@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleExecutable</key>
+  <string>mars_hal</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.mars.driver</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>mars.driver</string>
+  <key>CFBundlePackageType</key>
+  <string>BNDL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.0</string>
+  <key>CFBundleVersion</key>
+  <string>0.1.0</string>
+  <key>CFPlugInDynamicRegistration</key>
+  <false/>
+  <key>CFPlugInFactories</key>
+  <dict>
+    <key>D5238E9D-5308-4F8A-8A4D-872CA57DCE0A</key>
+    <string>MarsAudioServerPlugInFactory</string>
+  </dict>
+  <key>CFPlugInTypes</key>
+  <dict>
+    <key>69BD71A6-7C87-11D8-9456-0019B3A13A0E</key>
+    <array>
+      <string>D5238E9D-5308-4F8A-8A4D-872CA57DCE0A</string>
+    </array>
+  </dict>
+</dict>
+</plist>
