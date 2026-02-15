@@ -6,6 +6,8 @@ use std::sync::Arc;
 use clap::Parser;
 use mars_daemon::{MarsDaemon, setup_logging};
 use mars_types::DEFAULT_LOG_PATH_RELATIVE;
+#[cfg(unix)]
+use tokio::signal::unix::{SignalKind, signal};
 
 #[derive(Debug, Parser)]
 #[command(name = "marsd")]
@@ -39,7 +41,34 @@ async fn main() -> anyhow::Result<()> {
 
     let _guard = setup_logging()?;
     let daemon = Arc::new(MarsDaemon::new(default_log_path()));
-    daemon.run(&socket_path).await?;
+    let daemon_task = tokio::spawn({
+        let daemon = daemon.clone();
+        let socket_path = socket_path.clone();
+        async move { daemon.run(&socket_path).await }
+    });
+
+    #[cfg(unix)]
+    {
+        let mut sigterm = signal(SignalKind::terminate())?;
+        tokio::select! {
+            result = daemon_task => {
+                result??;
+            }
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::select! {
+            result = daemon_task => {
+                result??;
+            }
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
+
     Ok(())
 }
 

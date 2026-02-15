@@ -40,10 +40,14 @@ pub fn list_device_inventory() -> Result<DeviceInventory, CoreAudioError> {
             .description()
             .map(|description| description.name().to_string())
             .unwrap_or_else(|_| format!("Unknown Device {index}"));
+        let uid = device.id().map_err(|error| {
+            CoreAudioError::Enumerate(format!("failed to get stable id for '{name}': {error}"))
+        })?;
+        let uid = uid.to_string();
         if let Ok(configs) = device.supported_output_configs() {
             let (channels, sample_rates) = collect_output_details(configs);
             outputs.push(ExternalDeviceInfo {
-                uid: format!("cpal:output:{index}:{name}"),
+                uid: uid.clone(),
                 name: name.clone(),
                 manufacturer: None,
                 transport: None,
@@ -55,7 +59,7 @@ pub fn list_device_inventory() -> Result<DeviceInventory, CoreAudioError> {
         if let Ok(configs) = device.supported_input_configs() {
             let (channels, sample_rates) = collect_input_details(configs);
             inputs.push(ExternalDeviceInfo {
-                uid: format!("cpal:input:{index}:{name}"),
+                uid,
                 name,
                 manufacturer: None,
                 transport: None,
@@ -66,6 +70,33 @@ pub fn list_device_inventory() -> Result<DeviceInventory, CoreAudioError> {
     }
 
     Ok(DeviceInventory { inputs, outputs })
+}
+
+/// Best-effort microphone permission probe.
+///
+/// Returns:
+/// - `Some(true)` when input stream config can be queried.
+/// - `Some(false)` when host reports authorization/permission denial.
+/// - `None` when status is indeterminate (no input device or unknown error).
+#[must_use]
+pub fn detect_microphone_permission() -> Option<bool> {
+    let host = cpal::default_host();
+    let device = host.default_input_device()?;
+    match device.default_input_config() {
+        Ok(_) => Some(true),
+        Err(error) => {
+            let message = error.to_string().to_lowercase();
+            if message.contains("not authorized")
+                || message.contains("permission")
+                || message.contains("denied")
+                || message.contains("tcc")
+            {
+                Some(false)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 pub fn resolve_externals(profile: &Profile, inventory: &DeviceInventory) -> ExternalResolution {

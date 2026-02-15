@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use mars_ipc::{DaemonRequest, DaemonResponse, IpcClient, LogRequest};
+use mars_ipc::{DaemonRequest, DaemonResponse, IpcClient, LogRequest, LogResponse};
 use mars_profile::{TemplateKind, render_template};
 use mars_types::{
     ApplyRequest, ClearRequest, DEFAULT_PROFILE_DIR_RELATIVE, DEFAULT_SOCKET_PATH_RELATIVE,
@@ -20,6 +20,7 @@ use tokio::time::sleep;
 const PROFILE_NAME_MAX_LEN: usize = 64;
 const DAEMON_PING_RETRY_COUNT: usize = 50;
 const DAEMON_PING_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const LOG_FOLLOW_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Parser)]
 #[command(name = "mars")]
@@ -93,19 +94,23 @@ enum CliError {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-
-    let result = run(cli).await;
-    match result {
-        Ok(code) => std::process::exit(code.as_i32()),
-        Err(error) => {
-            let (message, code) = match error {
-                CliError::WithExit { message, exit_code } => (message, exit_code),
-                other => (other.to_string(), ExitCode::DaemonCommunication),
-            };
-            eprintln!("{message}");
-            std::process::exit(code.as_i32());
+    let exit_code = tokio::select! {
+        result = run(cli) => {
+            match result {
+                Ok(code) => code,
+                Err(error) => {
+                    let (message, code) = match error {
+                        CliError::WithExit { message, exit_code } => (message, exit_code),
+                        other => (other.to_string(), ExitCode::DaemonCommunication),
+                    };
+                    eprintln!("{message}");
+                    code
+                }
+            }
         }
-    }
+        _ = tokio::signal::ctrl_c() => ExitCode::Interrupted,
+    };
+    std::process::exit(exit_code.as_i32());
 }
 
 async fn run(cli: Cli) -> Result<ExitCode, CliError> {
@@ -376,18 +381,19 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             Ok(ExitCode::Success)
         }
         Commands::Logs { follow } => {
-            let client = daemon_client(Duration::from_millis(5000)).await?;
-            let response = client
-                .send(DaemonRequest::Logs(LogRequest { follow }))
-                .await
-                .map_err(ipc_to_cli_error)?;
-            let DaemonResponse::Logs(result) = response else {
+            if cli.json && follow {
                 return Err(CliError::WithExit {
-                    message: "unexpected daemon response for logs".to_string(),
-                    exit_code: ExitCode::DaemonCommunication,
+                    message: "logs --follow does not support --json output".to_string(),
+                    exit_code: ExitCode::InvalidInput,
                 });
-            };
+            }
 
+            let client = daemon_client(Duration::from_millis(5000)).await?;
+            if follow {
+                return follow_logs(&client).await;
+            }
+
+            let result = request_logs(&client, false, None, Some(200)).await?;
             print_output(cli.json, &result, || result.lines.join("\n"))?;
             Ok(ExitCode::Success)
         }
@@ -406,10 +412,13 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
 
             print_output(cli.json, &result, || {
                 format!(
-                    "driver_installed={} daemon_reachable={} mic_permission={} driver_gen={} driver_pending={}",
+                    "driver_installed={} daemon_reachable={} mic_permission={} mic_source={} driver_version={} daemon_version={} driver_gen={} driver_pending={}",
                     result.driver_installed,
                     result.daemon_reachable,
                     result.microphone_permission_ok,
+                    result.mic_permission_source,
+                    result.driver_version.as_deref().unwrap_or("<unknown>"),
+                    result.daemon_version,
                     result.driver.generation,
                     result.driver.pending_change
                 )
@@ -707,9 +716,73 @@ fn ipc_to_cli_error(error: mars_ipc::IpcError) -> CliError {
     }
 }
 
+async fn request_logs(
+    client: &IpcClient,
+    follow: bool,
+    cursor: Option<u64>,
+    limit: Option<u32>,
+) -> Result<LogResponse, CliError> {
+    let response = client
+        .send(DaemonRequest::Logs(LogRequest {
+            follow,
+            cursor,
+            limit,
+        }))
+        .await
+        .map_err(ipc_to_cli_error)?;
+    let DaemonResponse::Logs(result) = response else {
+        return Err(CliError::WithExit {
+            message: "unexpected daemon response for logs".to_string(),
+            exit_code: ExitCode::DaemonCommunication,
+        });
+    };
+    Ok(result)
+}
+
+async fn follow_logs(client: &IpcClient) -> Result<ExitCode, CliError> {
+    let initial = request_logs(client, true, None, Some(200)).await?;
+    for line in initial.lines {
+        println!("{line}");
+    }
+    let mut cursor = initial.next_cursor;
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => return Ok(ExitCode::Interrupted),
+            _ = sleep(LOG_FOLLOW_POLL_INTERVAL) => {}
+        }
+
+        let snapshot = request_logs(client, true, Some(cursor), None).await?;
+        for line in snapshot.lines {
+            println!("{line}");
+        }
+        cursor = snapshot.next_cursor;
+    }
+}
+
+#[cfg(test)]
+fn compute_log_delta(previous: &[String], current: &[String]) -> Vec<String> {
+    if previous.is_empty() || current.len() < previous.len() {
+        return current.to_vec();
+    }
+
+    let max_overlap = previous.len().min(current.len());
+    for overlap in (0..=max_overlap).rev() {
+        if previous[previous.len() - overlap..] == current[..overlap] {
+            return current[overlap..].to_vec();
+        }
+    }
+
+    current.to_vec()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_stale_socket_error, is_valid_profile_name};
+    use super::{compute_log_delta, is_stale_socket_error, is_valid_profile_name};
+
+    fn lines(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
 
     #[test]
     fn accepts_valid_profile_names() {
@@ -741,5 +814,35 @@ mod tests {
 
         let timed_out = mars_ipc::IpcError::Timeout;
         assert!(!is_stale_socket_error(&timed_out));
+    }
+
+    #[test]
+    fn log_delta_returns_all_lines_on_first_snapshot() {
+        let current = lines(&["one", "two"]);
+        assert_eq!(compute_log_delta(&[], &current), current);
+    }
+
+    #[test]
+    fn log_delta_returns_only_new_lines_on_append() {
+        let previous = lines(&["one", "two"]);
+        let current = lines(&["one", "two", "three", "four"]);
+        assert_eq!(
+            compute_log_delta(&previous, &current),
+            lines(&["three", "four"])
+        );
+    }
+
+    #[test]
+    fn log_delta_returns_full_snapshot_on_truncation() {
+        let previous = lines(&["one", "two", "three", "four"]);
+        let current = lines(&["new-one", "new-two"]);
+        assert_eq!(compute_log_delta(&previous, &current), current);
+    }
+
+    #[test]
+    fn log_delta_returns_no_lines_when_snapshot_unchanged() {
+        let previous = lines(&["one", "two"]);
+        let current = lines(&["one", "two"]);
+        assert!(compute_log_delta(&previous, &current).is_empty());
     }
 }

@@ -322,6 +322,7 @@ fn convert_channels(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::f32::consts::PI;
 
     use mars_graph::build_routing_graph;
     use mars_types::{MixConfig, Pipe, Profile, VirtualInputDevice, VirtualOutputDevice};
@@ -415,5 +416,115 @@ mod tests {
         sources.insert("app".to_string(), vec![1.0]);
         let output = engine.render_cycle(1, &sources).expect("render");
         assert_eq!(output.sinks["mix"][0], 0.0);
+    }
+
+    #[test]
+    fn sine_gain_matches_expected_rms_and_peak() {
+        let mut profile = Profile::default();
+        profile.virtual_devices.outputs.push(VirtualOutputDevice {
+            id: "osc".to_string(),
+            name: "Osc".to_string(),
+            channels: Some(1),
+            uid: None,
+            hidden: false,
+        });
+        profile.virtual_devices.inputs.push(VirtualInputDevice {
+            id: "mix".to_string(),
+            name: "Mix".to_string(),
+            channels: Some(1),
+            uid: None,
+            mix: None,
+        });
+        profile.pipes.push(Pipe {
+            from: "osc".to_string(),
+            to: "mix".to_string(),
+            enabled: true,
+            gain_db: -6.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+
+        let graph = build_routing_graph(&profile).expect("graph");
+        let engine = Engine::new(EngineSnapshot {
+            graph,
+            sample_rate: 48_000,
+            buffer_frames: 256,
+        });
+
+        let frames = 256usize;
+        let freq_hz = 1_000.0f32;
+        let sample_rate = 48_000.0f32;
+        let mut sine = vec![0.0_f32; frames];
+        for (index, sample) in sine.iter_mut().enumerate() {
+            let phase = 2.0 * PI * freq_hz * (index as f32 / sample_rate);
+            *sample = phase.sin();
+        }
+
+        let mut sources = HashMap::new();
+        sources.insert("osc".to_string(), sine);
+        let output = engine.render_cycle(frames, &sources).expect("render");
+        let sink = output.sinks.get("mix").expect("sink");
+
+        let rms =
+            (sink.iter().map(|sample| sample * sample).sum::<f32>() / sink.len() as f32).sqrt();
+        let peak = sink
+            .iter()
+            .fold(0.0_f32, |acc, sample| acc.max(sample.abs()));
+
+        // input RMS for full-scale sine is ~0.7071; after -6 dB it is ~0.354.
+        assert!((rms - 0.354).abs() < 0.03);
+        // input peak is 1.0; after -6 dB it is ~0.501.
+        assert!((peak - 0.501).abs() < 0.03);
+    }
+
+    #[test]
+    fn limiter_caps_peak_to_configured_dbfs() {
+        let mut profile = Profile::default();
+        profile.virtual_devices.outputs.push(VirtualOutputDevice {
+            id: "loud".to_string(),
+            name: "Loud".to_string(),
+            channels: Some(2),
+            uid: None,
+            hidden: false,
+        });
+        profile.virtual_devices.inputs.push(VirtualInputDevice {
+            id: "mix".to_string(),
+            name: "Mix".to_string(),
+            channels: Some(2),
+            uid: None,
+            mix: Some(MixConfig {
+                limiter: true,
+                limit_dbfs: -1.0,
+                mode: mars_types::MixMode::Sum,
+            }),
+        });
+        profile.pipes.push(Pipe {
+            from: "loud".to_string(),
+            to: "mix".to_string(),
+            enabled: true,
+            gain_db: 12.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+
+        let graph = build_routing_graph(&profile).expect("graph");
+        let engine = Engine::new(EngineSnapshot {
+            graph,
+            sample_rate: 48_000,
+            buffer_frames: 8,
+        });
+
+        let mut sources = HashMap::new();
+        sources.insert("loud".to_string(), vec![1.0_f32; 16]);
+        let output = engine.render_cycle(8, &sources).expect("render");
+        let sink = output.sinks.get("mix").expect("sink");
+        let peak = sink
+            .iter()
+            .fold(0.0_f32, |acc, sample| acc.max(sample.abs()));
+
+        // -1 dBFS ~= 0.891.
+        assert!(peak <= 0.92);
     }
 }

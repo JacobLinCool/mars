@@ -54,6 +54,8 @@ pub struct HalDevice {
     pub name: String,
     pub kind: String,
     pub channels: u16,
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

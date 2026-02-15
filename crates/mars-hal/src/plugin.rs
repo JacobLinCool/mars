@@ -51,6 +51,7 @@ struct DeviceObjectInfo {
     name: String,
     kind: String,
     channels: u16,
+    hidden: bool,
     io_running: bool,
 }
 
@@ -229,6 +230,8 @@ unsafe extern "C" fn plugin_destroy_device(
         .map(|(uid, _)| uid.clone());
     if let Some(uid) = uid_to_remove {
         reg.devices.remove(&uid);
+        let _ = global_registry().remove(&stream_name(StreamDirection::Vout, &uid));
+        let _ = global_registry().remove(&stream_name(StreamDirection::Vin, &uid));
     }
     K_AUDIO_HARDWARE_NO_ERROR
 }
@@ -547,7 +550,7 @@ unsafe extern "C" fn plugin_start_io(
         RingSpec {
             sample_rate: state.applied_state.sample_rate,
             channels,
-            capacity_frames: state.applied_state.buffer_frames.saturating_mul(4),
+            capacity_frames: state.applied_state.buffer_frames.saturating_mul(8),
         }
     };
 
@@ -938,7 +941,7 @@ unsafe fn device_get_property(
             write_cfstring(&dev.name, data_size, out_data_size, data)
         },
         K_AUDIO_OBJECT_PROPERTY_MANUFACTURER => unsafe {
-            write_cfstring("MARS Audio", data_size, out_data_size, data)
+            write_cfstring("MARS", data_size, out_data_size, data)
         },
         K_AUDIO_DEVICE_PROPERTY_DEVICE_UID => unsafe {
             write_cfstring(&dev.uid, data_size, out_data_size, data)
@@ -959,7 +962,12 @@ unsafe fn device_get_property(
             write_val::<UInt32>(1, data_size, out_data_size, data)
         },
         K_AUDIO_DEVICE_PROPERTY_DEVICE_IS_HIDDEN => unsafe {
-            write_val::<UInt32>(0, data_size, out_data_size, data)
+            write_val::<UInt32>(
+                if dev.hidden { 1 } else { 0 },
+                data_size,
+                out_data_size,
+                data,
+            )
         },
         K_AUDIO_DEVICE_PROPERTY_LATENCY | K_AUDIO_DEVICE_PROPERTY_SAFETY_OFFSET => unsafe {
             write_val::<UInt32>(0, data_size, out_data_size, data)
@@ -971,7 +979,12 @@ unsafe fn device_get_property(
             write_val::<UInt32>(1, data_size, out_data_size, data)
         },
         K_AUDIO_DEVICE_PROPERTY_IS_RUNNING => unsafe {
-            write_val::<UInt32>(0, data_size, out_data_size, data)
+            write_val::<UInt32>(
+                if dev.io_running { 1 } else { 0 },
+                data_size,
+                out_data_size,
+                data,
+            )
         },
         K_AUDIO_DEVICE_PROPERTY_ZERO_TIME_STAMP_PERIOD => unsafe {
             write_val::<UInt32>(buffer_frames, data_size, out_data_size, data)
@@ -1205,9 +1218,14 @@ fn sync_object_registry() {
         .collect();
     for uid in to_remove {
         reg.devices.remove(&uid);
+        let _ = global_registry().remove(&stream_name(StreamDirection::Vout, &uid));
+        let _ = global_registry().remove(&stream_name(StreamDirection::Vin, &uid));
+    }
+    if applied.devices.is_empty() {
+        let _ = global_registry().remove_namespace("mars.");
     }
 
-    // Add new devices.
+    // Add new devices and refresh metadata for existing ones.
     for device in &applied.devices {
         if !reg.devices.contains_key(&device.uid) {
             let device_id = reg.allocate_id();
@@ -1221,9 +1239,15 @@ fn sync_object_registry() {
                     name: device.name.clone(),
                     kind: device.kind.clone(),
                     channels: device.channels,
+                    hidden: device.hidden,
                     io_running: false,
                 },
             );
+        } else if let Some(existing) = reg.devices.get_mut(&device.uid) {
+            existing.name = device.name.clone();
+            existing.kind = device.kind.clone();
+            existing.channels = device.channels;
+            existing.hidden = device.hidden;
         }
     }
 }
@@ -1367,7 +1391,14 @@ fn cfdata_create(bytes: &[u8]) -> *const c_void {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::c_void;
+
+    use once_cell::sync::Lazy;
+    use parking_lot::Mutex;
+
     use super::*;
+
+    static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     #[test]
     fn factory_returns_nonnull() {
@@ -1391,5 +1422,80 @@ mod tests {
         let id2 = reg.allocate_id();
         assert_eq!(id1, 2);
         assert_eq!(id2, 3);
+    }
+
+    #[test]
+    fn device_is_running_property_reflects_io_state() {
+        let _guard = TEST_LOCK.lock();
+        let uid = "test.running.uid".to_string();
+        let device_id = {
+            let mut reg = PLUGIN.object_registry.lock();
+            let device_id = reg.allocate_id();
+            let stream_id = reg.allocate_id();
+            reg.devices.insert(
+                uid.clone(),
+                DeviceObjectInfo {
+                    device_id,
+                    stream_id,
+                    uid: uid.clone(),
+                    name: "Test Device".to_string(),
+                    kind: "virtual_output".to_string(),
+                    channels: 2,
+                    hidden: false,
+                    io_running: false,
+                },
+            );
+            device_id
+        };
+
+        let address = AudioObjectPropertyAddress {
+            m_selector: K_AUDIO_DEVICE_PROPERTY_IS_RUNNING,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        let mut out_size = 0_u32;
+        let mut running_value = 9_u32;
+        // SAFETY: all pointers are valid and sized for a UInt32 write.
+        let status = unsafe {
+            device_get_property(
+                device_id,
+                &address,
+                std::mem::size_of::<UInt32>() as UInt32,
+                &mut out_size,
+                (&mut running_value as *mut UInt32).cast::<c_void>(),
+            )
+        };
+        assert_eq!(status, K_AUDIO_HARDWARE_NO_ERROR);
+        assert_eq!(out_size, std::mem::size_of::<UInt32>() as UInt32);
+        assert_eq!(running_value, 0);
+
+        {
+            let mut reg = PLUGIN.object_registry.lock();
+            let device = reg
+                .devices
+                .get_mut(&uid)
+                .expect("device inserted in registry");
+            device.io_running = true;
+        }
+
+        out_size = 0;
+        running_value = 9;
+        // SAFETY: all pointers are valid and sized for a UInt32 write.
+        let status = unsafe {
+            device_get_property(
+                device_id,
+                &address,
+                std::mem::size_of::<UInt32>() as UInt32,
+                &mut out_size,
+                (&mut running_value as *mut UInt32).cast::<c_void>(),
+            )
+        };
+        assert_eq!(status, K_AUDIO_HARDWARE_NO_ERROR);
+        assert_eq!(out_size, std::mem::size_of::<UInt32>() as UInt32);
+        assert_eq!(running_value, 1);
+
+        let mut reg = PLUGIN.object_registry.lock();
+        reg.devices.remove(&uid);
     }
 }

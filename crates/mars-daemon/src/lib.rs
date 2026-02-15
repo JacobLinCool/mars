@@ -1,15 +1,20 @@
 #![forbid(unsafe_code)]
 //! marsd daemon implementation.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Utc;
-use mars_coreaudio::{CoreAudioError, list_device_inventory, resolve_externals};
+use mars_coreaudio::{
+    CoreAudioError, detect_microphone_permission, list_device_inventory, resolve_externals,
+};
 use mars_engine::{Engine, EngineSnapshot};
 use mars_graph::RoutingGraph;
 use mars_hal::{
@@ -20,6 +25,7 @@ use mars_ipc::{
     ApiError, DaemonRequest, DaemonResponse, LogRequest, LogResponse, RequestHandler, serve,
 };
 use mars_profile::{ValidatedProfile, load_profile, validate_only};
+use mars_shm::{RingSpec, StreamDirection, global_registry, stream_name};
 use mars_types::{
     ApplyMode, ApplyPlan, ApplyRequest, ApplyResult, DaemonStatus, DeviceDescriptor,
     DriverStatusSummary, ExitCode, MANAGED_UID_PREFIX, NodeKind, PlanChange, PlanChangeKind,
@@ -32,6 +38,7 @@ use tracing::{debug, info, warn};
 #[derive(Debug)]
 pub struct MarsDaemon {
     state: Mutex<DaemonState>,
+    render_runtime: Mutex<Option<RenderRuntime>>,
     log_path: PathBuf,
 }
 
@@ -62,6 +69,8 @@ struct DriverDevice {
     name: String,
     kind: NodeKind,
     channels: u16,
+    #[serde(default)]
+    hidden: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -71,8 +80,198 @@ struct DriverStateSnapshot {
     parsed_state: Option<DriverAppliedState>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderEndpoint {
+    node_id: String,
+    uid: String,
+    channels: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderRuntimeConfig {
+    sample_rate: u32,
+    buffer_frames: u32,
+    vout_sources: Vec<RenderEndpoint>,
+    vin_sinks: Vec<RenderEndpoint>,
+}
+
+#[derive(Debug, Default)]
+struct RenderMetrics {
+    deadline_miss_count: AtomicU64,
+    last_cycle_ns: AtomicU64,
+    max_cycle_ns: AtomicU64,
+}
+
+#[derive(Debug)]
+struct RenderRuntime {
+    config: RenderRuntimeConfig,
+    stop: Arc<AtomicBool>,
+    metrics: Arc<RenderMetrics>,
+    handle: Option<JoinHandle<()>>,
+}
+
 const fn default_driver_buffer_frames() -> u32 {
     256
+}
+
+impl RenderRuntime {
+    fn start(config: RenderRuntimeConfig, engine: Arc<Engine>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let metrics = Arc::new(RenderMetrics::default());
+        let thread_stop = stop.clone();
+        let thread_metrics = metrics.clone();
+        let thread_config = config.clone();
+        let handle = std::thread::Builder::new()
+            .name("marsd-render".to_string())
+            .spawn(move || {
+                run_render_loop(engine, thread_config, thread_stop, thread_metrics);
+            })
+            .ok();
+
+        Self {
+            config,
+            stop,
+            metrics,
+            handle,
+        }
+    }
+
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn update_max_atomic(cell: &AtomicU64, value: u64) {
+    let mut current = cell.load(Ordering::Relaxed);
+    while value > current {
+        match cell.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn run_render_loop(
+    engine: Arc<Engine>,
+    config: RenderRuntimeConfig,
+    stop: Arc<AtomicBool>,
+    metrics: Arc<RenderMetrics>,
+) {
+    let frames = config.buffer_frames as usize;
+    let period = Duration::from_secs_f64(config.buffer_frames as f64 / config.sample_rate as f64);
+    let inject_sleep_ms = std::env::var("MARS_RENDER_LOOP_INJECT_SLEEP_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    let mut source_buffers = HashMap::<String, Vec<f32>>::new();
+    for source in &config.vout_sources {
+        source_buffers.insert(
+            source.node_id.clone(),
+            vec![0.0; frames.saturating_mul(source.channels as usize)],
+        );
+    }
+
+    let mut sink_silence = HashMap::<String, Vec<f32>>::new();
+    for sink in &config.vin_sinks {
+        sink_silence.insert(
+            sink.node_id.clone(),
+            vec![0.0; frames.saturating_mul(sink.channels as usize)],
+        );
+    }
+
+    let mut source_rings = config
+        .vout_sources
+        .iter()
+        .map(|endpoint| (endpoint.clone(), None))
+        .collect::<Vec<(RenderEndpoint, Option<mars_shm::SharedRingHandle>)>>();
+    let mut sink_rings = config
+        .vin_sinks
+        .iter()
+        .map(|endpoint| (endpoint.clone(), None))
+        .collect::<Vec<(RenderEndpoint, Option<mars_shm::SharedRingHandle>)>>();
+
+    while !stop.load(Ordering::Relaxed) {
+        let started = Instant::now();
+
+        for (endpoint, ring_handle) in &mut source_rings {
+            if ring_handle.is_none() {
+                let spec = RingSpec {
+                    sample_rate: config.sample_rate,
+                    channels: endpoint.channels,
+                    capacity_frames: config.buffer_frames.saturating_mul(8),
+                };
+                let name = stream_name(StreamDirection::Vout, &endpoint.uid);
+                *ring_handle = global_registry().create_or_open(&name, spec).ok();
+            }
+
+            let Some(samples) = source_buffers.get_mut(&endpoint.node_id) else {
+                continue;
+            };
+            if let Some(handle) = ring_handle {
+                let mut guard = handle.lock();
+                match guard.read_interleaved(samples) {
+                    Ok(read_frames) => {
+                        let keep = read_frames.saturating_mul(endpoint.channels as usize);
+                        if keep < samples.len() {
+                            samples[keep..].fill(0.0);
+                        }
+                    }
+                    Err(_) => samples.fill(0.0),
+                }
+            } else {
+                samples.fill(0.0);
+            }
+        }
+
+        if let Ok(rendered) = engine.render_cycle(frames, &source_buffers) {
+            for (endpoint, ring_handle) in &mut sink_rings {
+                if ring_handle.is_none() {
+                    let spec = RingSpec {
+                        sample_rate: config.sample_rate,
+                        channels: endpoint.channels,
+                        capacity_frames: config.buffer_frames.saturating_mul(8),
+                    };
+                    let name = stream_name(StreamDirection::Vin, &endpoint.uid);
+                    *ring_handle = global_registry().create_or_open(&name, spec).ok();
+                }
+
+                let Some(handle) = ring_handle else {
+                    continue;
+                };
+                let data = rendered.sinks.get(&endpoint.node_id).map_or_else(
+                    || {
+                        sink_silence
+                            .get(&endpoint.node_id)
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[])
+                    },
+                    Vec::as_slice,
+                );
+                let mut guard = handle.lock();
+                let _ = guard.write_interleaved(data);
+            }
+        }
+
+        if inject_sleep_ms > 0 {
+            std::thread::sleep(Duration::from_millis(inject_sleep_ms));
+        }
+
+        let cycle_ns = started.elapsed().as_nanos() as u64;
+        metrics.last_cycle_ns.store(cycle_ns, Ordering::Relaxed);
+        update_max_atomic(&metrics.max_cycle_ns, cycle_ns);
+        if cycle_ns > period.as_nanos() as u64 {
+            metrics.deadline_miss_count.fetch_add(1, Ordering::Relaxed);
+        } else {
+            let remain = period.saturating_sub(Duration::from_nanos(cycle_ns));
+            if !remain.is_zero() {
+                std::thread::sleep(remain);
+            }
+        }
+    }
 }
 
 impl MarsDaemon {
@@ -80,12 +279,50 @@ impl MarsDaemon {
     pub fn new(log_path: PathBuf) -> Self {
         Self {
             state: Mutex::new(DaemonState::default()),
+            render_runtime: Mutex::new(None),
             log_path,
         }
     }
 
     pub async fn run(self: Arc<Self>, socket_path: &Path) -> Result<(), mars_ipc::IpcError> {
         serve(socket_path, self).await
+    }
+
+    fn stop_render_runtime(&self) {
+        if let Some(runtime) = self.render_runtime.lock().take() {
+            runtime.stop();
+        }
+    }
+
+    fn sync_render_runtime(&self) {
+        let (engine, config) = {
+            let state = self.state.lock();
+            (
+                state.engine.clone(),
+                render_runtime_config_from_state(state.current_profile.as_ref(), &state.devices),
+            )
+        };
+
+        let mut runtime = self.render_runtime.lock();
+        match (engine, config) {
+            (Some(engine), Some(config)) => {
+                let needs_restart = match runtime.as_ref() {
+                    None => true,
+                    Some(existing) => existing.config != config,
+                };
+                if needs_restart {
+                    if let Some(existing) = runtime.take() {
+                        existing.stop();
+                    }
+                    *runtime = Some(RenderRuntime::start(config, engine));
+                }
+            }
+            _ => {
+                if let Some(existing) = runtime.take() {
+                    existing.stop();
+                }
+            }
+        }
     }
 
     fn plan_internal(
@@ -198,22 +435,25 @@ impl MarsDaemon {
             validated.profile.clone()
         };
 
-        let sample_rate = validated
-            .profile
+        let sample_rate = effective_profile
             .audio
             .sample_rate
             .as_value()
             .unwrap_or(48_000);
-        let channels = validated.profile.audio.channels.as_value().unwrap_or(2);
+        let channels = effective_profile.audio.channels.as_value().unwrap_or(2);
         let apply_mode = validated.profile.policy.apply_mode;
         let mut warnings = plan.warnings.clone();
 
-        let engine = Arc::new(Engine::new(EngineSnapshot {
-            graph: validated.graph.clone(),
-            sample_rate,
-            buffer_frames: validated.profile.audio.buffer_frames,
-        }));
-        let devices = collect_devices(&validated.profile, &resolution.resolved);
+        if let Err(error) = ensure_driver_compatibility_for_apply() {
+            if matches!(apply_mode, ApplyMode::Atomic) {
+                return Err(ApiError::new(error, ExitCode::DriverUnavailable));
+            }
+            warnings.push(format!(
+                "driver version compatibility check failed but apply continued due to best_effort: {error}"
+            ));
+        }
+
+        let devices = collect_devices(&effective_profile, &resolution.resolved);
 
         if let Err(error) =
             stage_driver_state(&effective_profile, &validated.graph, sample_rate, channels)
@@ -229,12 +469,38 @@ impl MarsDaemon {
         }
 
         let mut state = self.state.lock();
+        let engine = if let (Some(previous_profile), Some(existing_engine)) =
+            (state.current_profile.as_ref(), state.engine.as_ref())
+        {
+            if render_restart_required(previous_profile, &effective_profile) {
+                Arc::new(Engine::new(EngineSnapshot {
+                    graph: validated.graph.clone(),
+                    sample_rate,
+                    buffer_frames: effective_profile.audio.buffer_frames,
+                }))
+            } else {
+                existing_engine.swap_snapshot(EngineSnapshot {
+                    graph: validated.graph.clone(),
+                    sample_rate,
+                    buffer_frames: effective_profile.audio.buffer_frames,
+                });
+                existing_engine.clone()
+            }
+        } else {
+            Arc::new(Engine::new(EngineSnapshot {
+                graph: validated.graph.clone(),
+                sample_rate,
+                buffer_frames: effective_profile.audio.buffer_frames,
+            }))
+        };
 
         state.current_profile_path = Some(request.profile_path);
         state.current_profile = Some(effective_profile);
         state.graph = Some(validated.graph.clone());
         state.engine = Some(engine);
         state.devices = devices;
+        drop(state);
+        self.sync_render_runtime();
 
         info!("apply transaction committed");
 
@@ -247,6 +513,7 @@ impl MarsDaemon {
     }
 
     fn clear_internal(&self, keep_devices: bool) -> Result<ApplyResult, ApiError> {
+        self.stop_render_runtime();
         let mut state = self.state.lock();
         let previous = state.clone();
 
@@ -259,12 +526,15 @@ impl MarsDaemon {
             state.devices.retain(|device| !device.managed);
             if let Err(error) = clear_driver_state() {
                 *state = previous;
+                drop(state);
+                self.sync_render_runtime();
                 return Err(ApiError::new(
                     format!("clear failed and rolled back: {error}"),
                     ExitCode::DriverUnavailable,
                 ));
             }
         }
+        drop(state);
 
         Ok(ApplyResult {
             applied: true,
@@ -295,6 +565,14 @@ impl MarsDaemon {
             counters.overrun_count = runtime.overrun_count;
             counters.xrun_count = runtime.xrun_count;
         }
+        if let Some(render_runtime) = self.render_runtime.lock().as_ref() {
+            counters.deadline_miss_count = render_runtime
+                .metrics
+                .deadline_miss_count
+                .load(Ordering::Relaxed);
+            counters.last_cycle_ns = render_runtime.metrics.last_cycle_ns.load(Ordering::Relaxed);
+            counters.max_cycle_ns = render_runtime.metrics.max_cycle_ns.load(Ordering::Relaxed);
+        }
 
         DaemonStatus {
             running: state.engine.is_some(),
@@ -321,21 +599,95 @@ impl MarsDaemon {
                 ExitCode::InvalidInput,
             )
         })?;
+        let all_lines = data.lines().map(ToOwned::to_owned).collect::<VecDeque<_>>();
+        let total = all_lines.len() as u64;
+        let limit = request.limit.unwrap_or(200) as usize;
 
-        let lines = data
-            .lines()
-            .rev()
-            .take(200)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
+        let start = if let Some(cursor) = request.cursor {
+            if cursor <= total {
+                cursor as usize
+            } else {
+                total.saturating_sub(limit as u64) as usize
+            }
+        } else {
+            total.saturating_sub(limit as u64) as usize
+        };
+
+        let lines = all_lines.into_iter().skip(start).collect::<Vec<_>>();
 
         Ok(LogResponse {
             lines,
-            streaming: request.follow,
+            next_cursor: total,
         })
+    }
+
+    fn doctor_report_internal(&self) -> mars_types::DoctorReport {
+        let driver_installed = Path::new("/Library/Audio/Plug-Ins/HAL/mars.driver").exists();
+        let daemon_reachable = true;
+        let driver_loaded = if driver_installed {
+            mars_hal_client::is_driver_loaded()
+        } else {
+            false
+        };
+        let driver = driver_status_summary();
+        let daemon_version = env!("CARGO_PKG_VERSION").to_string();
+        let driver_version = read_driver_version();
+        let driver_compatible = is_driver_compatible(
+            driver_installed,
+            driver_loaded,
+            driver_version.as_deref(),
+            &daemon_version,
+        );
+
+        let env_assume_mic = std::env::var("MARS_ASSUME_MIC_PERMISSION")
+            .as_deref()
+            .map(|value| value == "1")
+            .unwrap_or(false);
+        let (microphone_permission_ok, mic_permission_source) = if env_assume_mic {
+            (true, "env_override".to_string())
+        } else if let Some(status) = detect_microphone_permission() {
+            (status, "tcc".to_string())
+        } else {
+            (false, "unknown".to_string())
+        };
+
+        let mut notes = Vec::new();
+        if !driver_installed {
+            notes.push("driver not found at /Library/Audio/Plug-Ins/HAL/mars.driver".to_string());
+        }
+        if driver_installed && !driver_loaded {
+            notes.push("mars.driver is installed but not loaded by coreaudiod; run: sudo killall -9 coreaudiod".to_string());
+        }
+        if !microphone_permission_ok {
+            notes.push(
+                "microphone permission is not granted or could not be verified; check System Settings > Privacy & Security > Microphone".to_string(),
+            );
+        }
+        if !driver_compatible {
+            notes.push(format!(
+                "driver/daemon version mismatch: driver={:?}, daemon={}",
+                driver_version, daemon_version
+            ));
+        }
+        if driver.pending_change {
+            notes.push("driver has a pending configuration change".to_string());
+        }
+
+        let state = self.state.lock();
+        notes.extend(feedback_risk_notes(state.graph.as_ref(), &state.devices));
+        drop(state);
+
+        mars_types::DoctorReport {
+            driver_installed,
+            driver_compatible,
+            daemon_reachable,
+            microphone_permission_ok,
+            driver_version,
+            daemon_version,
+            mic_permission_source,
+            driver,
+            notes,
+        }
     }
 }
 
@@ -371,10 +723,7 @@ impl RequestHandler for MarsDaemon {
                 Ok(DaemonResponse::Devices(inventory))
             }
             DaemonRequest::Logs(request) => self.logs_internal(&request).map(DaemonResponse::Logs),
-            DaemonRequest::Doctor => {
-                let report = doctor_report();
-                Ok(DaemonResponse::Doctor(report))
-            }
+            DaemonRequest::Doctor => Ok(DaemonResponse::Doctor(self.doctor_report_internal())),
         }
     }
 }
@@ -637,6 +986,192 @@ fn dedupe_devices(devices: Vec<DeviceDescriptor>) -> Vec<DeviceDescriptor> {
     out
 }
 
+fn render_runtime_config_from_state(
+    profile: Option<&Profile>,
+    devices: &[DeviceDescriptor],
+) -> Option<RenderRuntimeConfig> {
+    let profile = profile?;
+    let sample_rate = profile.audio.sample_rate.as_value().unwrap_or(48_000);
+    let buffer_frames = profile.audio.buffer_frames;
+
+    let mut vout_sources = devices
+        .iter()
+        .filter(|device| matches!(device.kind, NodeKind::VirtualOutput))
+        .map(|device| RenderEndpoint {
+            node_id: device.id.clone(),
+            uid: device.uid.clone(),
+            channels: device.channels,
+        })
+        .collect::<Vec<_>>();
+    vout_sources.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+
+    let mut vin_sinks = devices
+        .iter()
+        .filter(|device| matches!(device.kind, NodeKind::VirtualInput))
+        .map(|device| RenderEndpoint {
+            node_id: device.id.clone(),
+            uid: device.uid.clone(),
+            channels: device.channels,
+        })
+        .collect::<Vec<_>>();
+    vin_sinks.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+
+    Some(RenderRuntimeConfig {
+        sample_rate,
+        buffer_frames,
+        vout_sources,
+        vin_sinks,
+    })
+}
+
+fn profile_runtime_signature(profile: &Profile) -> BTreeMap<String, (String, u16, NodeKind)> {
+    let mut signature = BTreeMap::new();
+    let default_channels = profile.audio.channels.as_value().unwrap_or(2);
+
+    for output in &profile.virtual_devices.outputs {
+        signature.insert(
+            output.id.clone(),
+            (
+                output
+                    .uid
+                    .clone()
+                    .unwrap_or_else(|| format!("{MANAGED_UID_PREFIX}vout.{}", output.id)),
+                output.channels.unwrap_or(default_channels),
+                NodeKind::VirtualOutput,
+            ),
+        );
+    }
+
+    for input in &profile.virtual_devices.inputs {
+        signature.insert(
+            input.id.clone(),
+            (
+                input
+                    .uid
+                    .clone()
+                    .unwrap_or_else(|| format!("{MANAGED_UID_PREFIX}vin.{}", input.id)),
+                input.channels.unwrap_or(default_channels),
+                NodeKind::VirtualInput,
+            ),
+        );
+    }
+
+    signature
+}
+
+fn render_restart_required(previous: &Profile, next: &Profile) -> bool {
+    if previous.audio.sample_rate.as_value() != next.audio.sample_rate.as_value() {
+        return true;
+    }
+    if previous.audio.buffer_frames != next.audio.buffer_frames {
+        return true;
+    }
+    profile_runtime_signature(previous) != profile_runtime_signature(next)
+}
+
+fn read_driver_version() -> Option<String> {
+    if std::env::var("MARS_ALLOW_DRIVER_STUB").as_deref() == Ok("1") {
+        let raw = mars_hal::applied_state_json().ok()?;
+        return serde_json::from_str::<mars_hal::AppliedState>(&raw)
+            .ok()
+            .map(|state| state.driver_version);
+    }
+
+    mars_hal_client::get_applied_state()
+        .ok()
+        .map(|state| state.driver_version)
+}
+
+fn parse_major(version: &str) -> Option<u64> {
+    version.split('.').next()?.parse::<u64>().ok()
+}
+
+fn ensure_driver_compatibility_for_apply() -> Result<(), String> {
+    if std::env::var("MARS_ALLOW_DRIVER_STUB").as_deref() == Ok("1") {
+        return Ok(());
+    }
+
+    let installed = Path::new("/Library/Audio/Plug-Ins/HAL/mars.driver").exists();
+    let loaded = if installed {
+        mars_hal_client::is_driver_loaded()
+    } else {
+        false
+    };
+    let daemon_version = env!("CARGO_PKG_VERSION");
+    let driver_version = read_driver_version();
+
+    if is_driver_compatible(installed, loaded, driver_version.as_deref(), daemon_version) {
+        Ok(())
+    } else {
+        Err(format!(
+            "incompatible driver version: driver={:?}, daemon={}",
+            driver_version, daemon_version
+        ))
+    }
+}
+
+fn feedback_risk_notes(graph: Option<&RoutingGraph>, devices: &[DeviceDescriptor]) -> Vec<String> {
+    let Some(graph) = graph else {
+        return Vec::new();
+    };
+
+    let mut external_inputs = BTreeMap::<String, Vec<String>>::new();
+    let mut external_outputs = BTreeMap::<String, Vec<String>>::new();
+    for device in devices {
+        match device.kind {
+            NodeKind::ExternalInput => external_inputs
+                .entry(device.uid.clone())
+                .or_default()
+                .push(device.id.clone()),
+            NodeKind::ExternalOutput => external_outputs
+                .entry(device.uid.clone())
+                .or_default()
+                .push(device.id.clone()),
+            _ => {}
+        }
+    }
+
+    let mut notes = Vec::new();
+    for (uid, input_ids) in external_inputs {
+        let Some(output_ids) = external_outputs.get(&uid) else {
+            continue;
+        };
+        if path_exists_between_nodes(graph, &input_ids, output_ids) {
+            notes.push(format!(
+                "potential feedback risk detected: external input/output share uid '{uid}' and graph routes input to output"
+            ));
+        }
+    }
+
+    notes
+}
+
+fn path_exists_between_nodes(graph: &RoutingGraph, starts: &[String], targets: &[String]) -> bool {
+    let target_set = targets.iter().cloned().collect::<BTreeSet<_>>();
+    let mut adjacency = BTreeMap::<String, Vec<String>>::new();
+    for edge in &graph.edges {
+        adjacency
+            .entry(edge.from.clone())
+            .or_default()
+            .push(edge.to.clone());
+    }
+
+    let mut queue = starts.iter().cloned().collect::<VecDeque<_>>();
+    let mut visited = BTreeSet::<String>::new();
+    while let Some(node) = queue.pop_front() {
+        if !visited.insert(node.clone()) {
+            continue;
+        }
+        if target_set.contains(&node) {
+            return true;
+        }
+        if let Some(next_nodes) = adjacency.get(&node) {
+            queue.extend(next_nodes.iter().cloned());
+        }
+    }
+    false
+}
+
 fn driver_state_path() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or_else(|| "cannot determine home directory".to_string())?;
     Ok(home.join("Library/Caches/mars/driver_applied_state.json"))
@@ -693,6 +1228,7 @@ fn hal_desired_from_driver_applied(state: &DriverAppliedState) -> HalDesiredStat
                 name: device.name.clone(),
                 kind: node_kind_to_hal_kind(device.kind),
                 channels: device.channels,
+                hidden: device.hidden,
             })
             .collect(),
     }
@@ -812,6 +1348,7 @@ fn stage_driver_state(
             name: output.name.clone(),
             kind: NodeKind::VirtualOutput,
             channels,
+            hidden: output.hidden,
         });
         hal_devices.push(HalDeviceState {
             id: output.id.clone(),
@@ -819,6 +1356,7 @@ fn stage_driver_state(
             name: output.name.clone(),
             kind: node_kind_to_hal_kind(NodeKind::VirtualOutput),
             channels,
+            hidden: output.hidden,
         });
     }
 
@@ -835,6 +1373,7 @@ fn stage_driver_state(
             name: input.name.clone(),
             kind: NodeKind::VirtualInput,
             channels,
+            hidden: false,
         });
         hal_devices.push(HalDeviceState {
             id: input.id.clone(),
@@ -842,6 +1381,7 @@ fn stage_driver_state(
             name: input.name.clone(),
             kind: node_kind_to_hal_kind(NodeKind::VirtualInput),
             channels,
+            hidden: false,
         });
     }
 
@@ -905,6 +1445,7 @@ fn clear_driver_state() -> Result<(), String> {
         }
         return Err(error);
     }
+    let _ = global_registry().remove_namespace("mars.");
 
     if path.exists() {
         fs::remove_file(&path).map_err(|error| {
@@ -943,44 +1484,24 @@ fn ensure_driver_available() -> Result<(), String> {
     Ok(())
 }
 
-fn doctor_report() -> mars_types::DoctorReport {
-    let driver_installed = Path::new("/Library/Audio/Plug-Ins/HAL/mars.driver").exists();
-    let daemon_reachable = true;
-    let driver_loaded = if driver_installed {
-        mars_hal_client::is_driver_loaded()
-    } else {
-        false
+fn is_driver_compatible(
+    driver_installed: bool,
+    driver_loaded: bool,
+    driver_version: Option<&str>,
+    daemon_version: &str,
+) -> bool {
+    if !driver_installed || !driver_loaded {
+        return false;
+    }
+
+    let Some(driver_major) = driver_version.and_then(parse_major) else {
+        return false;
     };
-    let driver = driver_status_summary();
-    let microphone_permission_ok = std::env::var("MARS_ASSUME_MIC_PERMISSION")
-        .as_deref()
-        .map(|value| value == "1")
-        .unwrap_or(false);
+    let Some(daemon_major) = parse_major(daemon_version) else {
+        return false;
+    };
 
-    let mut notes = Vec::new();
-    if !driver_installed {
-        notes.push("driver not found at /Library/Audio/Plug-Ins/HAL/mars.driver".to_string());
-    }
-    if driver_installed && !driver_loaded {
-        notes.push("mars.driver is installed but not loaded by coreaudiod; run: sudo killall -9 coreaudiod".to_string());
-    }
-    if !microphone_permission_ok {
-        notes.push(
-            "microphone permission status could not be verified automatically; check System Settings > Privacy & Security > Microphone".to_string(),
-        );
-    }
-    if driver.pending_change {
-        notes.push("driver has a pending configuration change".to_string());
-    }
-
-    mars_types::DoctorReport {
-        driver_installed,
-        driver_compatible: driver_installed,
-        daemon_reachable,
-        microphone_permission_ok,
-        driver,
-        notes,
-    }
+    driver_major == daemon_major
 }
 
 pub fn setup_logging() -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard> {
@@ -1008,7 +1529,7 @@ pub fn setup_logging() -> anyhow::Result<tracing_appender::non_blocking::WorkerG
 mod tests {
     use mars_types::{Pipe, Profile, VirtualInputDevice, VirtualOutputDevice};
 
-    use super::diff_profiles;
+    use super::{diff_profiles, is_driver_compatible};
 
     #[test]
     fn diff_detects_create_remove() {
@@ -1064,5 +1585,15 @@ mod tests {
         let before = Profile::default();
         let diff = diff_profiles(Some(&before), None);
         assert!(!diff.changes.is_empty());
+    }
+
+    #[test]
+    fn driver_compatibility_requires_install_and_load() {
+        assert!(!is_driver_compatible(false, false, Some("0.1.0"), "0.1.0"));
+        assert!(!is_driver_compatible(false, true, Some("0.1.0"), "0.1.0"));
+        assert!(!is_driver_compatible(true, false, Some("0.1.0"), "0.1.0"));
+        assert!(!is_driver_compatible(true, true, None, "0.1.0"));
+        assert!(!is_driver_compatible(true, true, Some("2.1.0"), "1.4.0"));
+        assert!(is_driver_compatible(true, true, Some("1.2.0"), "1.4.0"));
     }
 }

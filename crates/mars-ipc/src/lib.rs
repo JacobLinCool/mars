@@ -19,7 +19,7 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -38,12 +38,16 @@ pub enum Command {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LogRequest {
     pub follow: bool,
+    #[serde(default)]
+    pub cursor: Option<u64>,
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LogResponse {
     pub lines: Vec<String>,
-    pub streaming: bool,
+    pub next_cursor: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

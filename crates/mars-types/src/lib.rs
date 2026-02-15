@@ -449,6 +449,10 @@ pub struct RuntimeCounters {
     pub overrun_count: u64,
     pub xrun_count: u64,
     pub deadline_miss_count: u64,
+    #[serde(default)]
+    pub last_cycle_ns: u64,
+    #[serde(default)]
+    pub max_cycle_ns: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
@@ -493,6 +497,11 @@ pub struct DoctorReport {
     pub daemon_reachable: bool,
     #[serde(default)]
     pub microphone_permission_ok: bool,
+    #[serde(default)]
+    pub driver_version: Option<String>,
+    pub daemon_version: String,
+    #[serde(default)]
+    pub mic_permission_source: String,
     #[serde(default)]
     pub driver: DriverStatusSummary,
     #[serde(default)]
