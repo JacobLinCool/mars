@@ -35,7 +35,7 @@ Cause:
 Fix:
 
 1. Run `mars devices --json` and inspect names/UIDs.
-2. Update profile `match`/`fallback` fields.
+2. Update profile `match` fields (strict mode rejects `fallback`).
 3. Re-run `mars validate` and `mars plan`.
 
 ## No microphone audio from external input

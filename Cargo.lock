@@ -789,6 +789,7 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "mars-types",
+ "parking_lot",
  "regex",
  "thiserror 2.0.18",
 ]

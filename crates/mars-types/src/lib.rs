@@ -353,8 +353,6 @@ pub struct Policy {
 pub enum MissingExternalPolicy {
     #[default]
     Error,
-    Skip,
-    Fallback,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
@@ -362,7 +360,6 @@ pub enum MissingExternalPolicy {
 pub enum ApplyMode {
     #[default]
     Atomic,
-    BestEffort,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -450,6 +447,8 @@ pub struct RuntimeCounters {
     pub xrun_count: u64,
     pub deadline_miss_count: u64,
     #[serde(default)]
+    pub last_callback_ns: u64,
+    #[serde(default)]
     pub last_cycle_ns: u64,
     #[serde(default)]
     pub max_cycle_ns: u64,
@@ -462,6 +461,15 @@ pub struct DriverStatusSummary {
     pub perform_count: u64,
     pub applied_device_count: usize,
     pub pending_change: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+pub struct ExternalRuntimeStatus {
+    pub connected_inputs: usize,
+    pub connected_outputs: usize,
+    pub restart_attempts: u64,
+    #[serde(default)]
+    pub stream_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
@@ -487,6 +495,8 @@ pub struct DaemonStatus {
     pub counters: RuntimeCounters,
     #[serde(default)]
     pub driver: DriverStatusSummary,
+    #[serde(default)]
+    pub external_runtime: ExternalRuntimeStatus,
     pub updated_at: DateTime<Utc>,
 }
 

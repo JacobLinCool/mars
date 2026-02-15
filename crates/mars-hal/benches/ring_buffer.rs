@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};

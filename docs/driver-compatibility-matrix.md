@@ -11,4 +11,5 @@
 
 - `marsd` stages driver state with explicit `driver_version`.
 - `mars doctor` surfaces install and compatibility status.
-- In dev-first mode, `MARS_ALLOW_DRIVER_STUB=1` bypasses system HAL install checks.
+- `marsd` now always enforces real HAL install/load checks during apply.
+- `scripts/build-driver.sh` requires `Developer ID Application` by default; local-only insecure signing is opt-in via `MARS_ALLOW_INSECURE_SIGNING=1`.

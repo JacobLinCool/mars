@@ -431,6 +431,10 @@ pub mod ffi {
 
     /// Legacy factory entrypoint. The real AudioServerPlugIn factory is in
     /// `plugin.rs`. This is retained behind `legacy-ffi` for test compatibility.
+    ///
+    /// # Safety
+    /// Called via C ABI by external callers. The incoming pointers may be null
+    /// and are ignored by this shim.
     #[cfg(feature = "legacy-ffi")]
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn MarsAudioServerPlugInFactoryLegacy(
@@ -443,6 +447,10 @@ pub mod ffi {
     }
 
     /// Accessor for tests/tooling that want a strongly typed interface pointer.
+    ///
+    /// # Safety
+    /// Returned pointer references static storage and must not be freed or
+    /// mutated by the caller.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn mars_hal_get_driver_interface() -> *const MarsAudioServerPlugInInterface
     {
@@ -451,6 +459,10 @@ pub mod ffi {
 
     /// Set desired state from JSON payload.
     /// Returns 0 on success, non-zero on parse error.
+    ///
+    /// # Safety
+    /// `raw` must be a valid, NUL-terminated C string pointer that remains
+    /// alive for the duration of this call.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn mars_hal_set_desired_state_json(raw: *const c_char) -> i32 {
         if raw.is_null() {
@@ -473,6 +485,10 @@ pub mod ffi {
 
     /// Trigger RequestDeviceConfigurationChange phase.
     /// Returns generation token on success, negative value on failure.
+    ///
+    /// # Safety
+    /// C ABI entrypoint; no additional safety requirements beyond valid call
+    /// convention.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn mars_hal_request_device_configuration_change() -> i64 {
         match request_device_configuration_change() {
@@ -486,6 +502,10 @@ pub mod ffi {
     /// Returns 2 if no pending change exists.
     /// Returns 3 if generation mismatches.
     /// Returns 4 for other failures.
+    ///
+    /// # Safety
+    /// C ABI entrypoint; caller provides the generation token as returned by
+    /// `mars_hal_request_device_configuration_change`.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn mars_hal_perform_device_configuration_change(generation: i64) -> i32 {
         if generation < 0 {
@@ -502,6 +522,9 @@ pub mod ffi {
 
     /// Copy applied state JSON into caller-provided buffer.
     /// Returns number of bytes written (excluding trailing NUL) or -1 on error.
+    ///
+    /// # Safety
+    /// `out` must point to a writable buffer of length `out_len`.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn mars_hal_get_applied_state_json(
         out: *mut c_char,
@@ -512,6 +535,9 @@ pub mod ffi {
 
     /// Copy runtime stats JSON into caller-provided buffer.
     /// Returns number of bytes written (excluding trailing NUL) or -1 on error.
+    ///
+    /// # Safety
+    /// `out` must point to a writable buffer of length `out_len`.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn mars_hal_get_runtime_stats_json(
         out: *mut c_char,
@@ -522,6 +548,9 @@ pub mod ffi {
 
     /// Copy pending configuration change JSON into caller-provided buffer.
     /// Returns number of bytes written (excluding trailing NUL) or -1 on error.
+    ///
+    /// # Safety
+    /// `out` must point to a writable buffer of length `out_len`.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn mars_hal_get_pending_change_json(
         out: *mut c_char,
@@ -532,6 +561,9 @@ pub mod ffi {
 
     /// Copy configuration summary JSON into caller-provided buffer.
     /// Returns number of bytes written (excluding trailing NUL) or -1 on error.
+    ///
+    /// # Safety
+    /// `out` must point to a writable buffer of length `out_len`.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn mars_hal_get_configuration_summary_json(
         out: *mut c_char,
@@ -541,6 +573,10 @@ pub mod ffi {
     }
 
     /// Return number of currently applied devices.
+    ///
+    /// # Safety
+    /// C ABI entrypoint; no additional safety requirements beyond valid call
+    /// convention.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn mars_hal_get_applied_device_count() -> usize {
         applied_device_count()
@@ -580,6 +616,7 @@ pub mod ffi {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use once_cell::sync::Lazy;
     use parking_lot::Mutex;

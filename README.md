@@ -28,6 +28,12 @@ Quick install:
 
 Run as your normal user (do not prefix with `sudo`).
 
+For local-only development on SIP-disabled systems, you can explicitly opt in to insecure signing:
+
+```bash
+MARS_ALLOW_INSECURE_SIGNING=1 ./scripts/install.sh
+```
+
 Quick health check:
 
 ```bash
@@ -63,14 +69,13 @@ Run as your normal user (do not prefix with `sudo`).
 
 For more operational commands and runtime paths, see `docs/operator-guide.md`.
 
-## Development mode without system driver
+## Development run (strict driver mode)
 
 ```bash
-export MARS_ALLOW_DRIVER_STUB=1
 cargo run -p mars-daemon --bin marsd -- --serve
 ```
 
-Then run CLI commands from another terminal.
+`marsd` now requires a real loaded `mars.driver` bundle; fallback stub mode was removed.
 
 ## Logs
 

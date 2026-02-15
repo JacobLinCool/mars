@@ -10,6 +10,7 @@ pub use mars_hal::shm_backend::{
 };
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::{RingRegistry, RingSpec, StreamDirection, global_registry, stream_name};
 

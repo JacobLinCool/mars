@@ -13,5 +13,6 @@ workspace = true
 [dependencies]
 cpal.workspace = true
 mars-types = { path = "../mars-types" }
+parking_lot.workspace = true
 regex.workspace = true
 thiserror.workspace = true

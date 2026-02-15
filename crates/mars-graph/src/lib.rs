@@ -42,12 +42,10 @@ impl RoutingGraph {
         ordered
     }
 
-    #[must_use]
     pub fn outgoing<'a>(&'a self, id: &'a str) -> impl Iterator<Item = &'a PipeDescriptor> {
         self.edges.iter().filter(move |edge| edge.from == id)
     }
 
-    #[must_use]
     pub fn incoming<'a>(&'a self, id: &'a str) -> impl Iterator<Item = &'a PipeDescriptor> {
         self.edges.iter().filter(move |edge| edge.to == id)
     }
@@ -242,6 +240,7 @@ fn node_from_vin(device: &VirtualInputDevice, default_channels: u16) -> NodeDesc
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use mars_types::{Pipe, Profile, VirtualInputDevice, VirtualOutputDevice};
 

@@ -13,13 +13,13 @@ use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Utc;
 use mars_coreaudio::{
-    CoreAudioError, detect_microphone_permission, list_device_inventory, resolve_externals,
+    CoreAudioError, ExternalEndpointConfig, ExternalIoRuntime, detect_microphone_permission,
+    list_device_inventory, resolve_externals,
 };
 use mars_engine::{Engine, EngineSnapshot};
 use mars_graph::RoutingGraph;
 use mars_hal::{
-    DesiredState as HalDesiredState, HalDevice as HalDeviceState, HalError as MarsHalError,
-    RuntimeStats as HalRuntimeStats,
+    DesiredState as HalDesiredState, HalDevice as HalDeviceState, RuntimeStats as HalRuntimeStats,
 };
 use mars_ipc::{
     ApiError, DaemonRequest, DaemonResponse, LogRequest, LogResponse, RequestHandler, serve,
@@ -27,8 +27,8 @@ use mars_ipc::{
 use mars_profile::{ValidatedProfile, load_profile, validate_only};
 use mars_shm::{RingSpec, StreamDirection, global_registry, stream_name};
 use mars_types::{
-    ApplyMode, ApplyPlan, ApplyRequest, ApplyResult, DaemonStatus, DeviceDescriptor,
-    DriverStatusSummary, ExitCode, MANAGED_UID_PREFIX, NodeKind, PlanChange, PlanChangeKind,
+    ApplyPlan, ApplyRequest, ApplyResult, DaemonStatus, DeviceDescriptor, DriverStatusSummary,
+    ExitCode, ExternalRuntimeStatus, MANAGED_UID_PREFIX, NodeKind, PlanChange, PlanChangeKind,
     PlanRequest, Profile, RuntimeCounters,
 };
 use parking_lot::Mutex;
@@ -50,6 +50,7 @@ struct DaemonState {
     engine: Option<Arc<Engine>>,
     devices: Vec<DeviceDescriptor>,
     counters: RuntimeCounters,
+    external_runtime: ExternalRuntimeStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +94,8 @@ struct RenderRuntimeConfig {
     buffer_frames: u32,
     vout_sources: Vec<RenderEndpoint>,
     vin_sinks: Vec<RenderEndpoint>,
+    external_inputs: Vec<RenderEndpoint>,
+    external_outputs: Vec<RenderEndpoint>,
 }
 
 #[derive(Debug, Default)]
@@ -100,11 +103,16 @@ struct RenderMetrics {
     deadline_miss_count: AtomicU64,
     last_cycle_ns: AtomicU64,
     max_cycle_ns: AtomicU64,
+    external_runtime: Mutex<ExternalRuntimeStatus>,
+    external_underrun_count: AtomicU64,
+    external_overrun_count: AtomicU64,
+    external_xrun_count: AtomicU64,
 }
 
 #[derive(Debug)]
 struct RenderRuntime {
     config: RenderRuntimeConfig,
+    external_runtime: Option<Arc<ExternalIoRuntime>>,
     stop: Arc<AtomicBool>,
     metrics: Arc<RenderMetrics>,
     handle: Option<JoinHandle<()>>,
@@ -115,25 +123,92 @@ const fn default_driver_buffer_frames() -> u32 {
 }
 
 impl RenderRuntime {
-    fn start(config: RenderRuntimeConfig, engine: Arc<Engine>) -> Self {
+    fn start(config: RenderRuntimeConfig, engine: Arc<Engine>) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let metrics = Arc::new(RenderMetrics::default());
+        let external_runtime = if config.external_inputs.is_empty()
+            && config.external_outputs.is_empty()
+        {
+            None
+        } else {
+            let input_configs = config
+                .external_inputs
+                .iter()
+                .map(|endpoint| ExternalEndpointConfig {
+                    node_id: endpoint.node_id.clone(),
+                    uid: endpoint.uid.clone(),
+                    channels: endpoint.channels,
+                })
+                .collect::<Vec<_>>();
+            let output_configs = config
+                .external_outputs
+                .iter()
+                .map(|endpoint| ExternalEndpointConfig {
+                    node_id: endpoint.node_id.clone(),
+                    uid: endpoint.uid.clone(),
+                    channels: endpoint.channels,
+                })
+                .collect::<Vec<_>>();
+            let runtime = ExternalIoRuntime::start(
+                config.sample_rate,
+                config.buffer_frames,
+                &input_configs,
+                &output_configs,
+            )
+            .map_err(|error| format!("external I/O runtime startup failed: {error}"))?;
+            let snapshot = runtime.snapshot();
+            if snapshot.status.connected_inputs != input_configs.len()
+                || snapshot.status.connected_outputs != output_configs.len()
+            {
+                return Err(format!(
+                    "external I/O runtime readiness failed: expected inputs={} outputs={}, got inputs={} outputs={}",
+                    input_configs.len(),
+                    output_configs.len(),
+                    snapshot.status.connected_inputs,
+                    snapshot.status.connected_outputs
+                ));
+            }
+            Some(Arc::new(runtime))
+        };
+
+        if let Some(external_runtime) = external_runtime.as_ref() {
+            let snapshot = external_runtime.snapshot();
+            *metrics.external_runtime.lock() = snapshot.status.clone();
+            metrics
+                .external_underrun_count
+                .store(snapshot.counters.underrun_count, Ordering::Relaxed);
+            metrics
+                .external_overrun_count
+                .store(snapshot.counters.overrun_count, Ordering::Relaxed);
+            metrics
+                .external_xrun_count
+                .store(snapshot.counters.xrun_count, Ordering::Relaxed);
+        }
+
         let thread_stop = stop.clone();
         let thread_metrics = metrics.clone();
         let thread_config = config.clone();
+        let thread_external_runtime = external_runtime.clone();
         let handle = std::thread::Builder::new()
             .name("marsd-render".to_string())
             .spawn(move || {
-                run_render_loop(engine, thread_config, thread_stop, thread_metrics);
+                run_render_loop(
+                    engine,
+                    thread_config,
+                    thread_stop,
+                    thread_metrics,
+                    thread_external_runtime,
+                );
             })
-            .ok();
+            .map_err(|error| format!("failed to spawn render runtime thread: {error}"))?;
 
-        Self {
+        Ok(Self {
             config,
+            external_runtime,
             stop,
             metrics,
-            handle,
-        }
+            handle: Some(handle),
+        })
     }
 
     fn stop(mut self) {
@@ -159,6 +234,7 @@ fn run_render_loop(
     config: RenderRuntimeConfig,
     stop: Arc<AtomicBool>,
     metrics: Arc<RenderMetrics>,
+    external_runtime: Option<Arc<ExternalIoRuntime>>,
 ) {
     let frames = config.buffer_frames as usize;
     let period = Duration::from_secs_f64(config.buffer_frames as f64 / config.sample_rate as f64);
@@ -174,9 +250,21 @@ fn run_render_loop(
             vec![0.0; frames.saturating_mul(source.channels as usize)],
         );
     }
+    for source in &config.external_inputs {
+        source_buffers.insert(
+            source.node_id.clone(),
+            vec![0.0; frames.saturating_mul(source.channels as usize)],
+        );
+    }
 
     let mut sink_silence = HashMap::<String, Vec<f32>>::new();
     for sink in &config.vin_sinks {
+        sink_silence.insert(
+            sink.node_id.clone(),
+            vec![0.0; frames.saturating_mul(sink.channels as usize)],
+        );
+    }
+    for sink in &config.external_outputs {
         sink_silence.insert(
             sink.node_id.clone(),
             vec![0.0; frames.saturating_mul(sink.channels as usize)],
@@ -227,6 +315,23 @@ fn run_render_loop(
             }
         }
 
+        if let Some(external_runtime) = external_runtime.as_ref() {
+            for endpoint in &config.external_inputs {
+                let Some(samples) = source_buffers.get_mut(&endpoint.node_id) else {
+                    continue;
+                };
+                if !external_runtime.read_input_into(&endpoint.node_id, samples) {
+                    samples.fill(0.0);
+                }
+            }
+        } else {
+            for endpoint in &config.external_inputs {
+                if let Some(samples) = source_buffers.get_mut(&endpoint.node_id) {
+                    samples.fill(0.0);
+                }
+            }
+        }
+
         if let Ok(rendered) = engine.render_cycle(frames, &source_buffers) {
             for (endpoint, ring_handle) in &mut sink_rings {
                 if ring_handle.is_none() {
@@ -254,6 +359,35 @@ fn run_render_loop(
                 let mut guard = handle.lock();
                 let _ = guard.write_interleaved(data);
             }
+
+            if let Some(external_runtime) = external_runtime.as_ref() {
+                for endpoint in &config.external_outputs {
+                    let data = rendered.sinks.get(&endpoint.node_id).map_or_else(
+                        || {
+                            sink_silence
+                                .get(&endpoint.node_id)
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[])
+                        },
+                        Vec::as_slice,
+                    );
+                    let _ = external_runtime.write_output_from(&endpoint.node_id, data);
+                }
+            }
+        }
+
+        if let Some(external_runtime) = external_runtime.as_ref() {
+            let snapshot = external_runtime.snapshot();
+            *metrics.external_runtime.lock() = snapshot.status.clone();
+            metrics
+                .external_underrun_count
+                .store(snapshot.counters.underrun_count, Ordering::Relaxed);
+            metrics
+                .external_overrun_count
+                .store(snapshot.counters.overrun_count, Ordering::Relaxed);
+            metrics
+                .external_xrun_count
+                .store(snapshot.counters.xrun_count, Ordering::Relaxed);
         }
 
         if inject_sleep_ms > 0 {
@@ -294,7 +428,7 @@ impl MarsDaemon {
         }
     }
 
-    fn sync_render_runtime(&self) {
+    fn sync_render_runtime(&self) -> Result<(), String> {
         let (engine, config) = {
             let state = self.state.lock();
             (
@@ -314,7 +448,7 @@ impl MarsDaemon {
                     if let Some(existing) = runtime.take() {
                         existing.stop();
                     }
-                    *runtime = Some(RenderRuntime::start(config, engine));
+                    *runtime = Some(RenderRuntime::start(config, engine)?);
                 }
             }
             _ => {
@@ -322,6 +456,68 @@ impl MarsDaemon {
                     existing.stop();
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    fn apply_deadline(timeout_ms: u64) -> Option<Instant> {
+        if timeout_ms == 0 {
+            None
+        } else {
+            Instant::now().checked_add(Duration::from_millis(timeout_ms))
+        }
+    }
+
+    fn ensure_within_deadline(deadline: Option<Instant>, stage: &str) -> Result<(), ApiError> {
+        if let Some(deadline) = deadline {
+            if Instant::now() > deadline {
+                return Err(ApiError::new(
+                    format!("apply timeout exceeded during stage: {stage}"),
+                    ExitCode::ApplyFailed,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn rollback_apply(
+        &self,
+        previous_state: DaemonState,
+        driver_snapshot: &DriverStateSnapshot,
+        stage_error: impl Into<String>,
+        exit_code: ExitCode,
+    ) -> ApiError {
+        self.stop_render_runtime();
+
+        let mut rollback_issues = Vec::new();
+        if let Err(error) = restore_driver_state_snapshot(driver_snapshot) {
+            rollback_issues.push(format!("driver rollback failed: {error}"));
+        }
+
+        {
+            let mut state = self.state.lock();
+            *state = previous_state;
+        }
+
+        if let Err(error) = self.sync_render_runtime() {
+            rollback_issues.push(format!("render runtime rollback failed: {error}"));
+        }
+
+        let stage_error = stage_error.into();
+        if rollback_issues.is_empty() {
+            ApiError::new(
+                format!("apply failed and rolled back: {stage_error}"),
+                exit_code,
+            )
+        } else {
+            ApiError::new(
+                format!(
+                    "apply failed and rollback encountered issues: {stage_error}; {}",
+                    rollback_issues.join("; ")
+                ),
+                exit_code,
+            )
         }
     }
 
@@ -365,9 +561,14 @@ impl MarsDaemon {
     }
 
     fn apply_internal(&self, request: ApplyRequest) -> Result<ApplyResult, ApiError> {
+        let deadline = Self::apply_deadline(request.timeout_ms);
+        Self::ensure_within_deadline(deadline, "profile-validate")?;
+
         let validated = load_profile(Path::new(&request.profile_path)).map_err(|error| {
             ApiError::new(
-                format!("profile validation failed: {error}"),
+                format!(
+                    "profile validation failed (strict policy requires apply_mode=atomic, on_missing_external=error, and no endpoint fallback/on_missing override): {error}"
+                ),
                 ExitCode::InvalidInput,
             )
         })?;
@@ -377,6 +578,7 @@ impl MarsDaemon {
             no_delete: request.no_delete,
         };
 
+        Self::ensure_within_deadline(deadline, "plan")?;
         let plan = self.plan_internal(&plan_request, &validated)?;
         if request.dry_run {
             return Ok(ApplyResult {
@@ -387,6 +589,7 @@ impl MarsDaemon {
             });
         }
 
+        Self::ensure_within_deadline(deadline, "external-resolve")?;
         let inventory = list_device_inventory().map_err(coreaudio_to_api_error)?;
         let resolution = resolve_externals(&validated.profile, &inventory);
         if !resolution.errors.is_empty() {
@@ -396,11 +599,16 @@ impl MarsDaemon {
             ));
         }
 
+        let previous_state = self.state.lock().clone();
+        let driver_snapshot_path = driver_state_path()
+            .map_err(|error| ApiError::new(error, ExitCode::DriverUnavailable))?;
+        let driver_snapshot = capture_driver_state_snapshot(&driver_snapshot_path)
+            .map_err(|error| ApiError::new(error, ExitCode::DriverUnavailable))?;
+
         // When --no-delete is set, merge devices from the previous profile that
         // would otherwise be removed so the HAL desired state retains them.
         let effective_profile = if request.no_delete {
-            let prev = self.state.lock().current_profile.clone();
-            if let Some(prev) = prev {
+            if let Some(prev) = previous_state.current_profile.clone() {
                 let next_output_ids: BTreeSet<&str> = validated
                     .profile
                     .virtual_devices
@@ -441,32 +649,43 @@ impl MarsDaemon {
             .as_value()
             .unwrap_or(48_000);
         let channels = effective_profile.audio.channels.as_value().unwrap_or(2);
-        let apply_mode = validated.profile.policy.apply_mode;
-        let mut warnings = plan.warnings.clone();
-
+        let warnings = plan.warnings.clone();
+        Self::ensure_within_deadline(deadline, "driver-compatibility")?;
         if let Err(error) = ensure_driver_compatibility_for_apply() {
-            if matches!(apply_mode, ApplyMode::Atomic) {
-                return Err(ApiError::new(error, ExitCode::DriverUnavailable));
-            }
-            warnings.push(format!(
-                "driver version compatibility check failed but apply continued due to best_effort: {error}"
-            ));
+            return Err(ApiError::new(error, ExitCode::DriverUnavailable));
         }
 
         let devices = collect_devices(&effective_profile, &resolution.resolved);
 
+        self.stop_render_runtime();
+
+        Self::ensure_within_deadline(deadline, "driver-stage").map_err(|timeout_error| {
+            self.rollback_apply(
+                previous_state.clone(),
+                &driver_snapshot,
+                timeout_error.message,
+                ExitCode::ApplyFailed,
+            )
+        })?;
         if let Err(error) =
             stage_driver_state(&effective_profile, &validated.graph, sample_rate, channels)
         {
             warn!(error = %error, "failed to stage driver state");
-            if matches!(apply_mode, ApplyMode::Atomic) {
-                return Err(ApiError::new(error, ExitCode::DriverUnavailable));
-            }
-            // best_effort keeps control-plane state moving and reports data-plane divergence.
-            warnings.push(format!(
-                "driver stage failed but apply continued due to best_effort: {error}"
+            return Err(self.rollback_apply(
+                previous_state,
+                &driver_snapshot,
+                error,
+                ExitCode::DriverUnavailable,
             ));
         }
+        Self::ensure_within_deadline(deadline, "graph-activate").map_err(|timeout_error| {
+            self.rollback_apply(
+                previous_state.clone(),
+                &driver_snapshot,
+                timeout_error.message,
+                ExitCode::ApplyFailed,
+            )
+        })?;
 
         let mut state = self.state.lock();
         let engine = if let (Some(previous_profile), Some(existing_engine)) =
@@ -499,8 +718,62 @@ impl MarsDaemon {
         state.graph = Some(validated.graph.clone());
         state.engine = Some(engine);
         state.devices = devices;
+        state.external_runtime = ExternalRuntimeStatus::default();
         drop(state);
-        self.sync_render_runtime();
+
+        if let Err(error) = self.sync_render_runtime() {
+            return Err(self.rollback_apply(
+                previous_state.clone(),
+                &driver_snapshot,
+                error,
+                ExitCode::ApplyFailed,
+            ));
+        }
+
+        Self::ensure_within_deadline(deadline, "runtime-ready").map_err(|timeout_error| {
+            self.rollback_apply(
+                previous_state.clone(),
+                &driver_snapshot,
+                timeout_error.message,
+                ExitCode::ApplyFailed,
+            )
+        })?;
+
+        {
+            let runtime_guard = self.render_runtime.lock();
+            if let Some(runtime) = runtime_guard.as_ref() {
+                if let Some(external_runtime) = runtime.external_runtime.as_ref() {
+                    let snapshot = external_runtime.snapshot();
+                    let expected_inputs = runtime.config.external_inputs.len();
+                    let expected_outputs = runtime.config.external_outputs.len();
+                    if snapshot.status.connected_inputs != expected_inputs
+                        || snapshot.status.connected_outputs != expected_outputs
+                    {
+                        return Err(self.rollback_apply(
+                            previous_state.clone(),
+                            &driver_snapshot,
+                            format!(
+                                "external runtime readiness failed: expected inputs={} outputs={}, got inputs={} outputs={}",
+                                expected_inputs,
+                                expected_outputs,
+                                snapshot.status.connected_inputs,
+                                snapshot.status.connected_outputs
+                            ),
+                            ExitCode::ApplyFailed,
+                        ));
+                    }
+                }
+            }
+        }
+
+        if let Some(external_status) = self
+            .render_runtime
+            .lock()
+            .as_ref()
+            .map(|runtime| runtime.metrics.external_runtime.lock().clone())
+        {
+            self.state.lock().external_runtime = external_status;
+        }
 
         info!("apply transaction committed");
 
@@ -521,13 +794,16 @@ impl MarsDaemon {
         state.current_profile = None;
         state.current_profile_path = None;
         state.graph = None;
+        state.external_runtime = ExternalRuntimeStatus::default();
 
         if !keep_devices {
             state.devices.retain(|device| !device.managed);
             if let Err(error) = clear_driver_state() {
                 *state = previous;
                 drop(state);
-                self.sync_render_runtime();
+                if let Err(error) = self.sync_render_runtime() {
+                    warn!(error = %error, "failed to restore render runtime during clear rollback");
+                }
                 return Err(ApiError::new(
                     format!("clear failed and rolled back: {error}"),
                     ExitCode::DriverUnavailable,
@@ -556,14 +832,38 @@ impl MarsDaemon {
     }
 
     fn status_internal(&self) -> DaemonStatus {
-        let state = self.state.lock();
-        let profile = state.current_profile.as_ref();
+        let (
+            running,
+            current_profile,
+            sample_rate,
+            buffer_frames,
+            graph_pipe_count,
+            devices,
+            mut counters,
+            mut external_runtime,
+        ) = {
+            let state = self.state.lock();
+            let profile = state.current_profile.as_ref();
+            (
+                state.engine.is_some(),
+                state.current_profile_path.clone(),
+                profile
+                    .and_then(|profile| profile.audio.sample_rate.as_value())
+                    .unwrap_or(48_000),
+                profile.map_or(256, |profile| profile.audio.buffer_frames),
+                state.graph.as_ref().map_or(0, |graph| graph.edges.len()),
+                state.devices.clone(),
+                state.counters.clone(),
+                state.external_runtime.clone(),
+            )
+        };
+
         let driver = driver_status_summary();
-        let mut counters = state.counters.clone();
         if let Some(runtime) = driver_runtime_stats() {
             counters.underrun_count = runtime.underrun_count;
             counters.overrun_count = runtime.overrun_count;
             counters.xrun_count = runtime.xrun_count;
+            counters.last_callback_ns = runtime.last_callback_ns;
         }
         if let Some(render_runtime) = self.render_runtime.lock().as_ref() {
             counters.deadline_miss_count = render_runtime
@@ -572,19 +872,37 @@ impl MarsDaemon {
                 .load(Ordering::Relaxed);
             counters.last_cycle_ns = render_runtime.metrics.last_cycle_ns.load(Ordering::Relaxed);
             counters.max_cycle_ns = render_runtime.metrics.max_cycle_ns.load(Ordering::Relaxed);
+            counters.underrun_count = counters.underrun_count.saturating_add(
+                render_runtime
+                    .metrics
+                    .external_underrun_count
+                    .load(Ordering::Relaxed),
+            );
+            counters.overrun_count = counters.overrun_count.saturating_add(
+                render_runtime
+                    .metrics
+                    .external_overrun_count
+                    .load(Ordering::Relaxed),
+            );
+            counters.xrun_count = counters.xrun_count.saturating_add(
+                render_runtime
+                    .metrics
+                    .external_xrun_count
+                    .load(Ordering::Relaxed),
+            );
+            external_runtime = render_runtime.metrics.external_runtime.lock().clone();
         }
 
         DaemonStatus {
-            running: state.engine.is_some(),
-            current_profile: state.current_profile_path.clone(),
-            sample_rate: profile
-                .and_then(|profile| profile.audio.sample_rate.as_value())
-                .unwrap_or(48_000),
-            buffer_frames: profile.map_or(256, |profile| profile.audio.buffer_frames),
-            graph_pipe_count: state.graph.as_ref().map_or(0, |graph| graph.edges.len()),
-            devices: state.devices.clone(),
+            running,
+            current_profile,
+            sample_rate,
+            buffer_frames,
+            graph_pipe_count,
+            devices,
             counters,
             driver,
+            external_runtime,
             updated_at: Utc::now(),
         }
     }
@@ -704,7 +1022,9 @@ impl RequestHandler for MarsDaemon {
                 let validated =
                     load_profile(Path::new(&request.profile_path)).map_err(|error| {
                         ApiError::new(
-                            format!("profile validation failed: {error}"),
+                            format!(
+                                "profile validation failed (strict policy requires apply_mode=atomic, on_missing_external=error, and no endpoint fallback/on_missing override): {error}"
+                            ),
                             ExitCode::InvalidInput,
                         )
                     })?;
@@ -745,14 +1065,7 @@ fn node_kind_to_hal_kind(kind: NodeKind) -> String {
     }
 }
 
-fn hal_error_to_string(error: MarsHalError) -> String {
-    format!("driver state operation failed: {error}")
-}
-
 fn driver_status_summary() -> DriverStatusSummary {
-    if std::env::var("MARS_ALLOW_DRIVER_STUB").as_deref() == Ok("1") {
-        return driver_status_summary_stub();
-    }
     match mars_hal_client::get_configuration_summary() {
         Ok(summary) => DriverStatusSummary {
             generation: summary.current_generation,
@@ -768,21 +1081,7 @@ fn driver_status_summary() -> DriverStatusSummary {
     }
 }
 
-fn driver_status_summary_stub() -> DriverStatusSummary {
-    let summary = mars_hal::configuration_summary();
-    DriverStatusSummary {
-        generation: summary.current_generation,
-        request_count: summary.request_count,
-        perform_count: summary.perform_count,
-        applied_device_count: summary.applied_device_count,
-        pending_change: summary.pending.is_some(),
-    }
-}
-
 fn driver_runtime_stats() -> Option<HalRuntimeStats> {
-    if std::env::var("MARS_ALLOW_DRIVER_STUB").as_deref() == Ok("1") {
-        return driver_runtime_stats_stub();
-    }
     match mars_hal_client::get_runtime_stats() {
         Ok(stats) => Some(HalRuntimeStats {
             underrun_count: stats.underrun_count,
@@ -795,11 +1094,6 @@ fn driver_runtime_stats() -> Option<HalRuntimeStats> {
             None
         }
     }
-}
-
-fn driver_runtime_stats_stub() -> Option<HalRuntimeStats> {
-    let raw = mars_hal::runtime_stats_json().ok()?;
-    serde_json::from_str::<HalRuntimeStats>(&raw).ok()
 }
 
 fn diff_profiles(previous: Option<&Profile>, next: Option<&Profile>) -> ApplyPlan {
@@ -1016,11 +1310,35 @@ fn render_runtime_config_from_state(
         .collect::<Vec<_>>();
     vin_sinks.sort_by(|a, b| a.node_id.cmp(&b.node_id));
 
+    let mut external_inputs = devices
+        .iter()
+        .filter(|device| matches!(device.kind, NodeKind::ExternalInput))
+        .map(|device| RenderEndpoint {
+            node_id: device.id.clone(),
+            uid: device.uid.clone(),
+            channels: device.channels,
+        })
+        .collect::<Vec<_>>();
+    external_inputs.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+
+    let mut external_outputs = devices
+        .iter()
+        .filter(|device| matches!(device.kind, NodeKind::ExternalOutput))
+        .map(|device| RenderEndpoint {
+            node_id: device.id.clone(),
+            uid: device.uid.clone(),
+            channels: device.channels,
+        })
+        .collect::<Vec<_>>();
+    external_outputs.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+
     Some(RenderRuntimeConfig {
         sample_rate,
         buffer_frames,
         vout_sources,
         vin_sinks,
+        external_inputs,
+        external_outputs,
     })
 }
 
@@ -1070,13 +1388,6 @@ fn render_restart_required(previous: &Profile, next: &Profile) -> bool {
 }
 
 fn read_driver_version() -> Option<String> {
-    if std::env::var("MARS_ALLOW_DRIVER_STUB").as_deref() == Ok("1") {
-        let raw = mars_hal::applied_state_json().ok()?;
-        return serde_json::from_str::<mars_hal::AppliedState>(&raw)
-            .ok()
-            .map(|state| state.driver_version);
-    }
-
     mars_hal_client::get_applied_state()
         .ok()
         .map(|state| state.driver_version)
@@ -1087,10 +1398,6 @@ fn parse_major(version: &str) -> Option<u64> {
 }
 
 fn ensure_driver_compatibility_for_apply() -> Result<(), String> {
-    if std::env::var("MARS_ALLOW_DRIVER_STUB").as_deref() == Ok("1") {
-        return Ok(());
-    }
-
     let installed = Path::new("/Library/Audio/Plug-Ins/HAL/mars.driver").exists();
     let loaded = if installed {
         mars_hal_client::is_driver_loaded()
@@ -1245,31 +1552,7 @@ fn empty_hal_desired_state() -> HalDesiredState {
 }
 
 fn apply_hal_desired_state(desired: &HalDesiredState) -> Result<(), String> {
-    if std::env::var("MARS_ALLOW_DRIVER_STUB").as_deref() == Ok("1") {
-        return apply_hal_desired_state_stub(desired);
-    }
     mars_hal_client::set_desired_state(desired).map_err(|e| format!("driver client error: {e}"))
-}
-
-fn apply_hal_desired_state_stub(desired: &HalDesiredState) -> Result<(), String> {
-    let desired_json = serde_json::to_string(desired).map_err(|error| {
-        format!(
-            "failed to serialize desired HAL state for sample_rate={} channels={}: {error}",
-            desired.sample_rate, desired.channels
-        )
-    })?;
-    mars_hal::set_desired_state_json(&desired_json).map_err(hal_error_to_string)?;
-
-    let generation =
-        mars_hal::request_device_configuration_change().map_err(hal_error_to_string)?;
-    match mars_hal::perform_device_configuration_change(generation) {
-        Ok(_) => Ok(()),
-        Err(MarsHalError::NoPendingConfigurationChange) => {
-            debug!(generation, "driver configuration already converged");
-            Ok(())
-        }
-        Err(error) => Err(hal_error_to_string(error)),
-    }
 }
 
 fn restore_driver_state_snapshot(snapshot: &DriverStateSnapshot) -> Result<(), String> {
@@ -1468,13 +1751,9 @@ fn clear_driver_state() -> Result<(), String> {
 }
 
 fn ensure_driver_available() -> Result<(), String> {
-    if std::env::var("MARS_ALLOW_DRIVER_STUB").as_deref() == Ok("1") {
-        return Ok(());
-    }
-
     let bundle = Path::new("/Library/Audio/Plug-Ins/HAL/mars.driver");
     if !bundle.exists() {
-        return Err("mars.driver is not installed; run scripts/install.sh or set MARS_ALLOW_DRIVER_STUB=1 for development".to_string());
+        return Err("mars.driver is not installed; run scripts/install.sh".to_string());
     }
 
     if !mars_hal_client::is_driver_loaded() {
@@ -1526,10 +1805,14 @@ pub fn setup_logging() -> anyhow::Result<tracing_appender::non_blocking::WorkerG
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
+    use std::thread;
+    use std::time::Duration;
+
     use mars_types::{Pipe, Profile, VirtualInputDevice, VirtualOutputDevice};
 
-    use super::{diff_profiles, is_driver_compatible};
+    use super::{MarsDaemon, diff_profiles, is_driver_compatible};
 
     #[test]
     fn diff_detects_create_remove() {
@@ -1595,5 +1878,20 @@ mod tests {
         assert!(!is_driver_compatible(true, true, None, "0.1.0"));
         assert!(!is_driver_compatible(true, true, Some("2.1.0"), "1.4.0"));
         assert!(is_driver_compatible(true, true, Some("1.2.0"), "1.4.0"));
+    }
+
+    #[test]
+    fn apply_deadline_zero_disables_timeout() {
+        let deadline = MarsDaemon::apply_deadline(0);
+        assert!(MarsDaemon::ensure_within_deadline(deadline, "any-stage").is_ok());
+    }
+
+    #[test]
+    fn apply_deadline_reports_stage_timeout() {
+        let deadline = MarsDaemon::apply_deadline(1);
+        thread::sleep(Duration::from_millis(5));
+        let error =
+            MarsDaemon::ensure_within_deadline(deadline, "driver-stage").expect_err("timed out");
+        assert!(error.message.contains("driver-stage"));
     }
 }

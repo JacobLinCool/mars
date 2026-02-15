@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use mars_graph::build_routing_graph;
 use mars_types::{Bus, MixConfig, MixMode, Pipe, Profile, VirtualInputDevice, VirtualOutputDevice};

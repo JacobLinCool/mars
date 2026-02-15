@@ -176,6 +176,7 @@ pub struct SharedRing {
     fd: OwnedFd,
     map: ShmMap,
     spec: RingSpec,
+    frame_scratch: Vec<u8>,
 }
 
 impl SharedRing {
@@ -228,6 +229,7 @@ impl SharedRing {
             fd,
             map,
             spec,
+            frame_scratch: Vec::new(),
         })
     }
 
@@ -255,7 +257,10 @@ impl SharedRing {
         }
 
         let mut header = read_header_bytes(self.map.as_slice())?;
-        let mut frame_bytes = vec![0_u8; channels * std::mem::size_of::<f32>()];
+        let frame_bytes_len = channels * std::mem::size_of::<f32>();
+        if self.frame_scratch.len() != frame_bytes_len {
+            self.frame_scratch.resize(frame_bytes_len, 0);
+        }
 
         for frame_idx in 0..frames {
             let used = header.write_idx.saturating_sub(header.read_idx) as usize;
@@ -266,10 +271,10 @@ impl SharedRing {
 
             let slot = (header.write_idx % header.capacity_frames as u64) as usize;
             let src = &interleaved[frame_idx * channels..(frame_idx + 1) * channels];
-            encode_frame(src, &mut frame_bytes);
+            encode_frame(src, &mut self.frame_scratch);
 
             let offset = data_offset(slot, channels)?;
-            let end = offset + frame_bytes.len();
+            let end = offset + self.frame_scratch.len();
             let bytes = self.map.as_slice_mut();
             if end > bytes.len() {
                 return Err(RingError::OutOfBounds {
@@ -278,7 +283,7 @@ impl SharedRing {
                 });
             }
 
-            bytes[offset..end].copy_from_slice(&frame_bytes);
+            bytes[offset..end].copy_from_slice(&self.frame_scratch);
             header.write_idx = header.write_idx.saturating_add(1);
         }
 
@@ -307,12 +312,15 @@ impl SharedRing {
         let mut header = read_header_bytes(self.map.as_slice())?;
         let available_frames =
             (header.write_idx.saturating_sub(header.read_idx) as usize).min(requested_frames);
-        let mut frame_bytes = vec![0_u8; channels * std::mem::size_of::<f32>()];
+        let frame_bytes_len = channels * std::mem::size_of::<f32>();
+        if self.frame_scratch.len() != frame_bytes_len {
+            self.frame_scratch.resize(frame_bytes_len, 0);
+        }
 
         for frame_idx in 0..available_frames {
             let slot = (header.read_idx % header.capacity_frames as u64) as usize;
             let offset = data_offset(slot, channels)?;
-            let end = offset + frame_bytes.len();
+            let end = offset + self.frame_scratch.len();
             let bytes = self.map.as_slice();
             if end > bytes.len() {
                 return Err(RingError::OutOfBounds {
@@ -321,9 +329,9 @@ impl SharedRing {
                 });
             }
 
-            frame_bytes.copy_from_slice(&bytes[offset..end]);
+            self.frame_scratch.copy_from_slice(&bytes[offset..end]);
             decode_frame(
-                &frame_bytes,
+                &self.frame_scratch,
                 &mut out[frame_idx * channels..(frame_idx + 1) * channels],
             );
             header.read_idx = header.read_idx.saturating_add(1);
@@ -551,51 +559,15 @@ fn read_header_bytes(bytes: &[u8]) -> Result<RingHeader, RingError> {
     }
 
     Ok(RingHeader {
-        magic: u32::from_le_bytes(
-            bytes[OFFSET_MAGIC..OFFSET_MAGIC + 4]
-                .try_into()
-                .expect("slice"),
-        ),
-        version: u32::from_le_bytes(
-            bytes[OFFSET_VERSION..OFFSET_VERSION + 4]
-                .try_into()
-                .expect("slice"),
-        ),
-        sample_rate: u32::from_le_bytes(
-            bytes[OFFSET_SAMPLE_RATE..OFFSET_SAMPLE_RATE + 4]
-                .try_into()
-                .expect("slice"),
-        ),
-        channels: u16::from_le_bytes(
-            bytes[OFFSET_CHANNELS..OFFSET_CHANNELS + 2]
-                .try_into()
-                .expect("slice"),
-        ),
-        capacity_frames: u32::from_le_bytes(
-            bytes[OFFSET_CAPACITY..OFFSET_CAPACITY + 4]
-                .try_into()
-                .expect("slice"),
-        ),
-        write_idx: u64::from_le_bytes(
-            bytes[OFFSET_WRITE_IDX..OFFSET_WRITE_IDX + 8]
-                .try_into()
-                .expect("slice"),
-        ),
-        read_idx: u64::from_le_bytes(
-            bytes[OFFSET_READ_IDX..OFFSET_READ_IDX + 8]
-                .try_into()
-                .expect("slice"),
-        ),
-        overrun_count: u64::from_le_bytes(
-            bytes[OFFSET_OVERRUN..OFFSET_OVERRUN + 8]
-                .try_into()
-                .expect("slice"),
-        ),
-        underrun_count: u64::from_le_bytes(
-            bytes[OFFSET_UNDERRUN..OFFSET_UNDERRUN + 8]
-                .try_into()
-                .expect("slice"),
-        ),
+        magic: read_u32(bytes, OFFSET_MAGIC),
+        version: read_u32(bytes, OFFSET_VERSION),
+        sample_rate: read_u32(bytes, OFFSET_SAMPLE_RATE),
+        channels: read_u16(bytes, OFFSET_CHANNELS),
+        capacity_frames: read_u32(bytes, OFFSET_CAPACITY),
+        write_idx: read_u64(bytes, OFFSET_WRITE_IDX),
+        read_idx: read_u64(bytes, OFFSET_READ_IDX),
+        overrun_count: read_u64(bytes, OFFSET_OVERRUN),
+        underrun_count: read_u64(bytes, OFFSET_UNDERRUN),
     })
 }
 
@@ -646,11 +618,32 @@ fn encode_frame(samples: &[f32], out: &mut [u8]) {
 fn decode_frame(bytes: &[u8], out: &mut [f32]) {
     for (idx, sample) in out.iter_mut().enumerate() {
         let start = idx * 4;
-        *sample = f32::from_le_bytes(bytes[start..start + 4].try_into().expect("slice"));
+        let mut raw = [0_u8; 4];
+        raw.copy_from_slice(&bytes[start..start + 4]);
+        *sample = f32::from_le_bytes(raw);
     }
 }
 
+fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    let mut raw = [0_u8; 2];
+    raw.copy_from_slice(&bytes[offset..offset + 2]);
+    u16::from_le_bytes(raw)
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    let mut raw = [0_u8; 4];
+    raw.copy_from_slice(&bytes[offset..offset + 4]);
+    u32::from_le_bytes(raw)
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+    let mut raw = [0_u8; 8];
+    raw.copy_from_slice(&bytes[offset..offset + 8]);
+    u64::from_le_bytes(raw)
+}
+
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::{RingRegistry, RingSpec, StreamDirection, global_registry, stream_name};
 

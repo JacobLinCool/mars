@@ -41,6 +41,8 @@ pub struct Engine {
 #[derive(Debug, Default)]
 struct EngineState {
     delay_lines: HashMap<String, DelayLine>,
+    node_buffers: HashMap<String, Vec<f32>>,
+    edge_scratch: Vec<f32>,
     counters: RuntimeCounters,
 }
 
@@ -105,12 +107,8 @@ impl Engine {
         let snapshot = self.snapshot.load();
         let graph = &snapshot.graph;
         let mut state = self.state.lock();
-
-        let mut node_buffers: HashMap<String, Vec<f32>> = graph
-            .nodes
-            .iter()
-            .map(|(id, node)| (id.clone(), vec![0.0; frames * node.channels as usize]))
-            .collect();
+        let mut edge_scratch = std::mem::take(&mut state.edge_scratch);
+        prepare_node_buffers(&mut state.node_buffers, graph, frames);
 
         for (id, samples) in sources {
             let Some(node) = graph.nodes.get(id) else {
@@ -124,7 +122,7 @@ impl Engine {
                 });
             }
 
-            let Some(buffer) = node_buffers.get_mut(id) else {
+            let Some(buffer) = state.node_buffers.get_mut(id) else {
                 continue;
             };
             let max = buffer.len().min(samples.len());
@@ -138,43 +136,43 @@ impl Engine {
             };
 
             for edge in graph.outgoing(&node_id) {
-                let (Some(src_buffer), Some(destination_node)) =
-                    (node_buffers.get(&edge.from), graph.nodes.get(&edge.to))
-                else {
+                let Some(destination_node) = graph.nodes.get(&edge.to) else {
                     continue;
                 };
+                let source_channels = source_node.channels as usize;
+                let dest_channels = destination_node.channels as usize;
+                {
+                    let Some(src_buffer) = state.node_buffers.get(&edge.from) else {
+                        continue;
+                    };
+                    convert_channels_into(
+                        src_buffer,
+                        source_channels,
+                        dest_channels,
+                        frames,
+                        &mut edge_scratch,
+                    );
+                }
 
-                let mut processed = convert_channels(
-                    src_buffer,
-                    source_node.channels as usize,
-                    destination_node.channels as usize,
-                    frames,
-                );
-
-                apply_gain(&mut processed, edge.gain_db, edge.mute);
-                apply_pan(
-                    &mut processed,
-                    destination_node.channels as usize,
-                    clamp_pan(edge.pan),
-                );
+                apply_gain(&mut edge_scratch, edge.gain_db, edge.mute);
+                apply_pan(&mut edge_scratch, dest_channels, clamp_pan(edge.pan));
 
                 let delay_frames = ((edge.delay_ms / 1000.0) * snapshot.sample_rate as f32)
                     .round()
                     .max(0.0) as usize;
                 if delay_frames > 0 {
-                    let line = state.delay_lines.entry(edge.id.clone()).or_insert_with(|| {
-                        DelayLine::new(delay_frames, destination_node.channels as usize)
-                    });
-                    if line.delay_frames != delay_frames
-                        || line.channels != destination_node.channels as usize
-                    {
-                        *line = DelayLine::new(delay_frames, destination_node.channels as usize);
+                    let line = state
+                        .delay_lines
+                        .entry(edge.id.clone())
+                        .or_insert_with(|| DelayLine::new(delay_frames, dest_channels));
+                    if line.delay_frames != delay_frames || line.channels != dest_channels {
+                        *line = DelayLine::new(delay_frames, dest_channels);
                     }
-                    line.process_in_place(&mut processed);
+                    line.process_in_place(&mut edge_scratch);
                 }
 
-                if let Some(dst) = node_buffers.get_mut(&edge.to) {
-                    accumulate(dst, &processed);
+                if let Some(dst) = state.node_buffers.get_mut(&edge.to) {
+                    accumulate(dst, &edge_scratch);
                     *sink_contributions.entry(edge.to.clone()).or_insert(0) += 1;
                 }
             }
@@ -186,10 +184,10 @@ impl Engine {
                 continue;
             }
 
-            let Some(buffer) = node_buffers.remove(id) else {
+            let Some(buffer) = state.node_buffers.get(id) else {
                 continue;
             };
-            let mut rendered = buffer;
+            let mut rendered = buffer.clone();
 
             if let Some(mix) = node.mix.as_ref() {
                 if matches!(mix.mode, MixMode::Average) {
@@ -208,6 +206,7 @@ impl Engine {
 
             sinks.insert(id.clone(), rendered);
         }
+        state.edge_scratch = edge_scratch;
 
         Ok(RenderOutput {
             sinks,
@@ -235,6 +234,14 @@ impl EngineState {
 
         Self {
             delay_lines,
+            node_buffers: snapshot
+                .graph
+                .nodes
+                .keys()
+                .cloned()
+                .map(|id| (id, Vec::new()))
+                .collect(),
+            edge_scratch: Vec::new(),
             counters: RuntimeCounters::default(),
         }
     }
@@ -286,40 +293,63 @@ fn accumulate(target: &mut [f32], source: &[f32]) {
     }
 }
 
-fn convert_channels(
+fn convert_channels_into(
     source: &[f32],
     source_channels: usize,
     dest_channels: usize,
     frames: usize,
-) -> Vec<f32> {
+    out: &mut Vec<f32>,
+) {
+    out.clear();
     if source_channels == dest_channels {
-        return source[..source.len().min(frames * dest_channels)].to_vec();
+        let len = source.len().min(frames * dest_channels);
+        out.extend_from_slice(&source[..len]);
+        if len < frames * dest_channels {
+            out.resize(frames * dest_channels, 0.0);
+        }
+        return;
     }
 
     match (source_channels, dest_channels) {
         (1, 2) => {
-            let mut out = vec![0.0; frames * 2];
+            out.resize(frames * 2, 0.0);
             for frame in 0..frames {
                 let sample = source.get(frame).copied().unwrap_or(0.0);
                 out[frame * 2] = sample;
                 out[frame * 2 + 1] = sample;
             }
-            out
         }
         (2, 1) => {
-            let mut out = vec![0.0; frames];
-            for frame in 0..frames {
+            out.resize(frames, 0.0);
+            for (frame, sample) in out.iter_mut().enumerate().take(frames) {
                 let left = source.get(frame * 2).copied().unwrap_or(0.0);
                 let right = source.get(frame * 2 + 1).copied().unwrap_or(0.0);
-                out[frame] = (left + right) * 0.5;
+                *sample = (left + right) * 0.5;
             }
-            out
         }
-        _ => vec![0.0; frames * dest_channels],
+        _ => out.resize(frames * dest_channels, 0.0),
+    }
+}
+
+fn prepare_node_buffers(
+    node_buffers: &mut HashMap<String, Vec<f32>>,
+    graph: &RoutingGraph,
+    frames: usize,
+) {
+    node_buffers.retain(|id, _| graph.nodes.contains_key(id));
+    for (id, node) in &graph.nodes {
+        let len = frames * node.channels as usize;
+        let buffer = node_buffers.entry(id.clone()).or_default();
+        if buffer.len() != len {
+            buffer.resize(len, 0.0);
+        } else {
+            buffer.fill(0.0);
+        }
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::collections::HashMap;
     use std::f32::consts::PI;

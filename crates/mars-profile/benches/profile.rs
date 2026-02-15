@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use mars_profile::{parse_profile_str, validate_profile};
 

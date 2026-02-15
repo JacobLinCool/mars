@@ -7,13 +7,9 @@ use std::path::Path;
 
 use mars_graph::{GraphError, RoutingGraph, build_routing_graph};
 use mars_types::{AutoOrU16, AutoOrU32, PROFILE_VERSION, Profile, ValidationReport};
-use once_cell::sync::Lazy;
 use regex::Regex;
 use schemars::schema_for;
 use thiserror::Error;
-
-static ID_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9-_]{0,63}$").expect("id regex should compile"));
 
 #[derive(Debug)]
 pub struct ValidatedProfile {
@@ -69,6 +65,10 @@ pub enum ProfileError {
         pattern: String,
         reason: String,
     },
+    #[error("external endpoint '{id}' uses unsupported fallback matcher in strict mode")]
+    UnsupportedFallbackMatcher { id: String },
+    #[error("external endpoint '{id}' uses unsupported on_missing override in strict mode")]
+    UnsupportedOnMissingOverride { id: String },
     #[error("graph validation failed: {0}")]
     Graph(#[from] GraphError),
 }
@@ -95,6 +95,7 @@ pub fn validate_profile(profile: Profile) -> Result<ValidatedProfile, ProfileErr
     validate_ids(&profile)?;
     validate_pipe_ranges(&profile)?;
     validate_external_matchers(&profile)?;
+    validate_strict_policy(&profile)?;
     let graph = build_routing_graph(&profile)?;
 
     let warnings = Vec::new();
@@ -121,7 +122,12 @@ pub fn validate_only(path: &Path) -> ValidationReport {
 }
 
 pub fn profile_schema_json() -> serde_json::Value {
-    serde_json::to_value(schema_for!(Profile)).expect("profile schema should serialize")
+    match serde_json::to_value(schema_for!(Profile)) {
+        Ok(value) => value,
+        Err(error) => serde_json::json!({
+            "error": format!("failed to serialize profile schema: {error}")
+        }),
+    }
 }
 
 pub fn render_template(name: &str, template: TemplateKind) -> String {
@@ -185,6 +191,36 @@ fn validate_external_matchers(profile: &Profile) -> Result<(), ProfileError> {
     Ok(())
 }
 
+fn validate_strict_policy(profile: &Profile) -> Result<(), ProfileError> {
+    for endpoint in &profile.external.inputs {
+        if endpoint.fallback.is_some() {
+            return Err(ProfileError::UnsupportedFallbackMatcher {
+                id: endpoint.id.clone(),
+            });
+        }
+        if endpoint.on_missing.is_some() {
+            return Err(ProfileError::UnsupportedOnMissingOverride {
+                id: endpoint.id.clone(),
+            });
+        }
+    }
+
+    for endpoint in &profile.external.outputs {
+        if endpoint.fallback.is_some() {
+            return Err(ProfileError::UnsupportedFallbackMatcher {
+                id: endpoint.id.clone(),
+            });
+        }
+        if endpoint.on_missing.is_some() {
+            return Err(ProfileError::UnsupportedOnMissingOverride {
+                id: endpoint.id.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_ids(profile: &Profile) -> Result<(), ProfileError> {
     let mut all = BTreeSet::<String>::new();
 
@@ -204,7 +240,7 @@ fn validate_ids(profile: &Profile) -> Result<(), ProfileError> {
         .chain(profile.external.inputs.iter().map(|item| item.id.as_str()))
         .chain(profile.external.outputs.iter().map(|item| item.id.as_str()))
     {
-        if !ID_REGEX.is_match(id) {
+        if !valid_id(id) {
             return Err(ProfileError::InvalidId { id: id.to_string() });
         }
 
@@ -214,6 +250,29 @@ fn validate_ids(profile: &Profile) -> Result<(), ProfileError> {
     }
 
     Ok(())
+}
+
+fn valid_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+
+    let mut len = 1usize;
+    for ch in chars {
+        len += 1;
+        if len > 64 {
+            return false;
+        }
+        if !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_') {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn default_template(name: &str) -> String {
@@ -274,7 +333,6 @@ external:
     - id: monitor
       match:
         name_regex: ".*Speakers.*"
-      on_missing: skip
 
 pipes:
   - from: app-browser
@@ -320,6 +378,7 @@ policy:
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::{parse_profile_str, validate_profile};
 
@@ -403,5 +462,78 @@ pipes: []
         let profile = parse_profile_str(yaml).expect("yaml parse should work");
         let validated = validate_profile(profile).expect("validation should pass");
         assert_eq!(validated.graph.edges.len(), 0);
+    }
+
+    #[test]
+    fn rejects_on_missing_override_in_strict_mode() {
+        let yaml = r#"
+version: 1
+virtual:
+  outputs: []
+  inputs: []
+external:
+  outputs:
+    - id: monitor
+      match:
+        name: "Speaker"
+      on_missing: error
+pipes: []
+"#;
+        let profile = parse_profile_str(yaml).expect("yaml parse should work");
+        let err = validate_profile(profile).expect_err("validation must fail");
+        assert!(err.to_string().contains("unsupported on_missing override"));
+    }
+
+    #[test]
+    fn rejects_fallback_matcher_in_strict_mode() {
+        let yaml = r#"
+version: 1
+virtual:
+  outputs: []
+  inputs: []
+external:
+  inputs:
+    - id: mic
+      match:
+        name: "Mic"
+      fallback:
+        name: "Built-in Microphone"
+pipes: []
+"#;
+        let profile = parse_profile_str(yaml).expect("yaml parse should work");
+        let err = validate_profile(profile).expect_err("validation must fail");
+        assert!(err.to_string().contains("unsupported fallback matcher"));
+    }
+
+    #[test]
+    fn rejects_legacy_apply_mode_best_effort() {
+        let yaml = r#"
+version: 1
+virtual:
+  outputs: []
+  inputs: []
+pipes: []
+policy:
+  apply_mode: best_effort
+"#;
+        let err = parse_profile_str(yaml).expect_err("yaml parse must fail");
+        assert!(err.to_string().contains("invalid yaml"));
+        assert!(err.to_string().contains("best_effort"));
+    }
+
+    #[test]
+    fn rejects_legacy_on_missing_external_skip() {
+        let yaml = r#"
+version: 1
+virtual:
+  outputs: []
+  inputs: []
+pipes: []
+policy:
+  on_missing_external: skip
+"#;
+        let err = parse_profile_str(yaml).expect_err("yaml parse must fail");
+        assert!(err.to_string().contains("invalid yaml"));
+        assert!(err.to_string().contains("skip"));
     }
 }

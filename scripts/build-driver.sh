@@ -72,26 +72,27 @@ with open(path, 'wb') as f:
     f.write(data)
 " "$BUNDLE_DIR/MacOS/mars_hal"
 
-# Code-sign the bundle with hardened runtime.  macOS 14+ loads HAL plugins
+# Code-sign the bundle with hardened runtime. macOS 14+ loads HAL plugins
 # out-of-process in com.apple.audio.DriverHelper which enforces library
-# validation — only "Developer ID Application" certificates pass.
-# "Apple Development" certs do NOT satisfy library validation; in that case
-# the daemon falls back to stub mode automatically (virtual devices won't
-# appear in the system audio list but IPC and profile logic still work).
-SIGN_ID="-"  # fallback to adhoc
-# Prefer Developer ID Application, then fall back to any available identity.
-if DEV_ID=$(security find-identity -v -p codesigning 2>/dev/null | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/'); then
-    if [ -n "$DEV_ID" ]; then
-        SIGN_ID="$DEV_ID"
+# validation; only "Developer ID Application" certificates pass.
+ALLOW_INSECURE_SIGNING="${MARS_ALLOW_INSECURE_SIGNING:-0}"
+DEV_ID="$(security find-identity -v -p codesigning 2>/dev/null | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/' || true)"
+
+if [ -n "$DEV_ID" ]; then
+    codesign --force --sign "$DEV_ID" --deep --options runtime "$ROOT_DIR/bundles/mars.driver"
+elif [ "$ALLOW_INSECURE_SIGNING" = "1" ]; then
+    SIGN_ID="-"
+    FOUND_ID="$(security find-identity -v -p codesigning 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/' || true)"
+    if [ -n "$FOUND_ID" ]; then
+        SIGN_ID="$FOUND_ID"
     fi
+    echo "warning: using insecure signing path (MARS_ALLOW_INSECURE_SIGNING=1)." >&2
+    echo "warning: this is for local development only (for example SIP-disabled systems)." >&2
+    codesign --force --sign "$SIGN_ID" --deep --options runtime "$ROOT_DIR/bundles/mars.driver"
+else
+    echo "error: missing Developer ID Application certificate; cannot build a loadable HAL bundle in strict mode." >&2
+    echo "error: for local-only development, set MARS_ALLOW_INSECURE_SIGNING=1 to opt in explicitly." >&2
+    exit 1
 fi
-if [ "$SIGN_ID" = "-" ]; then
-    if FOUND_ID=$(security find-identity -v -p codesigning 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/'); then
-        if [ -n "$FOUND_ID" ]; then
-            SIGN_ID="$FOUND_ID"
-        fi
-    fi
-fi
-codesign --force --sign "$SIGN_ID" --deep --options runtime "$ROOT_DIR/bundles/mars.driver"
 
 echo "Built driver bundle at $ROOT_DIR/bundles/mars.driver"

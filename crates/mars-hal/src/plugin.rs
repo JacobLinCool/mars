@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
@@ -673,23 +674,71 @@ unsafe extern "C" fn plugin_do_io_operation(
         StreamDirection::Vout
     };
     let name = stream_name(direction, &uid);
-    let Some(ring_handle) = global_registry().open(&name) else {
-        // Ring not ready yet — nothing to do.
-        return K_AUDIO_HARDWARE_NO_ERROR;
-    };
 
     let total_samples = io_buffer_frame_size as usize * channels;
     // SAFETY: `io_main_buffer` points to `total_samples` f32 samples provided by the host.
     let buffer: &mut [f32] =
         unsafe { core::slice::from_raw_parts_mut(io_main_buffer.cast::<f32>(), total_samples) };
 
-    let mut ring = ring_handle.lock();
-    if operation_id == K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_WRITE_MIX {
-        // VOut: host wrote mixed audio into buffer → push to SHM ring.
-        let _ = ring.write_interleaved(buffer);
+    let mut underrun_delta = 0_u64;
+    let mut overrun_delta = 0_u64;
+    let mut xrun_delta = 0_u64;
+
+    if let Some(ring_handle) = global_registry().open(&name) {
+        if let Some(mut ring) = ring_handle.try_lock() {
+            let before = ring.header().ok();
+            if operation_id == K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_WRITE_MIX {
+                // VOut: host wrote mixed audio into buffer -> push to SHM ring.
+                if ring.write_interleaved(buffer).is_err() {
+                    overrun_delta = overrun_delta.saturating_add(1);
+                    xrun_delta = xrun_delta.saturating_add(1);
+                }
+            } else if operation_id == K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_READ_INPUT {
+                // VIn: pull audio from SHM ring -> host reads from buffer.
+                if ring.read_interleaved(buffer).is_err() {
+                    buffer.fill(0.0);
+                    underrun_delta = underrun_delta.saturating_add(1);
+                    xrun_delta = xrun_delta.saturating_add(1);
+                }
+            }
+            let after = ring.header().ok();
+            if let (Some(before), Some(after)) = (before, after) {
+                let overrun = after.overrun_count.saturating_sub(before.overrun_count);
+                let underrun = after.underrun_count.saturating_sub(before.underrun_count);
+                overrun_delta = overrun_delta.saturating_add(overrun);
+                underrun_delta = underrun_delta.saturating_add(underrun);
+                xrun_delta = xrun_delta.saturating_add(overrun.saturating_add(underrun));
+            }
+        } else if operation_id == K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_WRITE_MIX {
+            // Non-blocking policy: drop current frame on contention.
+            overrun_delta = overrun_delta.saturating_add(1);
+            xrun_delta = xrun_delta.saturating_add(1);
+        } else if operation_id == K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_READ_INPUT {
+            // Non-blocking policy: return silence on contention.
+            buffer.fill(0.0);
+            underrun_delta = underrun_delta.saturating_add(1);
+            xrun_delta = xrun_delta.saturating_add(1);
+        }
+    } else if operation_id == K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_WRITE_MIX {
+        // Ring unavailable: drop current frame.
+        overrun_delta = overrun_delta.saturating_add(1);
+        xrun_delta = xrun_delta.saturating_add(1);
     } else if operation_id == K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_READ_INPUT {
-        // VIn: pull audio from SHM ring → host reads from buffer.
-        let _ = ring.read_interleaved(buffer);
+        // Ring unavailable: return silence.
+        buffer.fill(0.0);
+        underrun_delta = underrun_delta.saturating_add(1);
+        xrun_delta = xrun_delta.saturating_add(1);
+    }
+
+    {
+        let mut state = DRIVER_STATE.lock();
+        state.runtime.underrun_count = state.runtime.underrun_count.saturating_add(underrun_delta);
+        state.runtime.overrun_count = state.runtime.overrun_count.saturating_add(overrun_delta);
+        state.runtime.xrun_count = state.runtime.xrun_count.saturating_add(xrun_delta);
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+        state.runtime.last_callback_ns = now_ns;
     }
 
     K_AUDIO_HARDWARE_NO_ERROR
@@ -1390,6 +1439,7 @@ fn cfdata_create(bytes: &[u8]) -> *const c_void {
 // ===========================================================================
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::ffi::c_void;
 
@@ -1472,11 +1522,11 @@ mod tests {
 
         {
             let mut reg = PLUGIN.object_registry.lock();
-            let device = reg
-                .devices
-                .get_mut(&uid)
-                .expect("device inserted in registry");
-            device.io_running = true;
+            let device = reg.devices.get_mut(&uid);
+            assert!(device.is_some(), "device inserted in registry");
+            if let Some(device) = device {
+                device.io_running = true;
+            }
         }
 
         out_size = 0;

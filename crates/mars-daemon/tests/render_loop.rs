@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![allow(clippy::expect_used)]
 
 use std::collections::HashMap;
 use std::thread;
