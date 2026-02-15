@@ -4,8 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use mars_types::{
-    NodeDescriptor, NodeKind, PipeDescriptor, Profile, VirtualInputDevice,
-    VirtualOutputDevice,
+    NodeDescriptor, NodeKind, PipeDescriptor, Profile, VirtualInputDevice, VirtualOutputDevice,
 };
 use petgraph::algo::is_cyclic_directed;
 use petgraph::graph::DiGraph;

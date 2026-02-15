@@ -340,15 +340,13 @@ const fn default_enabled() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Default)]
 pub struct Policy {
     #[serde(default)]
     pub on_missing_external: MissingExternalPolicy,
     #[serde(default)]
     pub apply_mode: ApplyMode,
 }
-
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -445,8 +443,7 @@ pub struct ApplyResult {
     pub errors: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Default)]
 pub struct RuntimeCounters {
     pub underrun_count: u64,
     pub overrun_count: u64,
@@ -454,9 +451,7 @@ pub struct RuntimeCounters {
     pub deadline_miss_count: u64,
 }
 
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 pub struct DriverStatusSummary {
     pub generation: u64,
     pub request_count: u64,
@@ -464,7 +459,6 @@ pub struct DriverStatusSummary {
     pub applied_device_count: usize,
     pub pending_change: bool,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct DeviceDescriptor {

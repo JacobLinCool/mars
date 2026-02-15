@@ -9,8 +9,9 @@ Cause:
 Fix:
 
 1. Run `./scripts/install.sh`.
-2. If required by your macOS build, restart `coreaudiod` or reboot.
-3. Re-run `mars doctor`.
+2. Reload CoreAudio: `sudo killall -9 coreaudiod`.
+3. If still needed on your macOS build, reboot.
+4. Re-run `mars doctor`.
 
 ## `mars` cannot reach daemon (exit 5)
 

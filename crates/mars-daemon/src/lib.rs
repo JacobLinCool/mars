@@ -35,8 +35,7 @@ pub struct MarsDaemon {
     log_path: PathBuf,
 }
 
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 struct DaemonState {
     current_profile_path: Option<String>,
     current_profile: Option<Profile>,
@@ -45,7 +44,6 @@ struct DaemonState {
     devices: Vec<DeviceDescriptor>,
     counters: RuntimeCounters,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DriverAppliedState {
@@ -939,7 +937,7 @@ fn ensure_driver_available() -> Result<(), String> {
     }
 
     if !mars_hal_client::is_driver_loaded() {
-        return Err("mars.driver bundle exists but plugin is not loaded by coreaudiod; try: sudo launchctl kickstart -k system/com.apple.audio.coreaudiod".to_string());
+        return Err("mars.driver bundle exists but plugin is not loaded by coreaudiod; try: sudo killall -9 coreaudiod".to_string());
     }
 
     Ok(())
@@ -948,6 +946,11 @@ fn ensure_driver_available() -> Result<(), String> {
 fn doctor_report() -> mars_types::DoctorReport {
     let driver_installed = Path::new("/Library/Audio/Plug-Ins/HAL/mars.driver").exists();
     let daemon_reachable = true;
+    let driver_loaded = if driver_installed {
+        mars_hal_client::is_driver_loaded()
+    } else {
+        false
+    };
     let driver = driver_status_summary();
     let microphone_permission_ok = std::env::var("MARS_ASSUME_MIC_PERMISSION")
         .as_deref()
@@ -957,6 +960,9 @@ fn doctor_report() -> mars_types::DoctorReport {
     let mut notes = Vec::new();
     if !driver_installed {
         notes.push("driver not found at /Library/Audio/Plug-Ins/HAL/mars.driver".to_string());
+    }
+    if driver_installed && !driver_loaded {
+        notes.push("mars.driver is installed but not loaded by coreaudiod; run: sudo killall -9 coreaudiod".to_string());
     }
     if !microphone_permission_ok {
         notes.push(

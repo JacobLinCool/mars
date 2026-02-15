@@ -125,7 +125,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             if path.exists() && !force {
                 return Err(CliError::WithExit {
                     message: format!(
-                        "profile already exists: {} (use --force to overwrite)",
+                        "profile already exists: '{}' (use --force to overwrite)",
                         path.display()
                     ),
                     exit_code: ExitCode::InvalidInput,
@@ -142,7 +142,9 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 "path": path.display().to_string(),
                 "created": true,
             });
-            print_output(cli.json, &payload, || format!("created {}", path.display()))?;
+            print_output(cli.json, &payload, || {
+                format!("created '{}'", path.display())
+            })?;
             Ok(ExitCode::Success)
         }
         Commands::Open {
@@ -153,7 +155,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let path = profile_path(&profile_name)?;
             if !path.exists() {
                 return Err(CliError::WithExit {
-                    message: format!("profile not found: {}", path.display()),
+                    message: format!("profile not found: '{}'", path.display()),
                     exit_code: ExitCode::InvalidInput,
                 });
             }
@@ -172,7 +174,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let status = command.status()?;
             if !status.success() {
                 return Err(CliError::WithExit {
-                    message: format!("failed to open profile: {}", path.display()),
+                    message: format!("failed to open profile: '{}'", path.display()),
                     exit_code: ExitCode::InvalidInput,
                 });
             }
@@ -181,7 +183,9 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 "opened": true,
                 "path": path.display().to_string(),
             });
-            print_output(cli.json, &payload, || format!("opened {}", path.display()))?;
+            print_output(cli.json, &payload, || {
+                format!("opened '{}'", path.display())
+            })?;
             Ok(ExitCode::Success)
         }
         Commands::Apply {
@@ -193,7 +197,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let profile_path = profile_path(&profile_name)?;
             if !profile_path.exists() {
                 return Err(CliError::WithExit {
-                    message: format!("profile not found: {}", profile_path.display()),
+                    message: format!("profile not found: '{}'", profile_path.display()),
                     exit_code: ExitCode::InvalidInput,
                 });
             }
@@ -258,7 +262,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let profile_path = profile_path(&profile_name)?;
             if !profile_path.exists() {
                 return Err(CliError::WithExit {
-                    message: format!("profile not found: {}", profile_path.display()),
+                    message: format!("profile not found: '{}'", profile_path.display()),
                     exit_code: ExitCode::InvalidInput,
                 });
             }
@@ -298,7 +302,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let profile_path = profile_path(&profile_name)?;
             if !profile_path.exists() {
                 return Err(CliError::WithExit {
-                    message: format!("profile not found: {}", profile_path.display()),
+                    message: format!("profile not found: '{}'", profile_path.display()),
                     exit_code: ExitCode::InvalidInput,
                 });
             }

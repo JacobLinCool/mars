@@ -284,8 +284,12 @@ fn build_change_plan(applied: &AppliedState, desired: &DesiredState) -> Vec<Conf
             target: "audio".to_string(),
             details: format!(
                 "sample_rate {} -> {}, channels {} -> {}, buffer_frames {} -> {}",
-                applied.sample_rate, desired.sample_rate, applied.channels, desired.channels,
-                applied.buffer_frames, desired.buffer_frames
+                applied.sample_rate,
+                desired.sample_rate,
+                applied.channels,
+                desired.channels,
+                applied.buffer_frames,
+                desired.buffer_frames
             ),
         });
     }

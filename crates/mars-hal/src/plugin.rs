@@ -1130,8 +1130,7 @@ unsafe fn set_desired_state_from_raw(data: *const c_void, data_size: UInt32) -> 
     }
 
     // SAFETY: `data` is non-null (checked by caller) and large enough for a pointer.
-    let cf_data: *const c_void =
-        unsafe { core::ptr::read_unaligned(data.cast::<*const c_void>()) };
+    let cf_data: *const c_void = unsafe { core::ptr::read_unaligned(data.cast::<*const c_void>()) };
     if cf_data.is_null() {
         return K_AUDIO_HARDWARE_ILLEGAL_OPERATION_ERROR;
     }

@@ -16,31 +16,29 @@ cargo build
 cargo test
 ```
 
-## Install (dev-first)
+## Getting Started
+
+See the full setup and first-run guide: `docs/getting-started.md`.
+
+Quick install:
 
 ```bash
 ./scripts/install.sh
 ```
 
-This installs:
+Run as your normal user (do not prefix with `sudo`).
 
-- `/usr/local/bin/mars`
-- `/usr/local/bin/marsd`
-- `/Library/Audio/Plug-Ins/HAL/mars.driver`
-- `~/Library/LaunchAgents/com.mars.marsd.plist`
-
-## Uninstall
+Quick health check:
 
 ```bash
-./scripts/uninstall.sh
+mars doctor
 ```
 
-This removes:
+If logs report `Mars driver plugin not found in loaded CoreAudio plugins`, run:
 
-- `/usr/local/bin/mars` and `/usr/local/bin/marsd`
-- `/Library/Audio/Plug-Ins/HAL/mars.driver` (requires sudo)
-- `~/Library/LaunchAgents/com.mars.marsd.plist`
-- `~/Library/Caches/mars`
+```bash
+sudo killall -9 coreaudiod
+```
 
 ## Usage
 
@@ -54,6 +52,16 @@ mars status --json
 mars doctor
 mars clear
 ```
+
+## Uninstall
+
+```bash
+./scripts/uninstall.sh
+```
+
+Run as your normal user (do not prefix with `sudo`).
+
+For more operational commands and runtime paths, see `docs/operator-guide.md`.
 
 ## Development mode without system driver
 
