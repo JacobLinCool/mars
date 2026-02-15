@@ -467,6 +467,10 @@ pub struct DriverStatusSummary {
 pub struct ExternalRuntimeStatus {
     pub connected_inputs: usize,
     pub connected_outputs: usize,
+    #[serde(default)]
+    pub degraded_inputs: usize,
+    #[serde(default)]
+    pub degraded_outputs: usize,
     pub restart_attempts: u64,
     #[serde(default)]
     pub stream_errors: Vec<String>,

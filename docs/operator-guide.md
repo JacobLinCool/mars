@@ -21,6 +21,30 @@ A profile is addressed by file name stem (`<name>.yaml`).
 - `mars logs [--follow]`
 - `mars doctor [--json]`
 
+## Runtime behavior notes
+
+- External I/O uses `Degrade + Heal` at runtime:
+  - Input endpoint disconnect: MARS fills silence and keeps routing active.
+  - Output endpoint disconnect: MARS drops that endpoint's output and keeps routing active.
+  - A background recovery supervisor retries reconnect with exponential backoff.
+- `mars status --json` includes `external_runtime.degraded_inputs` and `external_runtime.degraded_outputs`.
+- `external_runtime.stream_errors` is capped (ring buffer) to avoid unbounded growth.
+
+## Log cursor semantics
+
+- `mars logs` / daemon `LogResponse.next_cursor` now represent a byte offset in `marsd.log`.
+- `cursor=None` returns tail lines (default `200`) and a byte offset cursor.
+- `cursor=<offset>` returns incremental lines from that byte position.
+- If the log is rotated or truncated, the daemon falls back to tail mode automatically.
+
+## External match semantics
+
+- `uid`/`name`/`name_regex` remain strict match filters.
+- `manufacturer`/`transport` are best-effort:
+  - When metadata exists, it must match.
+  - When metadata is unavailable, the candidate is treated as `unknown` (not immediate mismatch).
+  - Matches that rely on unknown metadata emit warnings in `plan`/`apply`.
+
 ## Exit codes
 
 - `0`: success

@@ -38,6 +38,47 @@ Fix:
 2. Update profile `match` fields (strict mode rejects `fallback`).
 3. Re-run `mars validate` and `mars plan`.
 
+Notes:
+
+- `manufacturer` / `transport` matching is best-effort when metadata is unavailable on the host.
+- If matching succeeded via unknown metadata, `plan` / `apply` warnings will mention it.
+
+## External endpoint disconnects during runtime
+
+Cause:
+
+- An external input/output stream was interrupted (device unplugged, transport reset, CoreAudio stream error).
+
+Behavior:
+
+- MARS keeps the graph running and enters degraded mode for the failed endpoint(s).
+- Input endpoint degraded: silence is injected.
+- Output endpoint degraded: endpoint output is dropped.
+- Background reconnect retries run with backoff.
+
+Fix:
+
+1. Check `mars status --json` fields:
+   - `external_runtime.connected_inputs`
+   - `external_runtime.connected_outputs`
+   - `external_runtime.degraded_inputs`
+   - `external_runtime.degraded_outputs`
+2. Inspect recent stream errors:
+   - `mars logs`
+3. Reconnect the physical/virtual device and wait for retry, or re-apply profile if needed.
+
+## `mars logs --follow` misses lines after log rotation
+
+Cause:
+
+- `marsd.log` was truncated or rotated while following.
+
+Fix:
+
+1. Re-run `mars logs --follow`; cursoring uses byte offsets and auto-recovers from truncation.
+2. If needed, fetch a fresh tail snapshot:
+   - `mars logs`
+
 ## No microphone audio from external input
 
 Cause:

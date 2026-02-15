@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -583,8 +584,8 @@ impl MarsDaemon {
         if request.dry_run {
             return Ok(ApplyResult {
                 applied: false,
+                warnings: plan.warnings.clone(),
                 plan,
-                warnings: Vec::new(),
                 errors: Vec::new(),
             });
         }
@@ -908,7 +909,7 @@ impl MarsDaemon {
     }
 
     fn logs_internal(&self, request: &LogRequest) -> Result<LogResponse, ApiError> {
-        let data = fs::read_to_string(&self.log_path).map_err(|error| {
+        let mut file = fs::File::open(&self.log_path).map_err(|error| {
             ApiError::new(
                 format!(
                     "failed to read log file {}: {error}",
@@ -917,26 +918,74 @@ impl MarsDaemon {
                 ExitCode::InvalidInput,
             )
         })?;
-        let all_lines = data.lines().map(ToOwned::to_owned).collect::<VecDeque<_>>();
-        let total = all_lines.len() as u64;
+        let file_len = file
+            .metadata()
+            .map_err(|error| {
+                ApiError::new(
+                    format!(
+                        "failed to read log metadata {}: {error}",
+                        self.log_path.display()
+                    ),
+                    ExitCode::InvalidInput,
+                )
+            })?
+            .len();
         let limit = request.limit.unwrap_or(200) as usize;
+        let effective_limit = request.limit.map(|value| value as usize);
 
-        let start = if let Some(cursor) = request.cursor {
-            if cursor <= total {
-                cursor as usize
+        let (lines, next_cursor) = if let Some(cursor) = request.cursor {
+            if cursor <= file_len {
+                read_lines_from_offset(&mut file, cursor, effective_limit).map_err(|error| {
+                    ApiError::new(
+                        format!(
+                            "failed to read log file {} from offset {cursor}: {error}",
+                            self.log_path.display()
+                        ),
+                        ExitCode::InvalidInput,
+                    )
+                })?
             } else {
-                total.saturating_sub(limit as u64) as usize
+                let start = tail_start_offset(&mut file, limit).map_err(|error| {
+                    ApiError::new(
+                        format!(
+                            "failed to compute tail offset for {}: {error}",
+                            self.log_path.display()
+                        ),
+                        ExitCode::InvalidInput,
+                    )
+                })?;
+                read_lines_from_offset(&mut file, start, Some(limit)).map_err(|error| {
+                    ApiError::new(
+                        format!(
+                            "failed to read log tail from {}: {error}",
+                            self.log_path.display()
+                        ),
+                        ExitCode::InvalidInput,
+                    )
+                })?
             }
         } else {
-            total.saturating_sub(limit as u64) as usize
+            let start = tail_start_offset(&mut file, limit).map_err(|error| {
+                ApiError::new(
+                    format!(
+                        "failed to compute tail offset for {}: {error}",
+                        self.log_path.display()
+                    ),
+                    ExitCode::InvalidInput,
+                )
+            })?;
+            read_lines_from_offset(&mut file, start, Some(limit)).map_err(|error| {
+                ApiError::new(
+                    format!(
+                        "failed to read log tail from {}: {error}",
+                        self.log_path.display()
+                    ),
+                    ExitCode::InvalidInput,
+                )
+            })?
         };
 
-        let lines = all_lines.into_iter().skip(start).collect::<Vec<_>>();
-
-        Ok(LogResponse {
-            lines,
-            next_cursor: total,
-        })
+        Ok(LogResponse { lines, next_cursor })
     }
 
     fn doctor_report_internal(&self) -> mars_types::DoctorReport {
@@ -1046,6 +1095,79 @@ impl RequestHandler for MarsDaemon {
             DaemonRequest::Doctor => Ok(DaemonResponse::Doctor(self.doctor_report_internal())),
         }
     }
+}
+
+fn read_lines_from_offset(
+    file: &mut fs::File,
+    offset: u64,
+    limit: Option<usize>,
+) -> Result<(Vec<String>, u64), std::io::Error> {
+    file.seek(SeekFrom::Start(offset))?;
+    let mut reader = BufReader::new(file);
+    let mut lines = Vec::new();
+    let mut buffer = Vec::<u8>::new();
+    let mut consumed = 0_u64;
+
+    loop {
+        if let Some(limit) = limit {
+            if lines.len() >= limit {
+                break;
+            }
+        }
+
+        buffer.clear();
+        let read = reader.read_until(b'\n', &mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        consumed = consumed.saturating_add(read as u64);
+        lines.push(String::from_utf8_lossy(trim_line_endings(&buffer)).to_string());
+    }
+
+    Ok((lines, offset.saturating_add(consumed)))
+}
+
+fn tail_start_offset(file: &mut fs::File, line_limit: usize) -> Result<u64, std::io::Error> {
+    let file_len = file.metadata()?.len();
+    if file_len == 0 || line_limit == 0 {
+        return Ok(file_len);
+    }
+
+    const CHUNK_SIZE: usize = 8192;
+    let mut cursor = file_len;
+    let mut found_newlines = 0usize;
+    let mut start = 0u64;
+    let mut buffer = vec![0_u8; CHUNK_SIZE];
+
+    'scan: while cursor > 0 {
+        let read_len = usize::try_from(cursor.min(CHUNK_SIZE as u64)).unwrap_or(CHUNK_SIZE);
+        cursor = cursor.saturating_sub(read_len as u64);
+        file.seek(SeekFrom::Start(cursor))?;
+        file.read_exact(&mut buffer[..read_len])?;
+
+        for index in (0..read_len).rev() {
+            if buffer[index] == b'\n' {
+                found_newlines = found_newlines.saturating_add(1);
+                if found_newlines > line_limit {
+                    start = cursor.saturating_add(index as u64).saturating_add(1);
+                    break 'scan;
+                }
+            }
+        }
+    }
+
+    Ok(start)
+}
+
+fn trim_line_endings(bytes: &[u8]) -> &[u8] {
+    let mut end = bytes.len();
+    if end > 0 && bytes[end - 1] == b'\n' {
+        end -= 1;
+    }
+    if end > 0 && bytes[end - 1] == b'\r' {
+        end -= 1;
+    }
+    &bytes[..end]
 }
 
 fn coreaudio_to_api_error(error: CoreAudioError) -> ApiError {
@@ -1807,12 +1929,24 @@ pub fn setup_logging() -> anyhow::Result<tracing_appender::non_blocking::WorkerG
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::path::PathBuf;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use mars_ipc::LogRequest;
     use mars_types::{Pipe, Profile, VirtualInputDevice, VirtualOutputDevice};
 
     use super::{MarsDaemon, diff_profiles, is_driver_compatible};
+
+    fn temp_log_path(case: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("mars-daemon-{case}-{nanos}.log"))
+    }
 
     #[test]
     fn diff_detects_create_remove() {
@@ -1893,5 +2027,61 @@ mod tests {
         let error =
             MarsDaemon::ensure_within_deadline(deadline, "driver-stage").expect_err("timed out");
         assert!(error.message.contains("driver-stage"));
+    }
+
+    #[test]
+    fn logs_cursor_returns_incremental_lines() {
+        let path = temp_log_path("incremental");
+        fs::write(&path, "one\ntwo\nthree\n").expect("seed log");
+        let daemon = MarsDaemon::new(path.clone());
+
+        let initial = daemon
+            .logs_internal(&LogRequest {
+                follow: false,
+                cursor: None,
+                limit: Some(2),
+            })
+            .expect("initial logs");
+        assert_eq!(initial.lines, vec!["two".to_string(), "three".to_string()]);
+
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open append");
+        writeln!(file, "four").expect("append four");
+        writeln!(file, "five").expect("append five");
+
+        let delta = daemon
+            .logs_internal(&LogRequest {
+                follow: true,
+                cursor: Some(initial.next_cursor),
+                limit: None,
+            })
+            .expect("delta logs");
+        assert_eq!(delta.lines, vec!["four".to_string(), "five".to_string()]);
+        assert!(delta.next_cursor > initial.next_cursor);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn logs_cursor_beyond_file_len_falls_back_to_tail() {
+        let path = temp_log_path("cursor-fallback");
+        fs::write(&path, "a\nb\nc\nd\n").expect("seed log");
+        let daemon = MarsDaemon::new(path.clone());
+
+        let result = daemon
+            .logs_internal(&LogRequest {
+                follow: false,
+                cursor: Some(9_999),
+                limit: Some(2),
+            })
+            .expect("fallback logs");
+        assert_eq!(result.lines, vec!["c".to_string(), "d".to_string()]);
+
+        let len = fs::metadata(&path).expect("metadata").len();
+        assert_eq!(result.next_cursor, len);
+
+        let _ = fs::remove_file(path);
     }
 }

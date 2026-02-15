@@ -2,10 +2,13 @@
 //! CoreAudio device discovery and external device matching.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
@@ -120,13 +123,21 @@ pub fn resolve_externals(profile: &Profile, inventory: &DeviceInventory) -> Exte
         let found = find_match(&endpoint.r#match, &inventory.inputs);
 
         match found {
-            Some(device) => resolution.resolved.push(ResolvedExternalDevice {
-                logical_id: endpoint.id.clone(),
-                matched_uid: device.uid.clone(),
-                name: device.name.clone(),
-                kind: NodeKind::ExternalInput,
-                channels: endpoint.channels.unwrap_or(device.channels),
-            }),
+            Some(result) => {
+                if result.used_unknown_metadata {
+                    resolution.warnings.push(format!(
+                        "external endpoint '{}' matched '{}' using best-effort metadata (manufacturer/transport unavailable)",
+                        endpoint.id, result.device.name
+                    ));
+                }
+                resolution.resolved.push(ResolvedExternalDevice {
+                    logical_id: endpoint.id.clone(),
+                    matched_uid: result.device.uid.clone(),
+                    name: result.device.name.clone(),
+                    kind: NodeKind::ExternalInput,
+                    channels: endpoint.channels.unwrap_or(result.device.channels),
+                });
+            }
             None => resolution
                 .errors
                 .push(format!("external endpoint '{}' is missing", endpoint.id)),
@@ -137,13 +148,21 @@ pub fn resolve_externals(profile: &Profile, inventory: &DeviceInventory) -> Exte
         let found = find_match(&endpoint.r#match, &inventory.outputs);
 
         match found {
-            Some(device) => resolution.resolved.push(ResolvedExternalDevice {
-                logical_id: endpoint.id.clone(),
-                matched_uid: device.uid.clone(),
-                name: device.name.clone(),
-                kind: NodeKind::ExternalOutput,
-                channels: endpoint.channels.unwrap_or(device.channels),
-            }),
+            Some(result) => {
+                if result.used_unknown_metadata {
+                    resolution.warnings.push(format!(
+                        "external endpoint '{}' matched '{}' using best-effort metadata (manufacturer/transport unavailable)",
+                        endpoint.id, result.device.name
+                    ));
+                }
+                resolution.resolved.push(ResolvedExternalDevice {
+                    logical_id: endpoint.id.clone(),
+                    matched_uid: result.device.uid.clone(),
+                    name: result.device.name.clone(),
+                    kind: NodeKind::ExternalOutput,
+                    channels: endpoint.channels.unwrap_or(result.device.channels),
+                });
+            }
             None => resolution
                 .errors
                 .push(format!("external endpoint '{}' is missing", endpoint.id)),
@@ -153,10 +172,16 @@ pub fn resolve_externals(profile: &Profile, inventory: &DeviceInventory) -> Exte
     resolution
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MatchResult<'a> {
+    device: &'a ExternalDeviceInfo,
+    used_unknown_metadata: bool,
+}
+
 fn find_match<'a>(
     criteria: &mars_types::DeviceMatch,
     candidates: &'a [ExternalDeviceInfo],
-) -> Option<&'a ExternalDeviceInfo> {
+) -> Option<MatchResult<'a>> {
     let regex = match criteria.name_regex.as_ref() {
         Some(value) => match Regex::new(value) {
             Ok(compiled) => Some(compiled),
@@ -164,34 +189,57 @@ fn find_match<'a>(
         },
         None => None,
     };
+    let metadata_requested = criteria.manufacturer.is_some() || criteria.transport.is_some();
+    let mut best: Option<(u8, u8, MatchResult<'_>)> = None;
 
-    candidates.iter().find(|candidate| {
+    for candidate in candidates {
         if let Some(uid) = criteria.uid.as_ref() {
             if candidate.uid != *uid {
-                return false;
+                continue;
             }
         }
         if let Some(name) = criteria.name.as_ref() {
             if candidate.name != *name {
-                return false;
-            }
-        }
-        if let Some(ref manufacturer) = criteria.manufacturer {
-            if candidate.manufacturer.as_ref() != Some(manufacturer) {
-                return false;
-            }
-        }
-        if let Some(transport) = criteria.transport {
-            if candidate.transport != Some(transport) {
-                return false;
+                continue;
             }
         }
         if let Some(ref regex) = regex {
-            regex.is_match(&candidate.name)
-        } else {
-            true
+            if !regex.is_match(&candidate.name) {
+                continue;
+            }
         }
-    })
+
+        let mut matched_known_metadata = 0_u8;
+        let mut used_unknown_metadata = false;
+        if let Some(ref manufacturer) = criteria.manufacturer {
+            match candidate.manufacturer.as_ref() {
+                Some(value) if value == manufacturer => matched_known_metadata += 1,
+                Some(_) => continue,
+                None => used_unknown_metadata = true,
+            }
+        }
+        if let Some(transport) = criteria.transport {
+            match candidate.transport {
+                Some(value) if value == transport => matched_known_metadata += 1,
+                Some(_) => continue,
+                None => used_unknown_metadata = true,
+            }
+        }
+
+        let known_rank = if !used_unknown_metadata { 1 } else { 0 };
+        let result = MatchResult {
+            device: candidate,
+            used_unknown_metadata: metadata_requested && used_unknown_metadata,
+        };
+        match &best {
+            Some((best_known, best_matched, _))
+                if *best_known > known_rank
+                    || (*best_known == known_rank && *best_matched >= matched_known_metadata) => {}
+            _ => best = Some((known_rank, matched_known_metadata, result)),
+        }
+    }
+
+    best.map(|(_, _, result)| result)
 }
 
 fn collect_output_details(configs: cpal::SupportedOutputConfigs) -> (u16, Vec<u32>) {
@@ -227,6 +275,12 @@ fn collect_input_details(configs: cpal::SupportedInputConfigs) -> (u16, Vec<u32>
 }
 
 const EXTERNAL_QUEUE_PERIODS: usize = 16;
+const STREAM_ERROR_RING_CAPACITY: usize = 64;
+const RECOVERY_EVENT_CAPACITY: usize = 256;
+const RECOVERY_BASE_BACKOFF_MS: u64 = 250;
+const RECOVERY_MAX_BACKOFF_MS: u64 = 10_000;
+const RECOVERY_JITTER_MAX_MS: u64 = 200;
+const RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct ExternalEndpointConfig {
@@ -248,40 +302,103 @@ pub struct ExternalRuntimeSnapshot {
     pub counters: ExternalRuntimeCounters,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointKind {
+    Input,
+    Output,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointPhase {
+    Connected,
+    Degraded,
+    Reconnecting,
+    Stopped,
+}
+
+impl EndpointPhase {
+    const fn is_connected(self) -> bool {
+        matches!(self, Self::Connected)
+    }
+
+    const fn is_degraded(self) -> bool {
+        matches!(self, Self::Degraded | Self::Reconnecting)
+    }
+}
+
 #[derive(Debug)]
+enum RecoveryEvent {
+    StreamError { kind: EndpointKind, node_id: String },
+    StopRequested,
+}
+
+struct InputEndpointRuntime {
+    device_channels: usize,
+    phase: EndpointPhase,
+    attempts: u32,
+    next_retry_at: Option<Instant>,
+    stream: Option<Stream>,
+}
+
+struct OutputEndpointRuntime {
+    device_channels: usize,
+    max_samples: usize,
+    phase: EndpointPhase,
+    attempts: u32,
+    next_retry_at: Option<Instant>,
+    stream: Option<Stream>,
+}
+
+#[derive(Clone)]
 struct InputEndpoint {
     node_id: String,
+    uid: String,
     node_channels: usize,
-    device_channels: usize,
+    sample_rate: u32,
+    buffer_frames: u32,
     queue: Arc<Mutex<VecDeque<f32>>>,
+    runtime: Arc<Mutex<InputEndpointRuntime>>,
 }
 
-#[derive(Debug)]
+#[derive(Clone)]
 struct OutputEndpoint {
     node_id: String,
+    uid: String,
     node_channels: usize,
-    device_channels: usize,
+    sample_rate: u32,
+    buffer_frames: u32,
     queue: Arc<Mutex<VecDeque<f32>>>,
-    max_samples: usize,
+    runtime: Arc<Mutex<OutputEndpointRuntime>>,
 }
 
-pub struct ExternalIoRuntime {
-    input_streams: Vec<Stream>,
-    output_streams: Vec<Stream>,
-    input_endpoints: BTreeMap<String, InputEndpoint>,
-    output_endpoints: BTreeMap<String, OutputEndpoint>,
-    stream_errors: Arc<Mutex<Vec<String>>>,
+struct RecoveryContext {
+    recovery_tx: SyncSender<RecoveryEvent>,
+    recovery_stop: Arc<std::sync::atomic::AtomicBool>,
+    stream_errors: Arc<Mutex<VecDeque<String>>>,
     restart_attempts: Arc<AtomicU64>,
     underrun_count: Arc<AtomicU64>,
     overrun_count: Arc<AtomicU64>,
     xrun_count: Arc<AtomicU64>,
+    input_endpoints: Vec<InputEndpoint>,
+    output_endpoints: Vec<OutputEndpoint>,
+}
+
+pub struct ExternalIoRuntime {
+    input_endpoints: BTreeMap<String, InputEndpoint>,
+    output_endpoints: BTreeMap<String, OutputEndpoint>,
+    stream_errors: Arc<Mutex<VecDeque<String>>>,
+    restart_attempts: Arc<AtomicU64>,
+    underrun_count: Arc<AtomicU64>,
+    overrun_count: Arc<AtomicU64>,
+    xrun_count: Arc<AtomicU64>,
+    recovery_tx: SyncSender<RecoveryEvent>,
+    recovery_stop: Arc<std::sync::atomic::AtomicBool>,
+    recovery_handle: Option<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for ExternalIoRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExternalIoRuntime")
-            .field("input_streams", &self.input_streams.len())
-            .field("output_streams", &self.output_streams.len())
             .field(
                 "input_endpoints",
                 &self.input_endpoints.keys().collect::<Vec<_>>(),
@@ -294,6 +411,27 @@ impl std::fmt::Debug for ExternalIoRuntime {
     }
 }
 
+impl Drop for ExternalIoRuntime {
+    fn drop(&mut self) {
+        self.recovery_stop.store(true, Ordering::Relaxed);
+        let _ = self.recovery_tx.try_send(RecoveryEvent::StopRequested);
+        if let Some(handle) = self.recovery_handle.take() {
+            let _ = handle.join();
+        }
+
+        for endpoint in self.input_endpoints.values() {
+            let mut runtime = endpoint.runtime.lock();
+            runtime.phase = EndpointPhase::Stopped;
+            runtime.stream = None;
+        }
+        for endpoint in self.output_endpoints.values() {
+            let mut runtime = endpoint.runtime.lock();
+            runtime.phase = EndpointPhase::Stopped;
+            runtime.stream = None;
+        }
+    }
+}
+
 impl ExternalIoRuntime {
     pub fn start(
         sample_rate: u32,
@@ -301,144 +439,99 @@ impl ExternalIoRuntime {
         inputs: &[ExternalEndpointConfig],
         outputs: &[ExternalEndpointConfig],
     ) -> Result<Self, CoreAudioError> {
-        let host = cpal::default_host();
-
-        let stream_errors = Arc::new(Mutex::new(Vec::new()));
+        let stream_errors = Arc::new(Mutex::new(VecDeque::new()));
         let restart_attempts = Arc::new(AtomicU64::new(0));
         let underrun_count = Arc::new(AtomicU64::new(0));
         let overrun_count = Arc::new(AtomicU64::new(0));
         let xrun_count = Arc::new(AtomicU64::new(0));
+        let recovery_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (recovery_tx, recovery_rx) = sync_channel::<RecoveryEvent>(RECOVERY_EVENT_CAPACITY);
 
-        let mut input_streams = Vec::new();
-        let mut output_streams = Vec::new();
         let mut input_endpoints = BTreeMap::new();
         let mut output_endpoints = BTreeMap::new();
 
         for endpoint in inputs {
-            let device = find_device_by_uid(&host, &endpoint.uid)?;
-            let (stream_config, sample_format) =
-                select_input_stream_config(&device, endpoint.channels, sample_rate).map_err(
-                    |reason| CoreAudioError::BuildInputStream {
-                        uid: endpoint.uid.clone(),
-                        reason,
-                    },
-                )?;
-            let device_channels = stream_config.channels as usize;
             let queue = Arc::new(Mutex::new(VecDeque::<f32>::new()));
-            let max_samples =
-                buffer_frames as usize * EXTERNAL_QUEUE_PERIODS * device_channels.max(1);
-
-            let callback_queue = queue.clone();
-            let callback_overrun = overrun_count.clone();
-            let callback_errors = stream_errors.clone();
-            let callback_xrun = xrun_count.clone();
-            let callback_xrun_error = callback_xrun.clone();
-            let uid = endpoint.uid.clone();
-            let stream = build_input_stream_for_format(
-                &device,
-                sample_format,
-                &stream_config,
-                move |samples| {
-                    push_samples(
-                        &callback_queue,
-                        samples,
-                        max_samples,
-                        &callback_overrun,
-                        &callback_xrun,
-                    );
-                },
-                move |error| {
-                    callback_xrun_error.fetch_add(1, Ordering::Relaxed);
-                    callback_errors
-                        .lock()
-                        .push(format!("external input stream error for '{uid}': {error}"));
-                },
-            )
-            .map_err(|reason| CoreAudioError::BuildInputStream {
+            let runtime = Arc::new(Mutex::new(InputEndpointRuntime {
+                device_channels: endpoint.channels as usize,
+                phase: EndpointPhase::Degraded,
+                attempts: 0,
+                next_retry_at: None,
+                stream: None,
+            }));
+            let input_endpoint = InputEndpoint {
+                node_id: endpoint.node_id.clone(),
                 uid: endpoint.uid.clone(),
-                reason,
-            })?;
-            stream.play().map_err(|error| CoreAudioError::StartStream {
-                uid: endpoint.uid.clone(),
-                reason: error.to_string(),
-            })?;
-
-            input_endpoints.insert(
-                endpoint.node_id.clone(),
-                InputEndpoint {
-                    node_id: endpoint.node_id.clone(),
-                    node_channels: endpoint.channels as usize,
-                    device_channels,
-                    queue,
-                },
-            );
-            input_streams.push(stream);
+                node_channels: endpoint.channels as usize,
+                sample_rate,
+                buffer_frames,
+                queue,
+                runtime,
+            };
+            connect_input_endpoint(
+                &input_endpoint,
+                &recovery_tx,
+                &stream_errors,
+                &overrun_count,
+                &xrun_count,
+            )?;
+            input_endpoints.insert(input_endpoint.node_id.clone(), input_endpoint);
         }
 
         for endpoint in outputs {
-            let device = find_device_by_uid(&host, &endpoint.uid)?;
-            let (stream_config, sample_format) =
-                select_output_stream_config(&device, endpoint.channels, sample_rate).map_err(
-                    |reason| CoreAudioError::BuildOutputStream {
-                        uid: endpoint.uid.clone(),
-                        reason,
-                    },
-                )?;
-            let device_channels = stream_config.channels as usize;
             let queue = Arc::new(Mutex::new(VecDeque::<f32>::new()));
-            let max_samples =
-                buffer_frames as usize * EXTERNAL_QUEUE_PERIODS * device_channels.max(1);
-
-            let callback_queue = queue.clone();
-            let callback_underrun = underrun_count.clone();
-            let callback_errors = stream_errors.clone();
-            let callback_xrun = xrun_count.clone();
-            let callback_xrun_error = callback_xrun.clone();
-            let uid = endpoint.uid.clone();
-            let stream = build_output_stream_for_format(
-                &device,
-                sample_format,
-                &stream_config,
-                move |out_samples| {
-                    pop_samples(
-                        &callback_queue,
-                        out_samples,
-                        &callback_underrun,
-                        &callback_xrun,
-                    );
-                },
-                move |error| {
-                    callback_xrun_error.fetch_add(1, Ordering::Relaxed);
-                    callback_errors
-                        .lock()
-                        .push(format!("external output stream error for '{uid}': {error}"));
-                },
-            )
-            .map_err(|reason| CoreAudioError::BuildOutputStream {
+            let runtime = Arc::new(Mutex::new(OutputEndpointRuntime {
+                device_channels: endpoint.channels as usize,
+                max_samples: buffer_frames as usize
+                    * EXTERNAL_QUEUE_PERIODS
+                    * usize::from(endpoint.channels).max(1),
+                phase: EndpointPhase::Degraded,
+                attempts: 0,
+                next_retry_at: None,
+                stream: None,
+            }));
+            let output_endpoint = OutputEndpoint {
+                node_id: endpoint.node_id.clone(),
                 uid: endpoint.uid.clone(),
-                reason,
-            })?;
-            stream.play().map_err(|error| CoreAudioError::StartStream {
-                uid: endpoint.uid.clone(),
-                reason: error.to_string(),
-            })?;
-
-            output_endpoints.insert(
-                endpoint.node_id.clone(),
-                OutputEndpoint {
-                    node_id: endpoint.node_id.clone(),
-                    node_channels: endpoint.channels as usize,
-                    device_channels,
-                    queue,
-                    max_samples,
-                },
-            );
-            output_streams.push(stream);
+                node_channels: endpoint.channels as usize,
+                sample_rate,
+                buffer_frames,
+                queue,
+                runtime,
+            };
+            connect_output_endpoint(
+                &output_endpoint,
+                &recovery_tx,
+                &stream_errors,
+                &underrun_count,
+                &xrun_count,
+            )?;
+            output_endpoints.insert(output_endpoint.node_id.clone(), output_endpoint);
         }
 
+        let recovery_handle = {
+            let recovery_context = RecoveryContext {
+                recovery_tx: recovery_tx.clone(),
+                recovery_stop: recovery_stop.clone(),
+                stream_errors: stream_errors.clone(),
+                restart_attempts: restart_attempts.clone(),
+                underrun_count: underrun_count.clone(),
+                overrun_count: overrun_count.clone(),
+                xrun_count: xrun_count.clone(),
+                input_endpoints: input_endpoints.values().cloned().collect::<Vec<_>>(),
+                output_endpoints: output_endpoints.values().cloned().collect::<Vec<_>>(),
+            };
+            std::thread::Builder::new()
+                .name("mars-external-recovery".to_string())
+                .spawn(move || {
+                    run_recovery_supervisor(recovery_rx, recovery_context);
+                })
+                .map_err(|error| {
+                    CoreAudioError::Host(format!("failed to spawn recovery supervisor: {error}"))
+                })?
+        };
+
         Ok(Self {
-            input_streams,
-            output_streams,
             input_endpoints,
             output_endpoints,
             stream_errors,
@@ -446,6 +539,9 @@ impl ExternalIoRuntime {
             underrun_count,
             overrun_count,
             xrun_count,
+            recovery_tx,
+            recovery_stop,
+            recovery_handle: Some(recovery_handle),
         })
     }
 
@@ -454,11 +550,22 @@ impl ExternalIoRuntime {
             return false;
         };
 
+        let (device_channels, phase) = {
+            let runtime = endpoint.runtime.lock();
+            (runtime.device_channels, runtime.phase)
+        };
+        if !phase.is_connected() {
+            out.fill(0.0);
+            self.underrun_count.fetch_add(1, Ordering::Relaxed);
+            self.xrun_count.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+
         let frames = out.len() / endpoint.node_channels.max(1);
         let mut queue = endpoint.queue.lock();
         let mut had_missing = false;
 
-        match (endpoint.device_channels, endpoint.node_channels) {
+        match (device_channels, endpoint.node_channels) {
             (dc, nc) if dc == nc => {
                 for sample in out.iter_mut() {
                     if let Some(value) = queue.pop_front() {
@@ -500,6 +607,7 @@ impl ExternalIoRuntime {
 
         if had_missing {
             self.underrun_count.fetch_add(1, Ordering::Relaxed);
+            self.xrun_count.fetch_add(1, Ordering::Relaxed);
         }
         true
     }
@@ -509,19 +617,29 @@ impl ExternalIoRuntime {
             return false;
         };
 
+        let (device_channels, max_samples, phase) = {
+            let runtime = endpoint.runtime.lock();
+            (runtime.device_channels, runtime.max_samples, runtime.phase)
+        };
+        if !phase.is_connected() {
+            self.overrun_count.fetch_add(1, Ordering::Relaxed);
+            self.xrun_count.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+
         let frames = data.len() / endpoint.node_channels.max(1);
         let mut queue = endpoint.queue.lock();
         let mut overrun = false;
 
         let mut push_sample = |sample: f32| {
             queue.push_back(sample);
-            while queue.len() > endpoint.max_samples {
+            while queue.len() > max_samples {
                 let _ = queue.pop_front();
                 overrun = true;
             }
         };
 
-        match (endpoint.node_channels, endpoint.device_channels) {
+        match (endpoint.node_channels, device_channels) {
             (nc, dc) if nc == dc => {
                 for sample in data {
                     push_sample(*sample);
@@ -540,32 +658,48 @@ impl ExternalIoRuntime {
                     push_sample((left + right) * 0.5);
                 }
             }
-            _ => {}
+            _ => overrun = true,
         }
 
         if overrun {
             self.overrun_count.fetch_add(1, Ordering::Relaxed);
+            self.xrun_count.fetch_add(1, Ordering::Relaxed);
         }
         true
     }
 
     #[must_use]
     pub fn snapshot(&self) -> ExternalRuntimeSnapshot {
-        let _keep_alive = (self.input_streams.len(), self.output_streams.len());
+        let mut connected_inputs = 0usize;
+        let mut degraded_inputs = 0usize;
+        for endpoint in self.input_endpoints.values() {
+            let phase = endpoint.runtime.lock().phase;
+            if phase.is_connected() {
+                connected_inputs = connected_inputs.saturating_add(1);
+            } else if phase.is_degraded() {
+                degraded_inputs = degraded_inputs.saturating_add(1);
+            }
+        }
+
+        let mut connected_outputs = 0usize;
+        let mut degraded_outputs = 0usize;
+        for endpoint in self.output_endpoints.values() {
+            let phase = endpoint.runtime.lock().phase;
+            if phase.is_connected() {
+                connected_outputs = connected_outputs.saturating_add(1);
+            } else if phase.is_degraded() {
+                degraded_outputs = degraded_outputs.saturating_add(1);
+            }
+        }
+
         ExternalRuntimeSnapshot {
             status: ExternalRuntimeStatus {
-                connected_inputs: self
-                    .input_endpoints
-                    .values()
-                    .filter(|endpoint| !endpoint.node_id.is_empty())
-                    .count(),
-                connected_outputs: self
-                    .output_endpoints
-                    .values()
-                    .filter(|endpoint| !endpoint.node_id.is_empty())
-                    .count(),
+                connected_inputs,
+                connected_outputs,
+                degraded_inputs,
+                degraded_outputs,
                 restart_attempts: self.restart_attempts.load(Ordering::Relaxed),
-                stream_errors: self.stream_errors.lock().clone(),
+                stream_errors: self.stream_errors.lock().iter().cloned().collect(),
             },
             counters: ExternalRuntimeCounters {
                 underrun_count: self.underrun_count.load(Ordering::Relaxed),
@@ -574,6 +708,287 @@ impl ExternalIoRuntime {
             },
         }
     }
+}
+
+fn connect_input_endpoint(
+    endpoint: &InputEndpoint,
+    recovery_tx: &SyncSender<RecoveryEvent>,
+    stream_errors: &Arc<Mutex<VecDeque<String>>>,
+    overrun_count: &Arc<AtomicU64>,
+    xrun_count: &Arc<AtomicU64>,
+) -> Result<(), CoreAudioError> {
+    let host = cpal::default_host();
+    let device = find_device_by_uid(&host, &endpoint.uid)?;
+    let (stream_config, sample_format) =
+        select_input_stream_config(&device, endpoint.node_channels as u16, endpoint.sample_rate)
+            .map_err(|reason| CoreAudioError::BuildInputStream {
+                uid: endpoint.uid.clone(),
+                reason,
+            })?;
+    let device_channels = stream_config.channels as usize;
+    let max_samples =
+        endpoint.buffer_frames as usize * EXTERNAL_QUEUE_PERIODS * device_channels.max(1);
+
+    let callback_queue = endpoint.queue.clone();
+    let callback_overrun = overrun_count.clone();
+    let callback_errors = stream_errors.clone();
+    let callback_xrun = xrun_count.clone();
+    let callback_xrun_error = callback_xrun.clone();
+    let callback_events = recovery_tx.clone();
+    let uid = endpoint.uid.clone();
+    let node_id = endpoint.node_id.clone();
+    let stream = build_input_stream_for_format(
+        &device,
+        sample_format,
+        &stream_config,
+        move |samples| {
+            push_samples(
+                &callback_queue,
+                samples,
+                max_samples,
+                &callback_overrun,
+                &callback_xrun,
+            );
+        },
+        move |error| {
+            callback_xrun_error.fetch_add(1, Ordering::Relaxed);
+            let message = format!("external input stream error for '{uid}': {error}");
+            push_stream_error(&callback_errors, message);
+            let _ = callback_events.try_send(RecoveryEvent::StreamError {
+                kind: EndpointKind::Input,
+                node_id: node_id.clone(),
+            });
+        },
+    )
+    .map_err(|reason| CoreAudioError::BuildInputStream {
+        uid: endpoint.uid.clone(),
+        reason,
+    })?;
+    stream.play().map_err(|error| CoreAudioError::StartStream {
+        uid: endpoint.uid.clone(),
+        reason: error.to_string(),
+    })?;
+
+    let mut runtime = endpoint.runtime.lock();
+    runtime.device_channels = device_channels;
+    runtime.phase = EndpointPhase::Connected;
+    runtime.attempts = 0;
+    runtime.next_retry_at = None;
+    runtime.stream = Some(stream);
+    Ok(())
+}
+
+fn connect_output_endpoint(
+    endpoint: &OutputEndpoint,
+    recovery_tx: &SyncSender<RecoveryEvent>,
+    stream_errors: &Arc<Mutex<VecDeque<String>>>,
+    underrun_count: &Arc<AtomicU64>,
+    xrun_count: &Arc<AtomicU64>,
+) -> Result<(), CoreAudioError> {
+    let host = cpal::default_host();
+    let device = find_device_by_uid(&host, &endpoint.uid)?;
+    let (stream_config, sample_format) =
+        select_output_stream_config(&device, endpoint.node_channels as u16, endpoint.sample_rate)
+            .map_err(|reason| CoreAudioError::BuildOutputStream {
+            uid: endpoint.uid.clone(),
+            reason,
+        })?;
+    let device_channels = stream_config.channels as usize;
+    let max_samples =
+        endpoint.buffer_frames as usize * EXTERNAL_QUEUE_PERIODS * device_channels.max(1);
+
+    let callback_queue = endpoint.queue.clone();
+    let callback_underrun = underrun_count.clone();
+    let callback_errors = stream_errors.clone();
+    let callback_xrun = xrun_count.clone();
+    let callback_xrun_error = callback_xrun.clone();
+    let callback_events = recovery_tx.clone();
+    let uid = endpoint.uid.clone();
+    let node_id = endpoint.node_id.clone();
+    let stream = build_output_stream_for_format(
+        &device,
+        sample_format,
+        &stream_config,
+        move |out_samples| {
+            pop_samples(
+                &callback_queue,
+                out_samples,
+                &callback_underrun,
+                &callback_xrun,
+            );
+        },
+        move |error| {
+            callback_xrun_error.fetch_add(1, Ordering::Relaxed);
+            let message = format!("external output stream error for '{uid}': {error}");
+            push_stream_error(&callback_errors, message);
+            let _ = callback_events.try_send(RecoveryEvent::StreamError {
+                kind: EndpointKind::Output,
+                node_id: node_id.clone(),
+            });
+        },
+    )
+    .map_err(|reason| CoreAudioError::BuildOutputStream {
+        uid: endpoint.uid.clone(),
+        reason,
+    })?;
+    stream.play().map_err(|error| CoreAudioError::StartStream {
+        uid: endpoint.uid.clone(),
+        reason: error.to_string(),
+    })?;
+
+    let mut runtime = endpoint.runtime.lock();
+    runtime.device_channels = device_channels;
+    runtime.max_samples = max_samples;
+    runtime.phase = EndpointPhase::Connected;
+    runtime.attempts = 0;
+    runtime.next_retry_at = None;
+    runtime.stream = Some(stream);
+    Ok(())
+}
+
+fn run_recovery_supervisor(recovery_rx: Receiver<RecoveryEvent>, context: RecoveryContext) {
+    while !context.recovery_stop.load(Ordering::Relaxed) {
+        match recovery_rx.recv_timeout(RECOVERY_POLL_INTERVAL) {
+            Ok(RecoveryEvent::StopRequested) => break,
+            Ok(RecoveryEvent::StreamError { kind, node_id }) => match kind {
+                EndpointKind::Input => {
+                    if let Some(endpoint) = context
+                        .input_endpoints
+                        .iter()
+                        .find(|endpoint| endpoint.node_id == node_id)
+                    {
+                        let mut runtime = endpoint.runtime.lock();
+                        mark_endpoint_degraded(&mut runtime, None);
+                    }
+                }
+                EndpointKind::Output => {
+                    if let Some(endpoint) = context
+                        .output_endpoints
+                        .iter()
+                        .find(|endpoint| endpoint.node_id == node_id)
+                    {
+                        let mut runtime = endpoint.runtime.lock();
+                        mark_output_endpoint_degraded(&mut runtime, None);
+                    }
+                }
+            },
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+
+        let now = Instant::now();
+
+        for endpoint in &context.input_endpoints {
+            let should_retry = {
+                let mut runtime = endpoint.runtime.lock();
+                if runtime.phase == EndpointPhase::Degraded
+                    && runtime.next_retry_at.is_some_and(|at| at <= now)
+                {
+                    runtime.phase = EndpointPhase::Reconnecting;
+                    true
+                } else {
+                    false
+                }
+            };
+            if !should_retry {
+                continue;
+            }
+
+            context.restart_attempts.fetch_add(1, Ordering::Relaxed);
+            if let Err(error) = connect_input_endpoint(
+                endpoint,
+                &context.recovery_tx,
+                &context.stream_errors,
+                &context.overrun_count,
+                &context.xrun_count,
+            ) {
+                push_stream_error(
+                    &context.stream_errors,
+                    format!(
+                        "external input reconnect failed for '{}': {error}",
+                        endpoint.uid
+                    ),
+                );
+                let mut runtime = endpoint.runtime.lock();
+                let attempts = runtime.attempts.saturating_add(1);
+                mark_endpoint_degraded(&mut runtime, Some(attempts));
+            }
+        }
+
+        for endpoint in &context.output_endpoints {
+            let should_retry = {
+                let mut runtime = endpoint.runtime.lock();
+                if runtime.phase == EndpointPhase::Degraded
+                    && runtime.next_retry_at.is_some_and(|at| at <= now)
+                {
+                    runtime.phase = EndpointPhase::Reconnecting;
+                    true
+                } else {
+                    false
+                }
+            };
+            if !should_retry {
+                continue;
+            }
+
+            context.restart_attempts.fetch_add(1, Ordering::Relaxed);
+            if let Err(error) = connect_output_endpoint(
+                endpoint,
+                &context.recovery_tx,
+                &context.stream_errors,
+                &context.underrun_count,
+                &context.xrun_count,
+            ) {
+                push_stream_error(
+                    &context.stream_errors,
+                    format!(
+                        "external output reconnect failed for '{}': {error}",
+                        endpoint.uid
+                    ),
+                );
+                let mut runtime = endpoint.runtime.lock();
+                let attempts = runtime.attempts.saturating_add(1);
+                mark_output_endpoint_degraded(&mut runtime, Some(attempts));
+            }
+        }
+    }
+}
+
+fn mark_endpoint_degraded(runtime: &mut InputEndpointRuntime, attempts: Option<u32>) {
+    runtime.phase = EndpointPhase::Degraded;
+    runtime.stream = None;
+    runtime.attempts = attempts
+        .unwrap_or_else(|| runtime.attempts.saturating_add(1))
+        .max(1);
+    runtime.next_retry_at = Some(Instant::now() + reconnect_backoff(runtime.attempts));
+}
+
+fn mark_output_endpoint_degraded(runtime: &mut OutputEndpointRuntime, attempts: Option<u32>) {
+    runtime.phase = EndpointPhase::Degraded;
+    runtime.stream = None;
+    runtime.attempts = attempts
+        .unwrap_or_else(|| runtime.attempts.saturating_add(1))
+        .max(1);
+    runtime.next_retry_at = Some(Instant::now() + reconnect_backoff(runtime.attempts));
+}
+
+fn reconnect_backoff(attempts: u32) -> Duration {
+    let shift = attempts.saturating_sub(1).min(20);
+    let exponential = RECOVERY_BASE_BACKOFF_MS.saturating_mul(1_u64 << shift);
+    let base = exponential.min(RECOVERY_MAX_BACKOFF_MS);
+    let jitter = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64 % (RECOVERY_JITTER_MAX_MS + 1))
+        .unwrap_or(0);
+    Duration::from_millis(base.saturating_add(jitter))
+}
+
+fn push_stream_error(stream_errors: &Arc<Mutex<VecDeque<String>>>, message: String) {
+    let mut guard = stream_errors.lock();
+    if guard.len() >= STREAM_ERROR_RING_CAPACITY {
+        let _ = guard.pop_front();
+    }
+    guard.push_back(message);
 }
 
 fn sample_format_priority(sample_format: SampleFormat) -> usize {
@@ -842,17 +1257,23 @@ fn pop_samples(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
-    use mars_types::{DeviceMatch, ExternalDeviceInfo};
+    use mars_types::{DeviceMatch, ExternalDeviceInfo, TransportType};
 
     use super::find_match;
 
-    fn candidate(name: &str) -> ExternalDeviceInfo {
+    fn candidate(
+        uid: &str,
+        name: &str,
+        manufacturer: Option<&str>,
+        transport: Option<TransportType>,
+    ) -> ExternalDeviceInfo {
         ExternalDeviceInfo {
-            uid: format!("cpal:input:0:{name}"),
+            uid: uid.to_string(),
             name: name.to_string(),
-            manufacturer: None,
-            transport: None,
+            manufacturer: manufacturer.map(ToOwned::to_owned),
+            transport,
             channels: 2,
             sample_rates: vec![48_000],
         }
@@ -864,7 +1285,7 @@ mod tests {
             name_regex: Some("*(".to_string()),
             ..DeviceMatch::default()
         };
-        let candidates = vec![candidate("Mic One")];
+        let candidates = vec![candidate("cpal:input:0:mic-one", "Mic One", None, None)];
 
         assert!(find_match(&criteria, &candidates).is_none());
     }
@@ -875,10 +1296,66 @@ mod tests {
             name_regex: Some(".*Mic.*".to_string()),
             ..DeviceMatch::default()
         };
-        let candidates = vec![candidate("Mic One")];
+        let candidates = vec![candidate("cpal:input:0:mic-one", "Mic One", None, None)];
 
         let matched = find_match(&criteria, &candidates);
         assert!(matched.is_some());
-        assert_eq!(matched.map(|device| device.name.as_str()), Some("Mic One"));
+        assert_eq!(
+            matched.map(|result| result.device.name.as_str()),
+            Some("Mic One")
+        );
+        assert_eq!(
+            matched.map(|result| result.used_unknown_metadata),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn metadata_unknown_allows_best_effort_match() {
+        let criteria = DeviceMatch {
+            name: Some("Mic One".to_string()),
+            manufacturer: Some("Acme".to_string()),
+            ..DeviceMatch::default()
+        };
+        let candidates = vec![candidate("cpal:input:0:mic-one", "Mic One", None, None)];
+
+        let matched = find_match(&criteria, &candidates).expect("match expected");
+        assert_eq!(matched.device.uid, "cpal:input:0:mic-one");
+        assert!(matched.used_unknown_metadata);
+    }
+
+    #[test]
+    fn metadata_known_mismatch_rejects_candidate() {
+        let criteria = DeviceMatch {
+            name: Some("Mic One".to_string()),
+            manufacturer: Some("Acme".to_string()),
+            ..DeviceMatch::default()
+        };
+        let candidates = vec![candidate(
+            "cpal:input:0:mic-one",
+            "Mic One",
+            Some("Other"),
+            None,
+        )];
+
+        assert!(find_match(&criteria, &candidates).is_none());
+    }
+
+    #[test]
+    fn known_metadata_match_is_preferred_over_unknown() {
+        let criteria = DeviceMatch {
+            name: Some("Mic One".to_string()),
+            manufacturer: Some("Acme".to_string()),
+            transport: Some(TransportType::Usb),
+            ..DeviceMatch::default()
+        };
+        let candidates = vec![
+            candidate("unknown", "Mic One", None, None),
+            candidate("known", "Mic One", Some("Acme"), Some(TransportType::Usb)),
+        ];
+
+        let matched = find_match(&criteria, &candidates).expect("match expected");
+        assert_eq!(matched.device.uid, "known");
+        assert!(!matched.used_unknown_metadata);
     }
 }

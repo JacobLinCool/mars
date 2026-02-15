@@ -54,6 +54,8 @@ struct DeviceObjectInfo {
     channels: u16,
     hidden: bool,
     io_running: bool,
+    sample_time_frames: u64,
+    zero_ts_seed: u64,
 }
 
 impl Default for ObjectRegistry {
@@ -570,6 +572,8 @@ unsafe extern "C" fn plugin_start_io(
     let mut reg = PLUGIN.object_registry.lock();
     if let Some(dev) = reg.find_device_by_object_mut(device_object_id) {
         dev.io_running = true;
+        dev.sample_time_frames = 0;
+        dev.zero_ts_seed = dev.zero_ts_seed.saturating_add(1);
     }
     K_AUDIO_HARDWARE_NO_ERROR
 }
@@ -581,13 +585,14 @@ unsafe extern "C" fn plugin_stop_io(
     let mut reg = PLUGIN.object_registry.lock();
     if let Some(dev) = reg.find_device_by_object_mut(device_object_id) {
         dev.io_running = false;
+        dev.zero_ts_seed = dev.zero_ts_seed.saturating_add(1);
     }
     K_AUDIO_HARDWARE_NO_ERROR
 }
 
 unsafe extern "C" fn plugin_get_zero_time_stamp(
     _driver: *mut c_void,
-    _device_object_id: AudioObjectID,
+    device_object_id: AudioObjectID,
     out_sample_time: *mut Float64,
     out_host_time: *mut u64,
     out_seed: *mut u64,
@@ -596,14 +601,22 @@ unsafe extern "C" fn plugin_get_zero_time_stamp(
         return K_AUDIO_HARDWARE_ILLEGAL_OPERATION_ERROR;
     }
 
+    let (sample_time_frames, seed) = {
+        let reg = PLUGIN.object_registry.lock();
+        let Some(device) = reg.find_device_by_object(device_object_id) else {
+            return K_AUDIO_HARDWARE_BAD_OBJECT_ERROR;
+        };
+        (device.sample_time_frames, device.zero_ts_seed)
+    };
+
     // Use mach_absolute_time for host time.
     // SAFETY: mach_absolute_time is always safe to call on macOS.
     let host_time = unsafe { mach_absolute_time() };
     // SAFETY: all output pointers verified non-null above.
     unsafe {
-        *out_sample_time = 0.0;
+        *out_sample_time = sample_time_frames as f64;
         *out_host_time = host_time;
-        *out_seed = 1;
+        *out_seed = seed;
     }
     K_AUDIO_HARDWARE_NO_ERROR
 }
@@ -739,6 +752,17 @@ unsafe extern "C" fn plugin_do_io_operation(
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos() as u64);
         state.runtime.last_callback_ns = now_ns;
+    }
+
+    if operation_id == K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_WRITE_MIX
+        || operation_id == K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_READ_INPUT
+    {
+        let mut reg = PLUGIN.object_registry.lock();
+        if let Some(dev) = reg.find_device_by_object_mut(device_object_id) {
+            dev.sample_time_frames = dev
+                .sample_time_frames
+                .saturating_add(io_buffer_frame_size as u64);
+        }
     }
 
     K_AUDIO_HARDWARE_NO_ERROR
@@ -1290,6 +1314,8 @@ fn sync_object_registry() {
                     channels: device.channels,
                     hidden: device.hidden,
                     io_running: false,
+                    sample_time_frames: 0,
+                    zero_ts_seed: 0,
                 },
             );
         } else if let Some(existing) = reg.devices.get_mut(&device.uid) {
@@ -1493,6 +1519,8 @@ mod tests {
                     channels: 2,
                     hidden: false,
                     io_running: false,
+                    sample_time_frames: 0,
+                    zero_ts_seed: 0,
                 },
             );
             device_id
@@ -1547,5 +1575,97 @@ mod tests {
 
         let mut reg = PLUGIN.object_registry.lock();
         reg.devices.remove(&uid);
+    }
+
+    #[test]
+    fn zero_timestamp_tracks_monotonic_sample_time_and_seed() {
+        let _guard = TEST_LOCK.lock();
+        let uid = "test.zero-ts.uid".to_string();
+        let device_id = {
+            let mut reg = PLUGIN.object_registry.lock();
+            let device_id = reg.allocate_id();
+            let stream_id = reg.allocate_id();
+            reg.devices.insert(
+                uid.clone(),
+                DeviceObjectInfo {
+                    device_id,
+                    stream_id,
+                    uid: uid.clone(),
+                    name: "Zero TS Device".to_string(),
+                    kind: "virtual_output".to_string(),
+                    channels: 2,
+                    hidden: false,
+                    io_running: false,
+                    sample_time_frames: 0,
+                    zero_ts_seed: 0,
+                },
+            );
+            device_id
+        };
+
+        // SAFETY: test passes valid object id and ignores driver pointer.
+        let start_status = unsafe { plugin_start_io(core::ptr::null_mut(), device_id) };
+        assert_eq!(start_status, K_AUDIO_HARDWARE_NO_ERROR);
+
+        let mut io_buffer = [0.0_f32; 4];
+        // SAFETY: buffer pointer and frame size are valid for 2 stereo frames.
+        let io_status = unsafe {
+            plugin_do_io_operation(
+                core::ptr::null_mut(),
+                device_id,
+                0,
+                0,
+                K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_WRITE_MIX,
+                2,
+                core::ptr::null(),
+                io_buffer.as_mut_ptr().cast::<c_void>(),
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(io_status, K_AUDIO_HARDWARE_NO_ERROR);
+
+        let mut sample_time = -1.0_f64;
+        let mut host_time = 0_u64;
+        let mut seed_after_start = 0_u64;
+        // SAFETY: output pointers are valid.
+        let ts_status = unsafe {
+            plugin_get_zero_time_stamp(
+                core::ptr::null_mut(),
+                device_id,
+                &mut sample_time,
+                &mut host_time,
+                &mut seed_after_start,
+            )
+        };
+        assert_eq!(ts_status, K_AUDIO_HARDWARE_NO_ERROR);
+        assert_eq!(sample_time, 2.0);
+        assert!(host_time > 0);
+        assert!(seed_after_start >= 1);
+
+        // SAFETY: test passes valid object id and ignores driver pointer.
+        let stop_status = unsafe { plugin_stop_io(core::ptr::null_mut(), device_id) };
+        assert_eq!(stop_status, K_AUDIO_HARDWARE_NO_ERROR);
+
+        let mut sample_time_after_stop = -1.0_f64;
+        let mut host_time_after_stop = 0_u64;
+        let mut seed_after_stop = 0_u64;
+        // SAFETY: output pointers are valid.
+        let ts_status_after_stop = unsafe {
+            plugin_get_zero_time_stamp(
+                core::ptr::null_mut(),
+                device_id,
+                &mut sample_time_after_stop,
+                &mut host_time_after_stop,
+                &mut seed_after_stop,
+            )
+        };
+        assert_eq!(ts_status_after_stop, K_AUDIO_HARDWARE_NO_ERROR);
+        assert_eq!(sample_time_after_stop, sample_time);
+        assert!(seed_after_stop > seed_after_start);
+
+        let mut reg = PLUGIN.object_registry.lock();
+        reg.devices.remove(&uid);
+        let _ = global_registry().remove(&stream_name(StreamDirection::Vout, &uid));
+        let _ = global_registry().remove(&stream_name(StreamDirection::Vin, &uid));
     }
 }
