@@ -242,7 +242,7 @@ fn node_from_vin(device: &VirtualInputDevice, default_channels: u16) -> NodeDesc
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use mars_types::{Pipe, Profile, VirtualInputDevice, VirtualOutputDevice};
+    use mars_types::{Bus, Pipe, Profile, VirtualInputDevice, VirtualOutputDevice};
 
     use super::{GraphError, build_routing_graph};
 
@@ -279,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn detects_cycle() {
+    fn rejects_invalid_destination_type() {
         let mut profile = Profile::default();
         profile.virtual_devices.outputs.push(VirtualOutputDevice {
             id: "a".to_string(),
@@ -314,5 +314,241 @@ mod tests {
 
         let err = build_routing_graph(&profile).expect_err("must fail");
         assert!(matches!(err, GraphError::InvalidDestinationType(_)));
+    }
+
+    #[test]
+    fn detects_duplicate_node_id() {
+        let mut profile = Profile::default();
+        profile.virtual_devices.outputs.push(VirtualOutputDevice {
+            id: "dup".to_string(),
+            name: "Output".to_string(),
+            channels: None,
+            uid: None,
+            hidden: false,
+        });
+        profile.buses.push(Bus {
+            id: "dup".to_string(),
+            channels: None,
+            mix: None,
+        });
+
+        let err = build_routing_graph(&profile).expect_err("must fail");
+        assert!(matches!(err, GraphError::DuplicateNode(id) if id == "dup"));
+    }
+
+    #[test]
+    fn detects_unknown_source() {
+        let mut profile = Profile::default();
+        profile.virtual_devices.inputs.push(VirtualInputDevice {
+            id: "mix".to_string(),
+            name: "Mix".to_string(),
+            channels: None,
+            uid: None,
+            mix: None,
+        });
+        profile.pipes.push(Pipe {
+            from: "missing".to_string(),
+            to: "mix".to_string(),
+            enabled: true,
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+
+        let err = build_routing_graph(&profile).expect_err("must fail");
+        assert!(matches!(err, GraphError::UnknownSource(id) if id == "missing"));
+    }
+
+    #[test]
+    fn detects_unknown_destination() {
+        let mut profile = Profile::default();
+        profile.virtual_devices.outputs.push(VirtualOutputDevice {
+            id: "app".to_string(),
+            name: "App".to_string(),
+            channels: None,
+            uid: None,
+            hidden: false,
+        });
+        profile.pipes.push(Pipe {
+            from: "app".to_string(),
+            to: "missing".to_string(),
+            enabled: true,
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+
+        let err = build_routing_graph(&profile).expect_err("must fail");
+        assert!(matches!(err, GraphError::UnknownDestination(id) if id == "missing"));
+    }
+
+    #[test]
+    fn rejects_invalid_source_type() {
+        let mut profile = Profile::default();
+        profile.virtual_devices.inputs.push(VirtualInputDevice {
+            id: "mix".to_string(),
+            name: "Mix".to_string(),
+            channels: None,
+            uid: None,
+            mix: None,
+        });
+        profile.buses.push(Bus {
+            id: "bus".to_string(),
+            channels: None,
+            mix: None,
+        });
+        profile.pipes.push(Pipe {
+            from: "mix".to_string(),
+            to: "bus".to_string(),
+            enabled: true,
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+
+        let err = build_routing_graph(&profile).expect_err("must fail");
+        assert!(matches!(err, GraphError::InvalidSourceType(id) if id == "mix"));
+    }
+
+    #[test]
+    fn rejects_unsupported_channels() {
+        let mut profile = Profile::default();
+        profile.virtual_devices.outputs.push(VirtualOutputDevice {
+            id: "mono".to_string(),
+            name: "Mono".to_string(),
+            channels: Some(1),
+            uid: None,
+            hidden: false,
+        });
+        profile.virtual_devices.inputs.push(VirtualInputDevice {
+            id: "quad".to_string(),
+            name: "Quad".to_string(),
+            channels: Some(4),
+            uid: None,
+            mix: None,
+        });
+        profile.pipes.push(Pipe {
+            from: "mono".to_string(),
+            to: "quad".to_string(),
+            enabled: true,
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+
+        let err = build_routing_graph(&profile).expect_err("must fail");
+        assert!(matches!(
+            err,
+            GraphError::UnsupportedChannels {
+                from,
+                from_channels: 1,
+                to,
+                to_channels: 4
+            } if from == "mono" && to == "quad"
+        ));
+    }
+
+    #[test]
+    fn rejects_delay_out_of_range() {
+        let mut profile = Profile::default();
+        profile.virtual_devices.outputs.push(VirtualOutputDevice {
+            id: "app".to_string(),
+            name: "App".to_string(),
+            channels: None,
+            uid: None,
+            hidden: false,
+        });
+        profile.virtual_devices.inputs.push(VirtualInputDevice {
+            id: "mix".to_string(),
+            name: "Mix".to_string(),
+            channels: None,
+            uid: None,
+            mix: None,
+        });
+        profile.pipes.push(Pipe {
+            from: "app".to_string(),
+            to: "mix".to_string(),
+            enabled: true,
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 2000.1,
+        });
+
+        let err = build_routing_graph(&profile).expect_err("must fail");
+        assert!(
+            matches!(err, GraphError::InvalidDelay(delay) if (delay - 2000.1).abs() < f32::EPSILON)
+        );
+    }
+
+    #[test]
+    fn ignores_disabled_pipe() {
+        let mut profile = Profile::default();
+        profile.virtual_devices.outputs.push(VirtualOutputDevice {
+            id: "app".to_string(),
+            name: "App".to_string(),
+            channels: None,
+            uid: None,
+            hidden: false,
+        });
+        profile.virtual_devices.inputs.push(VirtualInputDevice {
+            id: "mix".to_string(),
+            name: "Mix".to_string(),
+            channels: None,
+            uid: None,
+            mix: None,
+        });
+        profile.pipes.push(Pipe {
+            from: "app".to_string(),
+            to: "mix".to_string(),
+            enabled: false,
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+
+        let graph = build_routing_graph(&profile).expect("graph should build");
+        assert!(graph.edges.is_empty());
+    }
+
+    #[test]
+    fn detects_cycle_between_buses() {
+        let mut profile = Profile::default();
+        profile.buses.push(Bus {
+            id: "a".to_string(),
+            channels: Some(2),
+            mix: None,
+        });
+        profile.buses.push(Bus {
+            id: "b".to_string(),
+            channels: Some(2),
+            mix: None,
+        });
+        profile.pipes.push(Pipe {
+            from: "a".to_string(),
+            to: "b".to_string(),
+            enabled: true,
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+        profile.pipes.push(Pipe {
+            from: "b".to_string(),
+            to: "a".to_string(),
+            enabled: true,
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+
+        let err = build_routing_graph(&profile).expect_err("must fail");
+        assert!(matches!(err, GraphError::CycleDetected));
     }
 }

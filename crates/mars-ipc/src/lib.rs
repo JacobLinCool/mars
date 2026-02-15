@@ -407,3 +407,169 @@ async fn write_response(
     writer.flush().await?;
     Ok(())
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use serde_json::json;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    use super::*;
+
+    #[derive(Debug, Clone, Copy)]
+    enum HandlerMode {
+        Success,
+        Error,
+    }
+
+    #[derive(Debug, Clone)]
+    struct TestHandler {
+        calls: Arc<AtomicUsize>,
+        mode: HandlerMode,
+    }
+
+    #[async_trait]
+    impl RequestHandler for TestHandler {
+        async fn handle(&self, _request: DaemonRequest) -> Result<DaemonResponse, ApiError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.mode {
+                HandlerMode::Success => Ok(DaemonResponse::Pong),
+                HandlerMode::Error => Err(ApiError::new("boom", ExitCode::ApplyFailed)),
+            }
+        }
+    }
+
+    fn request_envelope(
+        protocol_version: u16,
+        command: Command,
+        payload: Value,
+    ) -> RequestEnvelope {
+        RequestEnvelope {
+            protocol_version,
+            request_id: "test-request-id".to_string(),
+            command,
+            payload,
+        }
+    }
+
+    async fn invoke_handler<H>(request: RequestEnvelope, handler: Arc<H>) -> ResponseEnvelope
+    where
+        H: RequestHandler,
+    {
+        let (client, server) = UnixStream::pair().expect("create unix stream pair");
+        let server_task = tokio::spawn(async move { handle_connection(server, handler).await });
+
+        let (reader, mut writer) = client.into_split();
+        let encoded = serde_json::to_string(&request).expect("serialize request");
+        writer
+            .write_all(encoded.as_bytes())
+            .await
+            .expect("write request");
+        writer.write_all(b"\n").await.expect("write newline");
+        writer.shutdown().await.expect("shutdown writer");
+
+        let mut lines = BufReader::new(reader).lines();
+        let line = lines
+            .next_line()
+            .await
+            .expect("read response")
+            .expect("response line");
+        let response: ResponseEnvelope = serde_json::from_str(&line).expect("deserialize response");
+
+        let result = server_task.await.expect("join server task");
+        assert!(result.is_ok(), "connection handler should exit cleanly");
+
+        response
+    }
+
+    #[tokio::test]
+    async fn protocol_mismatch_returns_daemon_communication_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(TestHandler {
+            calls: Arc::clone(&calls),
+            mode: HandlerMode::Success,
+        });
+        let request = request_envelope(PROTOCOL_VERSION + 1, Command::Ping, Value::Null);
+
+        let response = invoke_handler(request, handler).await;
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.exit_code,
+            Some(ExitCode::DaemonCommunication.as_i32())
+        );
+        assert!(
+            response
+                .error
+                .expect("protocol mismatch error")
+                .contains("protocol mismatch")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_payload_returns_invalid_input_error_without_calling_handler() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(TestHandler {
+            calls: Arc::clone(&calls),
+            mode: HandlerMode::Success,
+        });
+        let request = request_envelope(PROTOCOL_VERSION, Command::Logs, Value::Null);
+
+        let response = invoke_handler(request, handler).await;
+
+        assert!(!response.ok);
+        assert_eq!(response.command, Command::Logs);
+        assert_eq!(response.exit_code, Some(ExitCode::InvalidInput.as_i32()));
+        assert!(
+            response
+                .error
+                .expect("invalid payload error")
+                .contains("invalid request payload")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn handler_error_is_returned_with_exit_code() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(TestHandler {
+            calls: Arc::clone(&calls),
+            mode: HandlerMode::Error,
+        });
+        let request = request_envelope(PROTOCOL_VERSION, Command::Ping, Value::Null);
+
+        let response = invoke_handler(request, handler).await;
+
+        assert!(!response.ok);
+        assert_eq!(response.error.as_deref(), Some("boom"));
+        assert_eq!(response.exit_code, Some(ExitCode::ApplyFailed.as_i32()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn deserialize_logs_request_reads_optional_fields() {
+        let request = deserialize_request(
+            Command::Logs,
+            json!({
+                "follow": true,
+                "cursor": 42,
+                "limit": 7
+            }),
+        )
+        .expect("parse logs payload");
+
+        assert!(matches!(
+            request,
+            DaemonRequest::Logs(LogRequest {
+                follow: true,
+                cursor: Some(42),
+                limit: Some(7)
+            })
+        ));
+    }
+}

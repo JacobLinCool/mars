@@ -802,6 +802,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "criterion",
  "dirs",
  "mars-coreaudio",
  "mars-engine",

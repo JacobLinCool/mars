@@ -352,10 +352,10 @@ fn prepare_node_buffers(
 #[allow(clippy::expect_used)]
 mod tests {
     use std::collections::HashMap;
-    use std::f32::consts::PI;
+    use std::f32::consts::{FRAC_1_SQRT_2, PI};
 
     use mars_graph::build_routing_graph;
-    use mars_types::{MixConfig, Pipe, Profile, VirtualInputDevice, VirtualOutputDevice};
+    use mars_types::{Bus, MixConfig, Pipe, Profile, VirtualInputDevice, VirtualOutputDevice};
 
     use super::{Engine, EngineSnapshot};
 
@@ -556,5 +556,226 @@ mod tests {
 
         // -1 dBFS ~= 0.891.
         assert!(peak <= 0.92);
+    }
+
+    #[test]
+    fn near_e2e_multisource_multioutput_mixes_as_expected() {
+        let mut profile = Profile::default();
+        profile.virtual_devices.outputs.push(VirtualOutputDevice {
+            id: "music".to_string(),
+            name: "Music".to_string(),
+            channels: Some(2),
+            uid: None,
+            hidden: false,
+        });
+        profile.virtual_devices.outputs.push(VirtualOutputDevice {
+            id: "voice".to_string(),
+            name: "Voice".to_string(),
+            channels: Some(1),
+            uid: None,
+            hidden: false,
+        });
+        profile.virtual_devices.outputs.push(VirtualOutputDevice {
+            id: "fx".to_string(),
+            name: "FX".to_string(),
+            channels: Some(2),
+            uid: None,
+            hidden: false,
+        });
+        profile.buses.push(Bus {
+            id: "main".to_string(),
+            channels: Some(2),
+            mix: None,
+        });
+        profile.virtual_devices.inputs.push(VirtualInputDevice {
+            id: "stream".to_string(),
+            name: "Stream".to_string(),
+            channels: Some(2),
+            uid: None,
+            mix: Some(MixConfig {
+                limiter: false,
+                limit_dbfs: -1.0,
+                mode: mars_types::MixMode::Sum,
+            }),
+        });
+        profile.virtual_devices.inputs.push(VirtualInputDevice {
+            id: "monitor".to_string(),
+            name: "Monitor".to_string(),
+            channels: Some(2),
+            uid: None,
+            mix: Some(MixConfig {
+                limiter: false,
+                limit_dbfs: -1.0,
+                mode: mars_types::MixMode::Average,
+            }),
+        });
+
+        profile.pipes.push(Pipe {
+            from: "music".to_string(),
+            to: "main".to_string(),
+            enabled: true,
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+        profile.pipes.push(Pipe {
+            from: "voice".to_string(),
+            to: "main".to_string(),
+            enabled: true,
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+        profile.pipes.push(Pipe {
+            from: "fx".to_string(),
+            to: "main".to_string(),
+            enabled: true,
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+        profile.pipes.push(Pipe {
+            from: "main".to_string(),
+            to: "stream".to_string(),
+            enabled: true,
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+        profile.pipes.push(Pipe {
+            from: "main".to_string(),
+            to: "monitor".to_string(),
+            enabled: true,
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+        profile.pipes.push(Pipe {
+            from: "music".to_string(),
+            to: "monitor".to_string(),
+            enabled: true,
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+
+        let graph = build_routing_graph(&profile).expect("graph");
+        let engine = Engine::new(EngineSnapshot {
+            graph,
+            sample_rate: 48_000,
+            buffer_frames: 4,
+        });
+
+        let mut sources = HashMap::new();
+        sources.insert("music".to_string(), vec![1.0_f32; 8]);
+        sources.insert("voice".to_string(), vec![0.5_f32; 4]);
+        sources.insert("fx".to_string(), vec![0.25_f32; 8]);
+
+        let output = engine.render_cycle(4, &sources).expect("render");
+        let stream = output.sinks.get("stream").expect("stream sink");
+        let monitor = output.sinks.get("monitor").expect("monitor sink");
+
+        assert_eq!(stream.len(), 8);
+        assert_eq!(monitor.len(), 8);
+
+        let expected_stream = 1.75 * FRAC_1_SQRT_2 * FRAC_1_SQRT_2;
+        let expected_monitor = (expected_stream + (1.0 * FRAC_1_SQRT_2)) / 2.0;
+        for sample in stream {
+            assert!((*sample - expected_stream).abs() < 1e-5);
+        }
+        for sample in monitor {
+            assert!((*sample - expected_monitor).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn near_e2e_delay_path_keeps_state_across_cycles() {
+        let mut profile = Profile::default();
+        profile.virtual_devices.outputs.push(VirtualOutputDevice {
+            id: "pulse".to_string(),
+            name: "Pulse".to_string(),
+            channels: Some(1),
+            uid: None,
+            hidden: false,
+        });
+        profile.virtual_devices.outputs.push(VirtualOutputDevice {
+            id: "bed".to_string(),
+            name: "Bed".to_string(),
+            channels: Some(1),
+            uid: None,
+            hidden: false,
+        });
+        profile.buses.push(Bus {
+            id: "mix".to_string(),
+            channels: Some(1),
+            mix: None,
+        });
+        profile.virtual_devices.inputs.push(VirtualInputDevice {
+            id: "out".to_string(),
+            name: "Out".to_string(),
+            channels: Some(1),
+            uid: None,
+            mix: None,
+        });
+
+        profile.pipes.push(Pipe {
+            from: "pulse".to_string(),
+            to: "mix".to_string(),
+            enabled: true,
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 20.0,
+        });
+        profile.pipes.push(Pipe {
+            from: "bed".to_string(),
+            to: "mix".to_string(),
+            enabled: true,
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+        profile.pipes.push(Pipe {
+            from: "mix".to_string(),
+            to: "out".to_string(),
+            enabled: true,
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+
+        let graph = build_routing_graph(&profile).expect("graph");
+        let engine = Engine::new(EngineSnapshot {
+            graph,
+            sample_rate: 100,
+            buffer_frames: 1,
+        });
+
+        let mut cycle1 = HashMap::new();
+        cycle1.insert("pulse".to_string(), vec![1.0_f32]);
+        cycle1.insert("bed".to_string(), vec![0.2_f32]);
+        let out1 = engine.render_cycle(1, &cycle1).expect("cycle1");
+
+        let mut cycle2 = HashMap::new();
+        cycle2.insert("pulse".to_string(), vec![0.0_f32]);
+        cycle2.insert("bed".to_string(), vec![0.2_f32]);
+        let out2 = engine.render_cycle(1, &cycle2).expect("cycle2");
+
+        let mut cycle3 = HashMap::new();
+        cycle3.insert("pulse".to_string(), vec![0.0_f32]);
+        cycle3.insert("bed".to_string(), vec![0.2_f32]);
+        let out3 = engine.render_cycle(1, &cycle3).expect("cycle3");
+
+        assert!((out1.sinks["out"][0] - 0.2).abs() < 1e-6);
+        assert!((out2.sinks["out"][0] - 0.2).abs() < 1e-6);
+        assert!((out3.sinks["out"][0] - 1.2).abs() < 1e-6);
     }
 }

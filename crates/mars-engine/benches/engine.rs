@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use mars_engine::{Engine, EngineSnapshot};
 use mars_graph::build_routing_graph;
 use mars_types::{Bus, MixConfig, MixMode, Pipe, Profile, VirtualInputDevice, VirtualOutputDevice};
@@ -161,6 +161,139 @@ fn channel_conversion_profile() -> Profile {
     p
 }
 
+fn multisource_multioutput_profile() -> Profile {
+    let mut p = Profile::default();
+    for id in ["app1", "app2", "app3", "app4", "app5", "app6"] {
+        p.virtual_devices.outputs.push(VirtualOutputDevice {
+            id: id.into(),
+            name: id.into(),
+            channels: Some(2),
+            uid: None,
+            hidden: false,
+        });
+    }
+
+    p.buses.push(Bus {
+        id: "music".into(),
+        channels: Some(2),
+        mix: None,
+    });
+    p.buses.push(Bus {
+        id: "voice".into(),
+        channels: Some(2),
+        mix: None,
+    });
+    p.buses.push(Bus {
+        id: "master".into(),
+        channels: Some(2),
+        mix: None,
+    });
+
+    p.virtual_devices.inputs.push(VirtualInputDevice {
+        id: "stream".into(),
+        name: "Stream".into(),
+        channels: Some(2),
+        uid: None,
+        mix: Some(MixConfig {
+            limiter: true,
+            limit_dbfs: -1.0,
+            mode: MixMode::Sum,
+        }),
+    });
+    p.virtual_devices.inputs.push(VirtualInputDevice {
+        id: "monitor".into(),
+        name: "Monitor".into(),
+        channels: Some(2),
+        uid: None,
+        mix: Some(MixConfig {
+            limiter: false,
+            limit_dbfs: -1.0,
+            mode: MixMode::Average,
+        }),
+    });
+    p.virtual_devices.inputs.push(VirtualInputDevice {
+        id: "record".into(),
+        name: "Record".into(),
+        channels: Some(2),
+        uid: None,
+        mix: Some(MixConfig {
+            limiter: false,
+            limit_dbfs: -1.0,
+            mode: MixMode::Sum,
+        }),
+    });
+
+    for source in ["app1", "app2", "app3"] {
+        p.pipes.push(Pipe {
+            from: source.into(),
+            to: "music".into(),
+            enabled: true,
+            gain_db: -3.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+    }
+    for source in ["app4", "app5", "app6"] {
+        p.pipes.push(Pipe {
+            from: source.into(),
+            to: "voice".into(),
+            enabled: true,
+            gain_db: -6.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+    }
+    p.pipes.push(Pipe {
+        from: "music".into(),
+        to: "master".into(),
+        enabled: true,
+        gain_db: 0.0,
+        mute: false,
+        pan: -0.15,
+        delay_ms: 0.0,
+    });
+    p.pipes.push(Pipe {
+        from: "voice".into(),
+        to: "master".into(),
+        enabled: true,
+        gain_db: 0.0,
+        mute: false,
+        pan: 0.15,
+        delay_ms: 0.0,
+    });
+    p.pipes.push(Pipe {
+        from: "master".into(),
+        to: "stream".into(),
+        enabled: true,
+        gain_db: 0.0,
+        mute: false,
+        pan: 0.0,
+        delay_ms: 0.0,
+    });
+    p.pipes.push(Pipe {
+        from: "master".into(),
+        to: "monitor".into(),
+        enabled: true,
+        gain_db: 0.0,
+        mute: false,
+        pan: 0.0,
+        delay_ms: 0.0,
+    });
+    p.pipes.push(Pipe {
+        from: "master".into(),
+        to: "record".into(),
+        enabled: true,
+        gain_db: 0.0,
+        mute: false,
+        pan: 0.0,
+        delay_ms: 0.0,
+    });
+
+    p
+}
+
 fn make_engine(profile: &Profile) -> Engine {
     let graph = build_routing_graph(profile).unwrap();
     Engine::new(EngineSnapshot {
@@ -262,11 +395,41 @@ fn bench_render_channel_conversion(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_render_multisource_multioutput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("engine/render_multisource_multioutput");
+    let profile = multisource_multioutput_profile();
+    let engine = make_engine(&profile);
+
+    for frames in [128, 256, 512] {
+        let sources: HashMap<String, Vec<f32>> = [
+            stereo_source("app1", frames),
+            stereo_source("app2", frames),
+            stereo_source("app3", frames),
+            stereo_source("app4", frames),
+            stereo_source("app5", frames),
+            stereo_source("app6", frames),
+        ]
+        .into_iter()
+        .collect();
+        group.throughput(Throughput::Elements((frames * 2 * sources.len()) as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(frames),
+            &(frames, &sources),
+            |b, (f, s)| {
+                b.iter(|| engine.render_cycle(*f, s).unwrap());
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_render_simple,
     bench_render_complex,
     bench_render_with_delay,
-    bench_render_channel_conversion
+    bench_render_channel_conversion,
+    bench_render_multisource_multioutput
 );
 criterion_main!(benches);

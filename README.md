@@ -170,6 +170,15 @@ cargo build
 cargo test
 ```
 
+Engine robustness and perf checks:
+
+```bash
+cargo test -p mars-engine --test soak
+cargo test -p mars-engine --release --test perf_gate -- --ignored
+cargo bench -p mars-engine --bench engine -- engine/render_multisource_multioutput
+cargo bench -p mars-daemon --bench daemon_ipc_shm
+```
+
 ## Getting Started
 
 See the full setup and first-run guide: `docs/getting-started.md`.
