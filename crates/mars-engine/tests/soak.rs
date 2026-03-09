@@ -10,6 +10,7 @@ use mars_types::{
     Bus, MixConfig, MixMode, Pipe, ProcessorChain, ProcessorDefinition, ProcessorKind, Profile,
     Route, RouteMatrix, VirtualInputDevice, VirtualOutputDevice,
 };
+use serde_json::json;
 
 fn profile_variant(master_to_stream_delay_ms: f32, stream_limiter: bool) -> Profile {
     let mut profile = Profile::default();
@@ -371,4 +372,99 @@ fn concurrent_render_with_chain_swaps_and_control_updates_stays_stable() {
                 .unwrap_or(0)
             > 0
     );
+}
+
+#[test]
+fn soak_denoise_and_timeshift_keep_alignment_and_stability() {
+    let mut profile = Profile::default();
+    profile.virtual_devices.outputs.push(VirtualOutputDevice {
+        id: "src".to_string(),
+        name: "Src".to_string(),
+        channels: Some(1),
+        uid: None,
+        hidden: false,
+    });
+    profile.virtual_devices.inputs.push(VirtualInputDevice {
+        id: "sink".to_string(),
+        name: "Sink".to_string(),
+        channels: Some(1),
+        uid: None,
+        mix: None,
+    });
+    profile.processors.push(ProcessorDefinition {
+        id: "denoise".to_string(),
+        kind: ProcessorKind::Denoise,
+        config: json!({
+            "threshold_db": -35.0,
+            "reduction_db": 24.0,
+            "attack_ms": 0.1,
+            "release_ms": 120.0
+        }),
+    });
+    profile.processors.push(ProcessorDefinition {
+        id: "timeshift".to_string(),
+        kind: ProcessorKind::TimeShift,
+        config: json!({
+            "delay_ms": 50.0,
+            "max_delay_ms": 200.0
+        }),
+    });
+    profile.processor_chains.push(ProcessorChain {
+        id: "fx".to_string(),
+        processors: vec!["denoise".to_string(), "timeshift".to_string()],
+    });
+    profile.routes.push(Route {
+        id: "route".to_string(),
+        from: "src".to_string(),
+        to: "sink".to_string(),
+        enabled: true,
+        matrix: RouteMatrix {
+            rows: 1,
+            cols: 1,
+            coefficients: vec![vec![1.0]],
+        },
+        chain: Some("fx".to_string()),
+        gain_db: 0.0,
+        mute: false,
+        pan: 0.0,
+        delay_ms: 0.0,
+    });
+
+    let snapshot = snapshot_from_profile(&profile, 1_000, 25);
+    let engine = Engine::new(snapshot);
+    let mut expected_pulses = 0usize;
+    let mut observed_pulses = 0usize;
+
+    for cycle in 0..4_000usize {
+        let mut sources = HashMap::new();
+        let mut input = vec![0.0_f32; 25];
+        for (offset, sample) in input.iter_mut().enumerate() {
+            let frame = cycle * 25 + offset;
+            *sample = if frame % 200 == 0 {
+                1.0
+            } else {
+                0.002 * ((frame as f32) * 0.1).sin()
+            };
+        }
+        sources.insert("src".to_string(), input);
+
+        let output = engine.render_cycle(25, &sources).expect("render");
+        let sink = output.sinks.get("sink").expect("sink");
+        for (offset, sample) in sink.iter().enumerate() {
+            assert!(sample.is_finite());
+            let frame = cycle * 25 + offset;
+            let is_expected_pulse = frame >= 50 && (frame - 50) % 200 == 0;
+            if is_expected_pulse {
+                expected_pulses += 1;
+                if sample.abs() > 0.3 {
+                    observed_pulses += 1;
+                }
+            } else {
+                assert!(sample.abs() < 0.05);
+            }
+        }
+    }
+
+    assert!(expected_pulses > 0);
+    assert_eq!(observed_pulses, expected_pulses);
 }

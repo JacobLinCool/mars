@@ -116,6 +116,16 @@ pub enum ProfileError {
         processor_id: String,
         reason: String,
     },
+    #[error("processor '{processor_id}' denoise config is invalid: {reason}")]
+    InvalidDenoiseConfig {
+        processor_id: String,
+        reason: String,
+    },
+    #[error("processor '{processor_id}' time-shift config is invalid: {reason}")]
+    InvalidTimeShiftConfig {
+        processor_id: String,
+        reason: String,
+    },
     #[error("file sink '{sink_id}' path must not be empty")]
     EmptyFileSinkPath { sink_id: String },
     #[error("stream sink '{sink_id}' endpoint must not be empty")]
@@ -372,6 +382,28 @@ struct DynamicsConfig {
     limiter: bool,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DenoiseConfig {
+    #[serde(default = "default_denoise_threshold_db")]
+    threshold_db: f32,
+    #[serde(default = "default_denoise_reduction_db")]
+    reduction_db: f32,
+    #[serde(default = "default_denoise_attack_ms")]
+    attack_ms: f32,
+    #[serde(default = "default_denoise_release_ms")]
+    release_ms: f32,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TimeShiftConfig {
+    #[serde(default)]
+    delay_ms: f32,
+    #[serde(default = "default_timeshift_max_delay_ms")]
+    max_delay_ms: f32,
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -398,6 +430,26 @@ const fn default_dynamics_attack_ms() -> f32 {
 
 const fn default_dynamics_release_ms() -> f32 {
     100.0
+}
+
+const fn default_denoise_threshold_db() -> f32 {
+    -45.0
+}
+
+const fn default_denoise_reduction_db() -> f32 {
+    18.0
+}
+
+const fn default_denoise_attack_ms() -> f32 {
+    5.0
+}
+
+const fn default_denoise_release_ms() -> f32 {
+    120.0
+}
+
+const fn default_timeshift_max_delay_ms() -> f32 {
+    2_000.0
 }
 
 fn validate_eq_config(config: &EqConfig, processor_id: &str) -> Result<(), ProfileError> {
@@ -472,6 +524,63 @@ fn validate_dynamics_config(
     Ok(())
 }
 
+fn validate_denoise_config(config: &DenoiseConfig, processor_id: &str) -> Result<(), ProfileError> {
+    let in_range =
+        |value: f32, min: f32, max: f32| value.is_finite() && value >= min && value <= max;
+    if !in_range(config.threshold_db, -96.0, 0.0) {
+        return Err(ProfileError::InvalidDenoiseConfig {
+            processor_id: processor_id.to_string(),
+            reason: "threshold_db must be finite in [-96, 0]".to_string(),
+        });
+    }
+    if !in_range(config.reduction_db, 0.0, 60.0) {
+        return Err(ProfileError::InvalidDenoiseConfig {
+            processor_id: processor_id.to_string(),
+            reason: "reduction_db must be finite in [0, 60]".to_string(),
+        });
+    }
+    if !in_range(config.attack_ms, 0.1, 500.0) {
+        return Err(ProfileError::InvalidDenoiseConfig {
+            processor_id: processor_id.to_string(),
+            reason: "attack_ms must be finite in [0.1, 500]".to_string(),
+        });
+    }
+    if !in_range(config.release_ms, 1.0, 5_000.0) {
+        return Err(ProfileError::InvalidDenoiseConfig {
+            processor_id: processor_id.to_string(),
+            reason: "release_ms must be finite in [1, 5000]".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_time_shift_config(
+    config: &TimeShiftConfig,
+    processor_id: &str,
+) -> Result<(), ProfileError> {
+    let in_range =
+        |value: f32, min: f32, max: f32| value.is_finite() && value >= min && value <= max;
+    if !in_range(config.delay_ms, 0.0, 2_000.0) {
+        return Err(ProfileError::InvalidTimeShiftConfig {
+            processor_id: processor_id.to_string(),
+            reason: "delay_ms must be finite in [0, 2000]".to_string(),
+        });
+    }
+    if !in_range(config.max_delay_ms, 1.0, 2_000.0) {
+        return Err(ProfileError::InvalidTimeShiftConfig {
+            processor_id: processor_id.to_string(),
+            reason: "max_delay_ms must be finite in [1, 2000]".to_string(),
+        });
+    }
+    if config.delay_ms > config.max_delay_ms {
+        return Err(ProfileError::InvalidTimeShiftConfig {
+            processor_id: processor_id.to_string(),
+            reason: "delay_ms must be <= max_delay_ms".to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn normalized_processor_config(config: &serde_json::Value) -> serde_json::Value {
     if config.is_null() {
         return serde_json::Value::Object(serde_json::Map::new());
@@ -501,6 +610,26 @@ fn validate_processor_chains(profile: &Profile) -> Result<(), ProfileError> {
                     reason: error.to_string(),
                 })?;
                 validate_dynamics_config(&config, &processor.id)?;
+            }
+            ProcessorKind::Denoise => {
+                let config = serde_json::from_value::<DenoiseConfig>(normalized_processor_config(
+                    &processor.config,
+                ))
+                .map_err(|error| ProfileError::InvalidDenoiseConfig {
+                    processor_id: processor.id.clone(),
+                    reason: error.to_string(),
+                })?;
+                validate_denoise_config(&config, &processor.id)?;
+            }
+            ProcessorKind::TimeShift => {
+                let config = serde_json::from_value::<TimeShiftConfig>(
+                    normalized_processor_config(&processor.config),
+                )
+                .map_err(|error| ProfileError::InvalidTimeShiftConfig {
+                    processor_id: processor.id.clone(),
+                    reason: error.to_string(),
+                })?;
+                validate_time_shift_config(&config, &processor.id)?;
             }
             _ => {}
         }
@@ -1143,7 +1272,7 @@ pipes: []
     }
 
     #[test]
-    fn accepts_eq_and_dynamics_with_default_null_config() {
+    fn accepts_dsp_blocks_with_default_null_config() {
         let yaml = r#"
 version: 2
 virtual:
@@ -1158,9 +1287,13 @@ processors:
     kind: eq
   - id: dyn1
     kind: dynamics
+  - id: den1
+    kind: denoise
+  - id: ts1
+    kind: time_shift
 processor_chains:
   - id: chain1
-    processors: [eq1, dyn1]
+    processors: [eq1, dyn1, den1, ts1]
 routes:
   - id: r1
     from: app
@@ -1222,5 +1355,52 @@ pipes: []
         let err = validate_profile(profile).expect_err("validation must fail");
         assert!(err.to_string().contains("dynamics config is invalid"));
         assert!(err.to_string().contains("ratio must be finite in [1, 32]"));
+    }
+
+    #[test]
+    fn rejects_invalid_denoise_config_range() {
+        let yaml = r#"
+version: 2
+virtual:
+  outputs: []
+  inputs: []
+processors:
+  - id: den1
+    kind: denoise
+    config:
+      threshold_db: -30.0
+      reduction_db: 61.0
+      attack_ms: 5.0
+      release_ms: 120.0
+pipes: []
+"#;
+        let profile = parse_profile_str(yaml).expect("yaml parse should work");
+        let err = validate_profile(profile).expect_err("validation must fail");
+        assert!(err.to_string().contains("denoise config is invalid"));
+        assert!(
+            err.to_string()
+                .contains("reduction_db must be finite in [0, 60]")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_time_shift_config_range() {
+        let yaml = r#"
+version: 2
+virtual:
+  outputs: []
+  inputs: []
+processors:
+  - id: ts1
+    kind: time_shift
+    config:
+      delay_ms: 900.0
+      max_delay_ms: 500.0
+pipes: []
+"#;
+        let profile = parse_profile_str(yaml).expect("yaml parse should work");
+        let err = validate_profile(profile).expect_err("validation must fail");
+        assert!(err.to_string().contains("time-shift config is invalid"));
+        assert!(err.to_string().contains("delay_ms must be <= max_delay_ms"));
     }
 }

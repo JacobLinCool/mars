@@ -362,6 +362,16 @@ fn processor_config(kind: ProcessorKind) -> serde_json::Value {
             "makeup_gain_db": 0.0,
             "limiter": false
         }),
+        ProcessorKind::Denoise => json!({
+            "threshold_db": -40.0,
+            "reduction_db": 20.0,
+            "attack_ms": 2.0,
+            "release_ms": 120.0
+        }),
+        ProcessorKind::TimeShift => json!({
+            "delay_ms": 30.0,
+            "max_delay_ms": 200.0
+        }),
         _ => serde_json::Value::Null,
     }
 }
@@ -404,6 +414,49 @@ fn chain_profile(kinds: &[ProcessorKind]) -> Profile {
         enabled: true,
         matrix: identity_matrix(2),
         chain: Some("main-chain".into()),
+        gain_db: 0.0,
+        mute: false,
+        pan: 0.0,
+        delay_ms: 0.0,
+    });
+    p
+}
+
+fn timeshift_profile(channels: u16, delay_ms: f32, max_delay_ms: f32) -> Profile {
+    let mut p = Profile::default();
+    p.virtual_devices.outputs.push(VirtualOutputDevice {
+        id: "ts-src".into(),
+        name: "Time Shift Source".into(),
+        channels: Some(channels),
+        uid: None,
+        hidden: false,
+    });
+    p.virtual_devices.inputs.push(VirtualInputDevice {
+        id: "ts-sink".into(),
+        name: "Time Shift Sink".into(),
+        channels: Some(channels),
+        uid: None,
+        mix: None,
+    });
+    p.processors.push(ProcessorDefinition {
+        id: "ts-proc".into(),
+        kind: ProcessorKind::TimeShift,
+        config: json!({
+            "delay_ms": delay_ms,
+            "max_delay_ms": max_delay_ms
+        }),
+    });
+    p.processor_chains.push(ProcessorChain {
+        id: "ts-chain".into(),
+        processors: vec!["ts-proc".into()],
+    });
+    p.routes.push(Route {
+        id: "ts-route".into(),
+        from: "ts-src".into(),
+        to: "ts-sink".into(),
+        enabled: true,
+        matrix: identity_matrix(channels),
+        chain: Some("ts-chain".into()),
         gain_db: 0.0,
         mute: false,
         pan: 0.0,
@@ -640,6 +693,8 @@ fn bench_render_processor_block(c: &mut Criterion) {
     for (name, kind) in [
         ("eq", ProcessorKind::Eq),
         ("dynamics", ProcessorKind::Dynamics),
+        ("denoise", ProcessorKind::Denoise),
+        ("timeshift", ProcessorKind::TimeShift),
     ] {
         let profile = chain_profile(&[kind]);
         let engine = make_engine(&profile);
@@ -663,17 +718,19 @@ fn bench_render_processor_chain_kind(c: &mut Criterion) {
     let cases = vec![
         ("eqx4", vec![ProcessorKind::Eq; 4]),
         ("dynamicsx4", vec![ProcessorKind::Dynamics; 4]),
+        ("denoisex4", vec![ProcessorKind::Denoise; 4]),
+        ("timeshiftx4", vec![ProcessorKind::TimeShift; 4]),
         (
             "mix8",
             vec![
                 ProcessorKind::Eq,
                 ProcessorKind::Dynamics,
+                ProcessorKind::Denoise,
+                ProcessorKind::TimeShift,
                 ProcessorKind::Eq,
                 ProcessorKind::Dynamics,
-                ProcessorKind::Eq,
-                ProcessorKind::Dynamics,
-                ProcessorKind::Eq,
-                ProcessorKind::Dynamics,
+                ProcessorKind::Denoise,
+                ProcessorKind::TimeShift,
             ],
         ),
     ];
@@ -683,6 +740,36 @@ fn bench_render_processor_chain_kind(c: &mut Criterion) {
         let engine = make_engine(&profile);
         let sources: HashMap<String, Vec<f32>> =
             [stereo_source("chain-src", frames)].into_iter().collect();
+        group.bench_with_input(
+            BenchmarkId::new(name, frames),
+            &(frames, &sources),
+            |b, (f, s)| {
+                b.iter(|| engine.render_cycle(*f, s).unwrap());
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_render_timeshift_depth(c: &mut Criterion) {
+    let mut group = c.benchmark_group("engine/render_timeshift_depth");
+    let frames = 256usize;
+    let cases = [
+        ("ch2_d50", 2_u16, 50.0_f32, 200.0_f32),
+        ("ch2_d500", 2_u16, 500.0_f32, 1_000.0_f32),
+        ("ch8_d500", 8_u16, 500.0_f32, 1_000.0_f32),
+        ("ch8_d2000", 8_u16, 2_000.0_f32, 2_000.0_f32),
+    ];
+
+    for (name, channels, delay_ms, max_delay_ms) in cases {
+        let profile = timeshift_profile(channels, delay_ms, max_delay_ms);
+        let engine = make_engine(&profile);
+        let sources: HashMap<String, Vec<f32>> =
+            [multichannel_source("ts-src", frames, channels as usize)]
+                .into_iter()
+                .collect();
+        group.throughput(Throughput::Elements((frames * channels as usize) as u64));
         group.bench_with_input(
             BenchmarkId::new(name, frames),
             &(frames, &sources),
@@ -706,6 +793,7 @@ criterion_group!(
     bench_render_chain_length,
     bench_render_param_updates,
     bench_render_processor_block,
-    bench_render_processor_chain_kind
+    bench_render_processor_chain_kind,
+    bench_render_timeshift_depth
 );
 criterion_main!(benches);
