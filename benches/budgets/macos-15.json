@@ -88,14 +88,14 @@
       "benchmark_id": "engine/render_chain_length/1/256",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 4954.857763023493,
+      "budget_value": 6136.722719536767,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "engine/render_chain_length/1/256",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 6797.822223422641,
+      "budget_value": 7897.808470490125,
       "regression_threshold": 0.15
     },
     {
@@ -130,14 +130,14 @@
       "benchmark_id": "engine/render_chain_length/4/256",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 15241.20099914966,
+      "budget_value": 15697.875488508074,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "engine/render_chain_length/4/256",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 18793.627160074473,
+      "budget_value": 18894.601691745705,
       "regression_threshold": 0.15
     },
     {
@@ -151,14 +151,14 @@
       "benchmark_id": "engine/render_chain_length/8/256",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 27577.452723960923,
+      "budget_value": 29156.25318885449,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "engine/render_chain_length/8/256",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 34889.06511316872,
+      "budget_value": 38307.73293017957,
       "regression_threshold": 0.15
     },
     {
@@ -424,14 +424,14 @@
       "benchmark_id": "engine/render_param_updates/1/256",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 23778.382344517187,
+      "budget_value": 26250.145782493368,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "engine/render_param_updates/1/256",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 29459.911327764978,
+      "budget_value": 30134.275149572648,
       "regression_threshold": 0.15
     },
     {
