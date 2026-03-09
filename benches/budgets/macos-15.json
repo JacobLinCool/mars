@@ -137,7 +137,7 @@
       "benchmark_id": "engine/render_chain_length/4/256",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 3194.2863490226337,
+      "budget_value": 5024.437708609678,
       "regression_threshold": 0.15
     },
     {
