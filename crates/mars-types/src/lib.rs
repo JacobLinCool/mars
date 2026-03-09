@@ -6,7 +6,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROFILE_VERSION: u32 = 1;
+pub const PROFILE_VERSION: u32 = 2;
 pub const PROFILE_FILE_EXTENSION: &str = "yaml";
 pub const MANAGED_UID_PREFIX: &str = "com.mars.";
 pub const MANUFACTURER_MARS: &str = "MARS";
@@ -58,6 +58,7 @@ impl TryFrom<i32> for ExitCode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Profile {
     pub version: u32,
     #[serde(default)]
@@ -75,6 +76,16 @@ pub struct Profile {
     #[serde(default)]
     pub pipes: Vec<Pipe>,
     #[serde(default)]
+    pub routes: Vec<Route>,
+    #[serde(default)]
+    pub processors: Vec<ProcessorDefinition>,
+    #[serde(default)]
+    pub processor_chains: Vec<ProcessorChain>,
+    #[serde(default)]
+    pub captures: CaptureConfig,
+    #[serde(default)]
+    pub sinks: SinkConfig,
+    #[serde(default)]
     pub policy: Policy,
 }
 
@@ -89,6 +100,11 @@ impl Default for Profile {
             buses: Vec::new(),
             external: ExternalDevices::default(),
             pipes: Vec::new(),
+            routes: Vec::new(),
+            processors: Vec::new(),
+            processor_chains: Vec::new(),
+            captures: CaptureConfig::default(),
+            sinks: SinkConfig::default(),
             policy: Policy::default(),
         }
     }
@@ -307,6 +323,7 @@ pub enum TransportType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Pipe {
     pub from: String,
     pub to: String,
@@ -324,6 +341,151 @@ pub struct Pipe {
 
 const fn default_enabled() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Route {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    pub matrix: RouteMatrix,
+    #[serde(default)]
+    pub chain: Option<String>,
+    #[serde(default)]
+    pub gain_db: f32,
+    #[serde(default)]
+    pub mute: bool,
+    #[serde(default)]
+    pub pan: f32,
+    #[serde(default)]
+    pub delay_ms: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RouteMatrix {
+    pub rows: u16,
+    pub cols: u16,
+    pub coefficients: Vec<Vec<f32>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessorDefinition {
+    pub id: String,
+    pub kind: ProcessorKind,
+    #[serde(default)]
+    pub config: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessorKind {
+    Eq,
+    Dynamics,
+    Denoise,
+    TimeShift,
+    Au,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessorChain {
+    pub id: String,
+    #[serde(default)]
+    pub processors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureConfig {
+    #[serde(default)]
+    pub process_taps: Vec<ProcessTap>,
+    #[serde(default)]
+    pub system_taps: Vec<SystemTap>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessTap {
+    pub id: String,
+    pub selector: ProcessTapSelector,
+    #[serde(default)]
+    pub channels: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProcessTapSelector {
+    Pid { pid: u32 },
+    BundleId { bundle_id: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SystemTap {
+    pub id: String,
+    #[serde(default)]
+    pub mode: SystemTapMode,
+    #[serde(default)]
+    pub channels: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemTapMode {
+    #[default]
+    DefaultOutput,
+    AllOutput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SinkConfig {
+    #[serde(default)]
+    pub files: Vec<FileSink>,
+    #[serde(default)]
+    pub streams: Vec<StreamSink>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FileSink {
+    pub id: String,
+    pub path: String,
+    #[serde(default)]
+    pub format: FileSinkFormat,
+    #[serde(default)]
+    pub channels: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FileSinkFormat {
+    #[default]
+    Wav,
+    Caf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StreamSink {
+    pub id: String,
+    pub transport: StreamTransport,
+    pub endpoint: String,
+    #[serde(default)]
+    pub options: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamTransport {
+    Rtp,
+    Srt,
+    Webrtc,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Default)]

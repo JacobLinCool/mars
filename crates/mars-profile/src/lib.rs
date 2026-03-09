@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! YAML profile parsing, schema generation, and semantic validation.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -59,6 +59,57 @@ pub enum ProfileError {
     InvalidBufferFrames,
     #[error("pan must be in [-1.0, 1.0], got {0}")]
     InvalidPan(f32),
+    #[error("route '{route_id}' pan must be in [-1.0, 1.0], got {value}")]
+    InvalidRoutePan { route_id: String, value: f32 },
+    #[error("pipe delay must be in [0.0, 2000.0], got {0}")]
+    InvalidDelay(f32),
+    #[error("route '{route_id}' delay must be in [0.0, 2000.0], got {value}")]
+    InvalidRouteDelay { route_id: String, value: f32 },
+    #[error("route '{route_id}' references unknown source '{source_id}'")]
+    UnknownRouteSource { route_id: String, source_id: String },
+    #[error("route '{route_id}' references unknown destination '{destination}'")]
+    UnknownRouteDestination {
+        route_id: String,
+        destination: String,
+    },
+    #[error("route '{route_id}' references unknown processor chain '{chain_id}'")]
+    UnknownRouteChain { route_id: String, chain_id: String },
+    #[error(
+        "route '{route_id}' matrix shape mismatch: declared rows={rows}, cols={cols}, actual_rows={actual_rows}, actual_cols={actual_cols}"
+    )]
+    RouteMatrixShapeMismatch {
+        route_id: String,
+        rows: u16,
+        cols: u16,
+        actual_rows: usize,
+        actual_cols: usize,
+    },
+    #[error(
+        "route '{route_id}' matrix channels mismatch: expected rows={expected_rows}, cols={expected_cols}, got rows={rows}, cols={cols}"
+    )]
+    RouteMatrixChannelMismatch {
+        route_id: String,
+        expected_rows: u16,
+        expected_cols: u16,
+        rows: u16,
+        cols: u16,
+    },
+    #[error("route '{route_id}' matrix must be finite at [{row}][{col}], got {value}")]
+    NonFiniteRouteMatrixCoefficient {
+        route_id: String,
+        row: usize,
+        col: usize,
+        value: f32,
+    },
+    #[error("processor chain '{chain_id}' references unknown processor '{processor_id}'")]
+    UnknownProcessorInChain {
+        chain_id: String,
+        processor_id: String,
+    },
+    #[error("file sink '{sink_id}' path must not be empty")]
+    EmptyFileSinkPath { sink_id: String },
+    #[error("stream sink '{sink_id}' endpoint must not be empty")]
+    EmptyStreamSinkEndpoint { sink_id: String },
     #[error("invalid name_regex for external endpoint '{id}': '{pattern}' ({reason})")]
     InvalidNameRegex {
         id: String,
@@ -79,7 +130,11 @@ pub fn load_profile(path: &Path) -> Result<ValidatedProfile, ProfileError> {
 }
 
 pub fn parse_profile_str(raw: &str) -> Result<Profile, ProfileError> {
-    serde_yaml::from_str(raw).map_err(ProfileError::Yaml)
+    let profile: Profile = serde_yaml::from_str(raw).map_err(ProfileError::Yaml)?;
+    if profile.version != PROFILE_VERSION {
+        return Err(ProfileError::UnsupportedVersion(profile.version));
+    }
+    Ok(profile)
 }
 
 pub fn validate_profile(profile: Profile) -> Result<ValidatedProfile, ProfileError> {
@@ -90,6 +145,9 @@ pub fn validate_profile(profile: Profile) -> Result<ValidatedProfile, ProfileErr
     validate_audio(&profile)?;
     validate_ids(&profile)?;
     validate_pipe_ranges(&profile)?;
+    validate_routes(&profile)?;
+    validate_processor_chains(&profile)?;
+    validate_sinks(&profile)?;
     validate_external_matchers(&profile)?;
     let graph = build_routing_graph(&profile)?;
 
@@ -158,8 +216,187 @@ fn validate_pipe_ranges(profile: &Profile) -> Result<(), ProfileError> {
         if !(-1.0..=1.0).contains(&pipe.pan) {
             return Err(ProfileError::InvalidPan(pipe.pan));
         }
+        if !(0.0..=2_000.0).contains(&pipe.delay_ms) {
+            return Err(ProfileError::InvalidDelay(pipe.delay_ms));
+        }
     }
     Ok(())
+}
+
+fn validate_routes(profile: &Profile) -> Result<(), ProfileError> {
+    let node_channels = collect_node_channels(profile);
+    let chain_ids = profile
+        .processor_chains
+        .iter()
+        .map(|chain| chain.id.as_str())
+        .collect::<BTreeSet<_>>();
+
+    for route in &profile.routes {
+        if !(-1.0..=1.0).contains(&route.pan) {
+            return Err(ProfileError::InvalidRoutePan {
+                route_id: route.id.clone(),
+                value: route.pan,
+            });
+        }
+        if !(0.0..=2_000.0).contains(&route.delay_ms) {
+            return Err(ProfileError::InvalidRouteDelay {
+                route_id: route.id.clone(),
+                value: route.delay_ms,
+            });
+        }
+
+        let source_channels = node_channels
+            .get(route.from.as_str())
+            .copied()
+            .ok_or_else(|| ProfileError::UnknownRouteSource {
+                route_id: route.id.clone(),
+                source_id: route.from.clone(),
+            })?;
+        let destination_channels =
+            node_channels
+                .get(route.to.as_str())
+                .copied()
+                .ok_or_else(|| ProfileError::UnknownRouteDestination {
+                    route_id: route.id.clone(),
+                    destination: route.to.clone(),
+                })?;
+
+        if let Some(chain_id) = route.chain.as_deref() {
+            if !chain_ids.contains(chain_id) {
+                return Err(ProfileError::UnknownRouteChain {
+                    route_id: route.id.clone(),
+                    chain_id: chain_id.to_string(),
+                });
+            }
+        }
+
+        let rows = route.matrix.rows as usize;
+        let cols = route.matrix.cols as usize;
+        if rows == 0 || cols == 0 {
+            return Err(ProfileError::RouteMatrixShapeMismatch {
+                route_id: route.id.clone(),
+                rows: route.matrix.rows,
+                cols: route.matrix.cols,
+                actual_rows: route.matrix.coefficients.len(),
+                actual_cols: route.matrix.coefficients.first().map_or(0, Vec::len),
+            });
+        }
+
+        if rows != route.matrix.coefficients.len()
+            || route
+                .matrix
+                .coefficients
+                .iter()
+                .any(|row| row.len() != cols)
+        {
+            return Err(ProfileError::RouteMatrixShapeMismatch {
+                route_id: route.id.clone(),
+                rows: route.matrix.rows,
+                cols: route.matrix.cols,
+                actual_rows: route.matrix.coefficients.len(),
+                actual_cols: route.matrix.coefficients.first().map_or(0, Vec::len),
+            });
+        }
+
+        if route.matrix.rows != destination_channels || route.matrix.cols != source_channels {
+            return Err(ProfileError::RouteMatrixChannelMismatch {
+                route_id: route.id.clone(),
+                expected_rows: destination_channels,
+                expected_cols: source_channels,
+                rows: route.matrix.rows,
+                cols: route.matrix.cols,
+            });
+        }
+
+        for (row_index, row) in route.matrix.coefficients.iter().enumerate() {
+            for (col_index, coefficient) in row.iter().enumerate() {
+                if !coefficient.is_finite() {
+                    return Err(ProfileError::NonFiniteRouteMatrixCoefficient {
+                        route_id: route.id.clone(),
+                        row: row_index,
+                        col: col_index,
+                        value: *coefficient,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_processor_chains(profile: &Profile) -> Result<(), ProfileError> {
+    let processors = profile
+        .processors
+        .iter()
+        .map(|processor| processor.id.as_str())
+        .collect::<BTreeSet<_>>();
+
+    for chain in &profile.processor_chains {
+        for processor_id in &chain.processors {
+            if !processors.contains(processor_id.as_str()) {
+                return Err(ProfileError::UnknownProcessorInChain {
+                    chain_id: chain.id.clone(),
+                    processor_id: processor_id.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_sinks(profile: &Profile) -> Result<(), ProfileError> {
+    for file in &profile.sinks.files {
+        if file.path.trim().is_empty() {
+            return Err(ProfileError::EmptyFileSinkPath {
+                sink_id: file.id.clone(),
+            });
+        }
+    }
+    for stream in &profile.sinks.streams {
+        if stream.endpoint.trim().is_empty() {
+            return Err(ProfileError::EmptyStreamSinkEndpoint {
+                sink_id: stream.id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn collect_node_channels(profile: &Profile) -> BTreeMap<&str, u16> {
+    let default_channels = profile.audio.channels.as_value().unwrap_or(2);
+    let mut map = BTreeMap::new();
+
+    for output in &profile.virtual_devices.outputs {
+        map.insert(
+            output.id.as_str(),
+            output.channels.unwrap_or(default_channels),
+        );
+    }
+    for input in &profile.virtual_devices.inputs {
+        map.insert(
+            input.id.as_str(),
+            input.channels.unwrap_or(default_channels),
+        );
+    }
+    for bus in &profile.buses {
+        map.insert(bus.id.as_str(), bus.channels.unwrap_or(default_channels));
+    }
+    for input in &profile.external.inputs {
+        map.insert(
+            input.id.as_str(),
+            input.channels.unwrap_or(default_channels),
+        );
+    }
+    for output in &profile.external.outputs {
+        map.insert(
+            output.id.as_str(),
+            output.channels.unwrap_or(default_channels),
+        );
+    }
+
+    map
 }
 
 fn validate_external_matchers(profile: &Profile) -> Result<(), ProfileError> {
@@ -204,6 +441,25 @@ fn validate_ids(profile: &Profile) -> Result<(), ProfileError> {
         .chain(profile.buses.iter().map(|item| item.id.as_str()))
         .chain(profile.external.inputs.iter().map(|item| item.id.as_str()))
         .chain(profile.external.outputs.iter().map(|item| item.id.as_str()))
+        .chain(profile.routes.iter().map(|item| item.id.as_str()))
+        .chain(profile.processors.iter().map(|item| item.id.as_str()))
+        .chain(profile.processor_chains.iter().map(|item| item.id.as_str()))
+        .chain(
+            profile
+                .captures
+                .process_taps
+                .iter()
+                .map(|item| item.id.as_str()),
+        )
+        .chain(
+            profile
+                .captures
+                .system_taps
+                .iter()
+                .map(|item| item.id.as_str()),
+        )
+        .chain(profile.sinks.files.iter().map(|item| item.id.as_str()))
+        .chain(profile.sinks.streams.iter().map(|item| item.id.as_str()))
     {
         if !valid_id(id) {
             return Err(ProfileError::InvalidId { id: id.to_string() });
@@ -211,6 +467,14 @@ fn validate_ids(profile: &Profile) -> Result<(), ProfileError> {
 
         if !all.insert(id.to_string()) {
             return Err(ProfileError::DuplicateId { id: id.to_string() });
+        }
+    }
+
+    for tap in &profile.captures.process_taps {
+        if let mars_types::ProcessTapSelector::BundleId { bundle_id } = &tap.selector {
+            if bundle_id.trim().is_empty() {
+                return Err(ProfileError::InvalidId { id: tap.id.clone() });
+            }
         }
     }
 
@@ -242,7 +506,7 @@ fn valid_id(id: &str) -> bool {
 
 fn default_template(name: &str) -> String {
     format!(
-        r#"version: 1
+        r#"version: 2
 name: "{name}"
 audio:
   sample_rate: 48000
@@ -259,6 +523,29 @@ virtual:
     - id: mix-1
       name: "Mix: Main"
 
+routes:
+  - id: route-app-main
+    from: bus-1
+    to: mix-1
+    matrix:
+      rows: 2
+      cols: 2
+      coefficients:
+        - [1.0, 0.0]
+        - [0.0, 1.0]
+
+processors: []
+
+processor_chains: []
+
+captures:
+  process_taps: []
+  system_taps: []
+
+sinks:
+  files: []
+  streams: []
+
 pipes:
   - from: bus-1
     to: mix-1
@@ -268,7 +555,7 @@ pipes:
 
 fn multi_template(name: &str) -> String {
     format!(
-        r#"version: 1
+        r#"version: 2
 name: "{name}"
 audio:
   sample_rate: 48000
@@ -299,6 +586,29 @@ external:
       match:
         name_regex: ".*Speakers.*"
 
+routes:
+  - id: route-merge-main
+    from: merge-bus
+    to: mix-main
+    matrix:
+      rows: 2
+      cols: 2
+      coefficients:
+        - [1.0, 0.0]
+        - [0.0, 1.0]
+
+processors: []
+
+processor_chains: []
+
+captures:
+  process_taps: []
+  system_taps: []
+
+sinks:
+  files: []
+  streams: []
+
 pipes:
   - from: app-browser
     to: merge-bus
@@ -316,7 +626,7 @@ pipes:
 
 fn blank_template(name: &str) -> String {
     format!(
-        r#"version: 1
+        r#"version: 2
 name: "{name}"
 audio:
   sample_rate: 48000
@@ -332,6 +642,20 @@ buses: []
 external:
   inputs: []
   outputs: []
+
+routes: []
+
+processors: []
+
+processor_chains: []
+
+captures:
+  process_taps: []
+  system_taps: []
+
+sinks:
+  files: []
+  streams: []
 
 pipes: []
 
@@ -350,7 +674,7 @@ mod tests {
     #[test]
     fn validates_default_profile() {
         let yaml = r#"
-version: 1
+version: 2
 audio:
   sample_rate: 48000
   channels: 2
@@ -375,7 +699,7 @@ pipes:
     #[test]
     fn rejects_invalid_id() {
         let yaml = r#"
-version: 1
+version: 2
 virtual:
   outputs:
     - id: "bad id"
@@ -392,7 +716,7 @@ pipes: []
     #[test]
     fn rejects_invalid_external_name_regex() {
         let yaml = r#"
-version: 1
+version: 2
 virtual:
   outputs: []
   inputs: []
@@ -412,7 +736,7 @@ pipes: []
     #[test]
     fn accepts_valid_external_name_regex() {
         let yaml = r#"
-version: 1
+version: 2
 virtual:
   outputs: []
   inputs: []
@@ -432,7 +756,7 @@ pipes: []
     #[test]
     fn rejects_legacy_on_missing_override_field() {
         let yaml = r#"
-version: 1
+version: 2
 virtual:
   outputs: []
   inputs: []
@@ -452,7 +776,7 @@ pipes: []
     #[test]
     fn rejects_legacy_fallback_matcher_field() {
         let yaml = r#"
-version: 1
+version: 2
 virtual:
   outputs: []
   inputs: []
@@ -473,7 +797,7 @@ pipes: []
     #[test]
     fn rejects_legacy_apply_mode_best_effort() {
         let yaml = r#"
-version: 1
+version: 2
 virtual:
   outputs: []
   inputs: []
@@ -489,7 +813,7 @@ policy:
     #[test]
     fn rejects_legacy_on_missing_external_skip() {
         let yaml = r#"
-version: 1
+version: 2
 virtual:
   outputs: []
   inputs: []
@@ -500,5 +824,141 @@ policy:
         let err = parse_profile_str(yaml).expect_err("yaml parse must fail");
         assert!(err.to_string().contains("invalid yaml"));
         assert!(err.to_string().contains("skip"));
+    }
+
+    #[test]
+    fn parser_rejects_v1_profile() {
+        let yaml = r#"
+version: 1
+virtual:
+  outputs: []
+  inputs: []
+pipes: []
+"#;
+        let err = parse_profile_str(yaml).expect_err("v1 must be rejected");
+        assert!(err.to_string().contains("unsupported profile version"));
+        assert!(err.to_string().contains('1'));
+    }
+
+    #[test]
+    fn rejects_route_matrix_dimension_mismatch() {
+        let yaml = r#"
+version: 2
+audio:
+  channels: 2
+virtual:
+  outputs:
+    - id: app1
+      name: App 1
+      channels: 2
+  inputs:
+    - id: mix1
+      name: Mix 1
+      channels: 2
+routes:
+  - id: route1
+    from: app1
+    to: mix1
+    matrix:
+      rows: 1
+      cols: 2
+      coefficients:
+        - [1.0, 0.0]
+pipes: []
+"#;
+        let profile = parse_profile_str(yaml).expect("yaml parse should work");
+        let err = validate_profile(profile).expect_err("validation must fail");
+        assert!(err.to_string().contains("matrix channels mismatch"));
+    }
+
+    #[test]
+    fn rejects_route_with_missing_reference() {
+        let yaml = r#"
+version: 2
+virtual:
+  outputs: []
+  inputs:
+    - id: mix1
+      name: Mix 1
+routes:
+  - id: route1
+    from: missing
+    to: mix1
+    matrix:
+      rows: 2
+      cols: 2
+      coefficients:
+        - [1.0, 0.0]
+        - [0.0, 1.0]
+pipes: []
+"#;
+        let profile = parse_profile_str(yaml).expect("yaml parse should work");
+        let err = validate_profile(profile).expect_err("validation must fail");
+        assert!(err.to_string().contains("unknown source"));
+    }
+
+    #[test]
+    fn rejects_unknown_processor_reference_in_chain() {
+        let yaml = r#"
+version: 2
+virtual:
+  outputs: []
+  inputs: []
+processors: []
+processor_chains:
+  - id: chain1
+    processors:
+      - missing-processor
+pipes: []
+"#;
+        let profile = parse_profile_str(yaml).expect("yaml parse should work");
+        let err = validate_profile(profile).expect_err("validation must fail");
+        assert!(err.to_string().contains("unknown processor"));
+    }
+
+    #[test]
+    fn rejects_unknown_route_chain_reference() {
+        let yaml = r#"
+version: 2
+virtual:
+  outputs:
+    - id: app1
+      name: App 1
+  inputs:
+    - id: mix1
+      name: Mix 1
+routes:
+  - id: route1
+    from: app1
+    to: mix1
+    chain: missing-chain
+    matrix:
+      rows: 2
+      cols: 2
+      coefficients:
+        - [1.0, 0.0]
+        - [0.0, 1.0]
+pipes: []
+"#;
+        let profile = parse_profile_str(yaml).expect("yaml parse should work");
+        let err = validate_profile(profile).expect_err("validation must fail");
+        assert!(err.to_string().contains("unknown processor chain"));
+    }
+
+    #[test]
+    fn rejects_invalid_processor_enum_value() {
+        let yaml = r#"
+version: 2
+virtual:
+  outputs: []
+  inputs: []
+processors:
+  - id: p1
+    kind: not_a_processor
+pipes: []
+"#;
+        let err = parse_profile_str(yaml).expect_err("yaml parse must fail");
+        assert!(err.to_string().contains("invalid yaml"));
+        assert!(err.to_string().contains("not_a_processor"));
     }
 }

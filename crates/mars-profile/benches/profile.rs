@@ -4,7 +4,7 @@ use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_ma
 use mars_profile::{parse_profile_str, validate_profile};
 
 const SMALL_YAML: &str = r#"
-version: 1
+version: 2
 audio:
   sample_rate: 48000
   channels: 2
@@ -16,13 +16,48 @@ virtual:
   inputs:
     - id: mix1
       name: Mix 1
+routes:
+  - id: route1
+    from: app1
+    to: mix1
+    matrix:
+      rows: 2
+      cols: 2
+      coefficients:
+        - [1.0, 0.0]
+        - [0.0, 1.0]
+processors:
+  - id: eq-main
+    kind: eq
+processor_chains:
+  - id: main-chain
+    processors:
+      - eq-main
+captures:
+  process_taps:
+    - id: tap-app1
+      selector:
+        type: bundle_id
+        bundle_id: com.example.app1
+  system_taps:
+    - id: tap-system
+      mode: default_output
+sinks:
+  files:
+    - id: rec-main
+      path: /tmp/mars-small.wav
+      format: wav
+  streams:
+    - id: stream-main
+      transport: rtp
+      endpoint: rtp://127.0.0.1:5004
 pipes:
   - from: app1
     to: mix1
 "#;
 
 const MEDIUM_YAML: &str = r#"
-version: 1
+version: 2
 audio:
   sample_rate: 48000
   channels: 2
@@ -45,6 +80,52 @@ buses:
       limiter: true
       limit_dbfs: -1.0
       mode: sum
+routes:
+  - id: route-bus-mix1
+    from: bus1
+    to: mix1
+    chain: voice-chain
+    matrix:
+      rows: 2
+      cols: 2
+      coefficients:
+        - [1.0, 0.0]
+        - [0.0, 1.0]
+  - id: route-bus-mix2
+    from: bus1
+    to: mix2
+    matrix:
+      rows: 2
+      cols: 2
+      coefficients:
+        - [1.0, 0.0]
+        - [0.0, 1.0]
+processors:
+  - id: eq-voice
+    kind: eq
+  - id: dynamics-voice
+    kind: dynamics
+processor_chains:
+  - id: voice-chain
+    processors:
+      - eq-voice
+      - dynamics-voice
+captures:
+  process_taps:
+    - id: tap-app2
+      selector:
+        type: pid
+        pid: 4567
+  system_taps: []
+sinks:
+  files:
+    - id: rec-medium
+      path: /tmp/mars-medium.caf
+      format: caf
+  streams:
+    - id: stream-medium
+      transport: srt
+      endpoint: srt://127.0.0.1:10080
 pipes:
   - from: app1
     to: bus1
@@ -59,7 +140,7 @@ pipes:
 "#;
 
 const LARGE_YAML: &str = r#"
-version: 1
+version: 2
 audio:
   sample_rate: 48000
   channels: 2
@@ -110,6 +191,65 @@ buses:
       limiter: true
       limit_dbfs: -1.0
       mode: sum
+routes:
+  - id: route-bus0-mix0
+    from: bus0
+    to: mix0
+    matrix:
+      rows: 2
+      cols: 2
+      coefficients:
+        - [1.0, 0.0]
+        - [0.0, 1.0]
+  - id: route-bus1-mix1
+    from: bus1
+    to: mix1
+    matrix:
+      rows: 2
+      cols: 2
+      coefficients:
+        - [1.0, 0.0]
+        - [0.0, 1.0]
+  - id: route-bus2-mix2
+    from: bus2
+    to: mix2
+    matrix:
+      rows: 2
+      cols: 2
+      coefficients:
+        - [1.0, 0.0]
+        - [0.0, 1.0]
+processors:
+  - id: eq0
+    kind: eq
+  - id: denoise0
+    kind: denoise
+  - id: shift0
+    kind: time_shift
+processor_chains:
+  - id: chain0
+    processors:
+      - eq0
+      - denoise0
+      - shift0
+captures:
+  process_taps:
+    - id: tap-browser
+      selector:
+        type: bundle_id
+        bundle_id: com.example.browser
+  system_taps:
+    - id: tap-system-main
+      mode: all_output
+sinks:
+  files:
+    - id: rec-large
+      path: /tmp/mars-large.wav
+      format: wav
+  streams:
+    - id: stream-large
+      transport: webrtc
+      endpoint: webrtc://localhost/session
 pipes:
   - from: app0
     to: bus0
