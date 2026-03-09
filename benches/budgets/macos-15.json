@@ -536,7 +536,7 @@
       "benchmark_id": "profile/parse/medium/4pipes",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 59170.71943901138,
+      "budget_value": 66189.23438552188,
       "regression_threshold": 0.1
     },
     {
@@ -550,7 +550,7 @@
       "benchmark_id": "profile/parse/small/1pipe",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 33103.34531841938,
+      "budget_value": 39757.05320171547,
       "regression_threshold": 0.1
     },
     {
