@@ -10,7 +10,8 @@ use mars_graph::build_routing_graph;
 use mars_ipc::{DaemonRequest, DaemonResponse, IpcClient, LogRequest};
 use mars_shm::{RingSpec, StreamDirection, global_registry, stream_name};
 use mars_types::{
-    AutoOrU32, DeviceDescriptor, NodeKind, Pipe, Profile, VirtualInputDevice, VirtualOutputDevice,
+    AutoOrU32, DeviceDescriptor, FileSink, FileSinkFormat, NodeKind, Pipe, Profile,
+    VirtualInputDevice, VirtualOutputDevice,
 };
 
 use super::{MarsDaemon, diff_profiles, is_driver_compatible};
@@ -166,6 +167,111 @@ fn logs_cursor_beyond_file_len_falls_back_to_tail() {
     assert_eq!(result.next_cursor, len);
 
     let _ = fs::remove_file(path);
+}
+
+#[test]
+fn status_reports_sink_runtime_health_and_write_stats() {
+    let mut profile = Profile::default();
+    profile.audio.sample_rate = AutoOrU32::Value(48_000);
+    profile.audio.buffer_frames = 64;
+    profile.virtual_devices.outputs.push(VirtualOutputDevice {
+        id: "app".to_string(),
+        name: "App".to_string(),
+        channels: Some(2),
+        uid: Some("status-sink-vout".to_string()),
+        hidden: false,
+    });
+    profile.virtual_devices.inputs.push(VirtualInputDevice {
+        id: "mix".to_string(),
+        name: "Mix".to_string(),
+        channels: Some(2),
+        uid: Some("status-sink-vin".to_string()),
+        mix: None,
+    });
+    profile.pipes.push(Pipe {
+        from: "app".to_string(),
+        to: "mix".to_string(),
+        enabled: true,
+        gain_db: 0.0,
+        mute: false,
+        pan: 0.0,
+        delay_ms: 0.0,
+    });
+    let sink_path = std::env::temp_dir().join(format!(
+        "mars-daemon-status-sink-{}-{}.wav",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    profile.sinks.files.push(FileSink {
+        id: "record-main".to_string(),
+        source: "mix".to_string(),
+        path: sink_path.display().to_string(),
+        format: FileSinkFormat::Wav,
+        channels: Some(2),
+    });
+
+    let graph = build_routing_graph(&profile).expect("graph");
+    let engine = Arc::new(Engine::new(EngineSnapshot {
+        graph: graph.clone(),
+        sample_rate: 48_000,
+        buffer_frames: 64,
+    }));
+    let daemon = MarsDaemon::new(temp_log_path("sink-status"));
+    {
+        let mut state = daemon.state.lock();
+        state.current_profile = Some(profile.clone());
+        state.graph = Some(graph);
+        state.engine = Some(engine);
+        state.devices = vec![
+            DeviceDescriptor {
+                id: "app".to_string(),
+                name: "App".to_string(),
+                uid: "status-sink-vout".to_string(),
+                kind: NodeKind::VirtualOutput,
+                channels: 2,
+                managed: true,
+            },
+            DeviceDescriptor {
+                id: "mix".to_string(),
+                name: "Mix".to_string(),
+                uid: "status-sink-vin".to_string(),
+                kind: NodeKind::VirtualInput,
+                channels: 2,
+                managed: true,
+            },
+        ];
+    }
+
+    daemon.sync_render_runtime().expect("start runtime");
+    let ring_name = stream_name(StreamDirection::Vout, "status-sink-vout");
+    let ring_spec = RingSpec {
+        sample_rate: 48_000,
+        channels: 2,
+        capacity_frames: 64 * 8,
+    };
+    let ring = global_registry()
+        .create_or_open(&ring_name, ring_spec)
+        .expect("open vout ring");
+    let source = vec![0.4_f32; 64 * 2];
+    for _ in 0..32 {
+        ring.lock()
+            .write_interleaved(&source)
+            .expect("write source");
+        thread::sleep(Duration::from_millis(2));
+    }
+    thread::sleep(Duration::from_millis(40));
+
+    let status = daemon.status_internal();
+    assert_eq!(status.sink_runtime.sinks.len(), 1);
+    assert_eq!(status.sink_runtime.sinks[0].id, "record-main");
+    assert!(status.sink_runtime.sinks[0].written_frames > 0);
+    assert_eq!(status.sink_runtime.write_errors, 0);
+
+    daemon.stop_render_runtime();
+    let _ = fs::remove_file(sink_path);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

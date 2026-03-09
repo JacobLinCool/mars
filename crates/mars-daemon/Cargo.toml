@@ -45,3 +45,7 @@ criterion.workspace = true
 [[bench]]
 name = "daemon_ipc_shm"
 harness = false
+
+[[bench]]
+name = "sink_runtime"
+harness = false

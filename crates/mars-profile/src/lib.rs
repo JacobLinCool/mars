@@ -128,8 +128,23 @@ pub enum ProfileError {
     },
     #[error("file sink '{sink_id}' path must not be empty")]
     EmptyFileSinkPath { sink_id: String },
+    #[error("file sink '{sink_id}' source must not be empty")]
+    EmptyFileSinkSource { sink_id: String },
+    #[error("stream sink '{sink_id}' source must not be empty")]
+    EmptyStreamSinkSource { sink_id: String },
     #[error("stream sink '{sink_id}' endpoint must not be empty")]
     EmptyStreamSinkEndpoint { sink_id: String },
+    #[error("sink '{sink_id}' references unknown sink source '{source_id}'")]
+    UnknownSinkSource { sink_id: String, source_id: String },
+    #[error(
+        "file sink '{sink_id}' channels ({channels}) must match source '{source_id}' channels ({source_channels})"
+    )]
+    InvalidFileSinkChannels {
+        sink_id: String,
+        source_id: String,
+        channels: u16,
+        source_channels: u16,
+    },
     #[error("invalid name_regex for external endpoint '{id}': '{pattern}' ({reason})")]
     InvalidNameRegex {
         id: String,
@@ -656,17 +671,64 @@ fn validate_processor_chains(profile: &Profile) -> Result<(), ProfileError> {
 }
 
 fn validate_sinks(profile: &Profile) -> Result<(), ProfileError> {
+    let default_channels = profile.audio.channels.as_value().unwrap_or(2);
+    let mut sink_sources = BTreeMap::<String, u16>::new();
+    for input in &profile.virtual_devices.inputs {
+        sink_sources.insert(input.id.clone(), input.channels.unwrap_or(default_channels));
+    }
+    for output in &profile.external.outputs {
+        sink_sources.insert(
+            output.id.clone(),
+            output.channels.unwrap_or(default_channels),
+        );
+    }
+    for bus in &profile.buses {
+        sink_sources.insert(bus.id.clone(), bus.channels.unwrap_or(default_channels));
+    }
+
     for file in &profile.sinks.files {
+        if file.source.trim().is_empty() {
+            return Err(ProfileError::EmptyFileSinkSource {
+                sink_id: file.id.clone(),
+            });
+        }
         if file.path.trim().is_empty() {
             return Err(ProfileError::EmptyFileSinkPath {
                 sink_id: file.id.clone(),
             });
         }
+        let Some(source_channels) = sink_sources.get(&file.source).copied() else {
+            return Err(ProfileError::UnknownSinkSource {
+                sink_id: file.id.clone(),
+                source_id: file.source.clone(),
+            });
+        };
+        if let Some(channels) = file.channels {
+            if channels != source_channels {
+                return Err(ProfileError::InvalidFileSinkChannels {
+                    sink_id: file.id.clone(),
+                    source_id: file.source.clone(),
+                    channels,
+                    source_channels,
+                });
+            }
+        }
     }
     for stream in &profile.sinks.streams {
+        if stream.source.trim().is_empty() {
+            return Err(ProfileError::EmptyStreamSinkSource {
+                sink_id: stream.id.clone(),
+            });
+        }
         if stream.endpoint.trim().is_empty() {
             return Err(ProfileError::EmptyStreamSinkEndpoint {
                 sink_id: stream.id.clone(),
+            });
+        }
+        if !sink_sources.contains_key(&stream.source) {
+            return Err(ProfileError::UnknownSinkSource {
+                sink_id: stream.id.clone(),
+                source_id: stream.source.clone(),
             });
         }
     }
@@ -1402,5 +1464,58 @@ pipes: []
         let err = validate_profile(profile).expect_err("validation must fail");
         assert!(err.to_string().contains("time-shift config is invalid"));
         assert!(err.to_string().contains("delay_ms must be <= max_delay_ms"));
+    }
+
+    #[test]
+    fn rejects_file_sink_unknown_source() {
+        let yaml = r#"
+version: 2
+virtual:
+  outputs: []
+  inputs:
+    - id: mix
+      name: Mix
+sinks:
+  files:
+    - id: rec-main
+      source: unknown
+      path: /tmp/main.wav
+      format: wav
+pipes: []
+"#;
+        let profile = parse_profile_str(yaml).expect("yaml parse should work");
+        let err = validate_profile(profile).expect_err("validation must fail");
+        assert!(err.to_string().contains("unknown sink source"));
+        assert!(err.to_string().contains("unknown"));
+    }
+
+    #[test]
+    fn rejects_file_sink_channel_mismatch() {
+        let yaml = r#"
+version: 2
+audio:
+  channels: 2
+virtual:
+  outputs: []
+  inputs:
+    - id: mix
+      name: Mix
+      channels: 2
+sinks:
+  files:
+    - id: rec-main
+      source: mix
+      path: /tmp/main.wav
+      format: wav
+      channels: 1
+pipes: []
+"#;
+        let profile = parse_profile_str(yaml).expect("yaml parse should work");
+        let err = validate_profile(profile).expect_err("validation must fail");
+        assert!(
+            err.to_string()
+                .contains("file sink 'rec-main' channels (1)")
+        );
+        assert!(err.to_string().contains("source 'mix' channels (2)"));
     }
 }

@@ -455,6 +455,7 @@ pub struct SinkConfig {
 #[serde(deny_unknown_fields)]
 pub struct FileSink {
     pub id: String,
+    pub source: String,
     pub path: String,
     #[serde(default)]
     pub format: FileSinkFormat,
@@ -474,6 +475,7 @@ pub enum FileSinkFormat {
 #[serde(deny_unknown_fields)]
 pub struct StreamSink {
     pub id: String,
+    pub source: String,
     pub transport: StreamTransport,
     pub endpoint: String,
     #[serde(default)]
@@ -624,6 +626,57 @@ pub struct ExternalRuntimeStatus {
     pub stream_errors: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SinkRuntimeHealth {
+    #[default]
+    Healthy,
+    Degraded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SinkRuntimeKind {
+    #[default]
+    File,
+    Stream,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+pub struct SinkRuntimeSinkStatus {
+    pub id: String,
+    pub source: String,
+    pub kind: SinkRuntimeKind,
+    pub health: SinkRuntimeHealth,
+    #[serde(default)]
+    pub written_frames: u64,
+    #[serde(default)]
+    pub dropped_batches: u64,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+pub struct SinkRuntimeStatus {
+    #[serde(default)]
+    pub queue_capacity: usize,
+    #[serde(default)]
+    pub queued_batches: usize,
+    #[serde(default)]
+    pub dropped_batches: u64,
+    #[serde(default)]
+    pub dropped_samples: u64,
+    #[serde(default)]
+    pub write_errors: u64,
+    #[serde(default)]
+    pub active_file_sinks: usize,
+    #[serde(default)]
+    pub active_stream_sinks: usize,
+    #[serde(default)]
+    pub sinks: Vec<SinkRuntimeSinkStatus>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct DeviceDescriptor {
     pub id: String,
@@ -649,6 +702,8 @@ pub struct DaemonStatus {
     pub driver: DriverStatusSummary,
     #[serde(default)]
     pub external_runtime: ExternalRuntimeStatus,
+    #[serde(default)]
+    pub sink_runtime: SinkRuntimeStatus,
     pub updated_at: DateTime<Utc>,
 }
 
