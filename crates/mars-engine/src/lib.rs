@@ -40,10 +40,26 @@ pub struct Engine {
 
 #[derive(Debug, Default)]
 struct EngineState {
-    delay_lines: HashMap<String, DelayLine>,
+    routes: Vec<RouteRuntime>,
+    outgoing_routes: HashMap<String, Vec<usize>>,
+    sink_nodes: Vec<String>,
+    sink_contributions: HashMap<String, usize>,
     node_buffers: HashMap<String, Vec<f32>>,
     edge_scratch: Vec<f32>,
     counters: RuntimeCounters,
+}
+
+#[derive(Debug, Clone)]
+struct RouteRuntime {
+    from: String,
+    to: String,
+    source_channels: usize,
+    destination_channels: usize,
+    matrix: Vec<f32>,
+    gain_db: f32,
+    mute: bool,
+    pan: f32,
+    delay_line: DelayLine,
 }
 
 #[derive(Debug, Clone)]
@@ -51,7 +67,6 @@ struct DelayLine {
     data: Vec<f32>,
     write_idx: usize,
     delay_frames: usize,
-    channels: usize,
 }
 
 impl DelayLine {
@@ -61,7 +76,6 @@ impl DelayLine {
             data: vec![0.0; len],
             write_idx: 0,
             delay_frames,
-            channels,
         }
     }
 
@@ -100,6 +114,40 @@ impl Engine {
         frames: usize,
         sources: &HashMap<String, Vec<f32>>,
     ) -> Result<RenderOutput, EngineError> {
+        let mut sinks = HashMap::<String, Vec<f32>>::new();
+        let counters = self.render_cycle_with(frames, sources, |id, data| {
+            sinks.insert(id.to_string(), data.to_vec());
+        })?;
+
+        Ok(RenderOutput { sinks, counters })
+    }
+
+    pub fn render_cycle_into(
+        &self,
+        frames: usize,
+        sources: &HashMap<String, Vec<f32>>,
+        sink_outputs: &mut HashMap<String, Vec<f32>>,
+    ) -> Result<RuntimeCounters, EngineError> {
+        self.render_cycle_with(frames, sources, |id, data| {
+            let Some(target) = sink_outputs.get_mut(id) else {
+                return;
+            };
+            if target.len() != data.len() {
+                return;
+            }
+            target.copy_from_slice(data);
+        })
+    }
+
+    pub fn render_cycle_with<F>(
+        &self,
+        frames: usize,
+        sources: &HashMap<String, Vec<f32>>,
+        mut on_sink: F,
+    ) -> Result<RuntimeCounters, EngineError>
+    where
+        F: FnMut(&str, &[f32]),
+    {
         if frames == 0 {
             return Err(EngineError::InvalidFrames);
         }
@@ -107,7 +155,6 @@ impl Engine {
         let snapshot = self.snapshot.load();
         let graph = &snapshot.graph;
         let mut state = self.state.lock();
-        let mut edge_scratch = std::mem::take(&mut state.edge_scratch);
         prepare_node_buffers(&mut state.node_buffers, graph, frames);
 
         for (id, samples) in sources {
@@ -129,111 +176,146 @@ impl Engine {
             buffer[..max].copy_from_slice(&samples[..max]);
         }
 
-        let mut sink_contributions = HashMap::<String, usize>::new();
-        for node_id in graph.topological_order() {
-            let Some(source_node) = graph.nodes.get(&node_id) else {
+        let EngineState {
+            routes,
+            outgoing_routes,
+            sink_nodes,
+            sink_contributions,
+            node_buffers,
+            edge_scratch,
+            counters: _,
+        } = &mut *state;
+
+        for contributions in sink_contributions.values_mut() {
+            *contributions = 0;
+        }
+
+        let compile_order = &graph.compiled_route_plan().topological_order;
+        for node_id in compile_order {
+            let Some(route_indices) = outgoing_routes.get(node_id) else {
                 continue;
             };
 
-            for edge in graph.outgoing(&node_id) {
-                let Some(destination_node) = graph.nodes.get(&edge.to) else {
-                    continue;
-                };
-                let source_channels = source_node.channels as usize;
-                let dest_channels = destination_node.channels as usize;
+            for route_index in route_indices {
+                let route_index = *route_index;
+                let route = &mut routes[route_index];
+                let destination_len = frames.saturating_mul(route.destination_channels);
+                if edge_scratch.len() < destination_len {
+                    edge_scratch.resize(destination_len, 0.0);
+                }
+                let scratch = &mut edge_scratch[..destination_len];
                 {
-                    let Some(src_buffer) = state.node_buffers.get(&edge.from) else {
+                    let Some(src_buffer) = node_buffers.get(&route.from) else {
                         continue;
                     };
-                    convert_channels_into(
+                    matrix_mix_into(
                         src_buffer,
-                        source_channels,
-                        dest_channels,
+                        route.source_channels,
+                        route.destination_channels,
                         frames,
-                        &mut edge_scratch,
+                        &route.matrix,
+                        scratch,
                     );
                 }
 
-                apply_gain(&mut edge_scratch, edge.gain_db, edge.mute);
-                apply_pan(&mut edge_scratch, dest_channels, clamp_pan(edge.pan));
+                apply_gain(scratch, route.gain_db, route.mute);
+                apply_pan(scratch, route.destination_channels, clamp_pan(route.pan));
+                route.delay_line.process_in_place(scratch);
 
-                let delay_frames = ((edge.delay_ms / 1000.0) * snapshot.sample_rate as f32)
-                    .round()
-                    .max(0.0) as usize;
-                if delay_frames > 0 {
-                    let line = state
-                        .delay_lines
-                        .entry(edge.id.clone())
-                        .or_insert_with(|| DelayLine::new(delay_frames, dest_channels));
-                    if line.delay_frames != delay_frames || line.channels != dest_channels {
-                        *line = DelayLine::new(delay_frames, dest_channels);
+                if let Some(dst) = node_buffers.get_mut(&route.to) {
+                    accumulate(dst, scratch);
+                    if let Some(contributions) = sink_contributions.get_mut(&route.to) {
+                        *contributions += 1;
                     }
-                    line.process_in_place(&mut edge_scratch);
-                }
-
-                if let Some(dst) = state.node_buffers.get_mut(&edge.to) {
-                    accumulate(dst, &edge_scratch);
-                    *sink_contributions.entry(edge.to.clone()).or_insert(0) += 1;
                 }
             }
         }
 
-        let mut sinks = HashMap::<String, Vec<f32>>::new();
-        for (id, node) in &graph.nodes {
-            if !node.kind.is_sink() {
-                continue;
-            }
-
-            let Some(buffer) = state.node_buffers.get(id) else {
+        for sink_id in sink_nodes {
+            let Some(node) = graph.nodes.get(sink_id) else {
                 continue;
             };
-            let mut rendered = buffer.clone();
+            let contribution_count = sink_contributions.get(sink_id).copied().unwrap_or(0);
+            let Some(buffer) = node_buffers.get_mut(sink_id) else {
+                continue;
+            };
 
             if let Some(mix) = node.mix.as_ref() {
                 if matches!(mix.mode, MixMode::Average) {
-                    let count = sink_contributions.get(id).copied().unwrap_or(0);
-                    if count > 1 {
-                        for sample in &mut rendered {
-                            *sample /= count as f32;
+                    if contribution_count > 1 {
+                        for sample in buffer.iter_mut() {
+                            *sample /= contribution_count as f32;
                         }
                     }
                 }
 
                 if mix.limiter {
-                    apply_soft_limiter(&mut rendered, mix.limit_dbfs);
+                    apply_soft_limiter(buffer, mix.limit_dbfs);
                 }
             }
-
-            sinks.insert(id.clone(), rendered);
+            on_sink(sink_id, buffer);
         }
-        state.edge_scratch = edge_scratch;
 
-        Ok(RenderOutput {
-            sinks,
-            counters: state.counters.clone(),
-        })
+        Ok(state.counters.clone())
     }
 }
 
 impl EngineState {
     fn from_snapshot(snapshot: &EngineSnapshot) -> Self {
-        let mut delay_lines = HashMap::new();
-        for edge in &snapshot.graph.edges {
-            let Some(node) = snapshot.graph.nodes.get(&edge.to) else {
-                continue;
-            };
+        let mut routes = Vec::<RouteRuntime>::new();
+        let mut outgoing_routes = HashMap::<String, Vec<usize>>::new();
+        let mut max_destination_channels = 0usize;
 
-            let delay_frames = ((edge.delay_ms / 1000.0) * snapshot.sample_rate as f32)
+        for route in &snapshot.graph.compiled_route_plan().routes {
+            max_destination_channels =
+                max_destination_channels.max(route.destination_channels as usize);
+            let delay_frames = ((route.delay_ms / 1000.0) * snapshot.sample_rate as f32)
                 .round()
                 .max(0.0) as usize;
-            delay_lines.insert(
-                edge.id.clone(),
-                DelayLine::new(delay_frames, node.channels as usize),
-            );
+            let route_index = routes.len();
+            routes.push(RouteRuntime {
+                from: route.from.clone(),
+                to: route.to.clone(),
+                source_channels: route.source_channels as usize,
+                destination_channels: route.destination_channels as usize,
+                matrix: route.matrix.clone(),
+                gain_db: route.gain_db,
+                mute: route.mute,
+                pan: route.pan,
+                delay_line: DelayLine::new(delay_frames, route.destination_channels as usize),
+            });
+            outgoing_routes
+                .entry(route.from.clone())
+                .or_default()
+                .push(route_index);
         }
 
+        let sink_nodes = snapshot
+            .graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                if node.kind.is_sink() {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let sink_contributions = sink_nodes
+            .iter()
+            .cloned()
+            .map(|id| (id, 0usize))
+            .collect::<HashMap<_, _>>();
+        let scratch_len = snapshot
+            .buffer_frames
+            .saturating_mul(max_destination_channels as u32) as usize;
+
         Self {
-            delay_lines,
+            routes,
+            outgoing_routes,
+            sink_nodes,
+            sink_contributions,
             node_buffers: snapshot
                 .graph
                 .nodes
@@ -241,7 +323,7 @@ impl EngineState {
                 .cloned()
                 .map(|id| (id, Vec::new()))
                 .collect(),
-            edge_scratch: Vec::new(),
+            edge_scratch: vec![0.0; scratch_len],
             counters: RuntimeCounters::default(),
         }
     }
@@ -293,41 +375,37 @@ fn accumulate(target: &mut [f32], source: &[f32]) {
     }
 }
 
-fn convert_channels_into(
+fn matrix_mix_into(
     source: &[f32],
     source_channels: usize,
-    dest_channels: usize,
+    destination_channels: usize,
     frames: usize,
-    out: &mut Vec<f32>,
+    matrix: &[f32],
+    out: &mut [f32],
 ) {
-    out.clear();
-    if source_channels == dest_channels {
-        let len = source.len().min(frames * dest_channels);
-        out.extend_from_slice(&source[..len]);
-        if len < frames * dest_channels {
-            out.resize(frames * dest_channels, 0.0);
-        }
+    let expected_matrix_len = source_channels.saturating_mul(destination_channels);
+    if matrix.len() != expected_matrix_len {
+        out.fill(0.0);
         return;
     }
+    out.fill(0.0);
 
-    match (source_channels, dest_channels) {
-        (1, 2) => {
-            out.resize(frames * 2, 0.0);
-            for frame in 0..frames {
-                let sample = source.get(frame).copied().unwrap_or(0.0);
-                out[frame * 2] = sample;
-                out[frame * 2 + 1] = sample;
+    for frame in 0..frames {
+        let src_base = frame.saturating_mul(source_channels);
+        let dst_base = frame.saturating_mul(destination_channels);
+
+        for destination_channel in 0..destination_channels {
+            let row_base = destination_channel.saturating_mul(source_channels);
+            let mut mixed = 0.0f32;
+            for source_channel in 0..source_channels {
+                let source_sample = source
+                    .get(src_base + source_channel)
+                    .copied()
+                    .unwrap_or(0.0);
+                mixed += source_sample * matrix[row_base + source_channel];
             }
+            out[dst_base + destination_channel] = mixed;
         }
-        (2, 1) => {
-            out.resize(frames, 0.0);
-            for (frame, sample) in out.iter_mut().enumerate().take(frames) {
-                let left = source.get(frame * 2).copied().unwrap_or(0.0);
-                let right = source.get(frame * 2 + 1).copied().unwrap_or(0.0);
-                *sample = (left + right) * 0.5;
-            }
-        }
-        _ => out.resize(frames * dest_channels, 0.0),
     }
 }
 
@@ -336,10 +414,11 @@ fn prepare_node_buffers(
     graph: &RoutingGraph,
     frames: usize,
 ) {
-    node_buffers.retain(|id, _| graph.nodes.contains_key(id));
     for (id, node) in &graph.nodes {
         let len = frames * node.channels as usize;
-        let buffer = node_buffers.entry(id.clone()).or_default();
+        let Some(buffer) = node_buffers.get_mut(id) else {
+            continue;
+        };
         if buffer.len() != len {
             buffer.resize(len, 0.0);
         } else {
@@ -355,7 +434,9 @@ mod tests {
     use std::f32::consts::{FRAC_1_SQRT_2, PI};
 
     use mars_graph::build_routing_graph;
-    use mars_types::{Bus, MixConfig, Pipe, Profile, VirtualInputDevice, VirtualOutputDevice};
+    use mars_types::{
+        Bus, MixConfig, Pipe, Profile, Route, RouteMatrix, VirtualInputDevice, VirtualOutputDevice,
+    };
 
     use super::{Engine, EngineSnapshot};
 
@@ -397,6 +478,14 @@ mod tests {
         })
     }
 
+    fn stereo_identity_matrix() -> RouteMatrix {
+        RouteMatrix {
+            rows: 2,
+            cols: 2,
+            coefficients: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+        }
+    }
+
     #[test]
     fn applies_gain() {
         let engine = test_engine();
@@ -407,6 +496,86 @@ mod tests {
         let sink = output.sinks.get("mix").expect("sink");
         assert!(sink[0] < 1.0);
         assert!(sink[0] > 0.3);
+    }
+
+    #[test]
+    fn matrix_route_keeps_legacy_stereo_equivalence() {
+        let mut legacy_profile = Profile::default();
+        legacy_profile
+            .virtual_devices
+            .outputs
+            .push(VirtualOutputDevice {
+                id: "app".to_string(),
+                name: "App".to_string(),
+                channels: Some(2),
+                uid: None,
+                hidden: false,
+            });
+        legacy_profile
+            .virtual_devices
+            .inputs
+            .push(VirtualInputDevice {
+                id: "mix".to_string(),
+                name: "Mix".to_string(),
+                channels: Some(2),
+                uid: None,
+                mix: None,
+            });
+        legacy_profile.pipes.push(Pipe {
+            from: "app".to_string(),
+            to: "mix".to_string(),
+            enabled: true,
+            gain_db: -3.0,
+            mute: false,
+            pan: 0.25,
+            delay_ms: 0.0,
+        });
+
+        let mut matrix_profile = Profile::default();
+        matrix_profile.virtual_devices = legacy_profile.virtual_devices.clone();
+        matrix_profile.routes.push(Route {
+            id: "route-main".to_string(),
+            from: "app".to_string(),
+            to: "mix".to_string(),
+            enabled: true,
+            matrix: stereo_identity_matrix(),
+            chain: None,
+            gain_db: -3.0,
+            mute: false,
+            pan: 0.25,
+            delay_ms: 0.0,
+        });
+
+        let legacy_engine = Engine::new(EngineSnapshot {
+            graph: build_routing_graph(&legacy_profile).expect("legacy graph"),
+            sample_rate: 48_000,
+            buffer_frames: 256,
+        });
+        let matrix_engine = Engine::new(EngineSnapshot {
+            graph: build_routing_graph(&matrix_profile).expect("matrix graph"),
+            sample_rate: 48_000,
+            buffer_frames: 256,
+        });
+
+        let mut sources = HashMap::new();
+        let source = (0..(256 * 2))
+            .map(|index| ((index as f32) * 0.003).sin())
+            .collect::<Vec<_>>();
+        sources.insert("app".to_string(), source);
+
+        let legacy_output = legacy_engine
+            .render_cycle(256, &sources)
+            .expect("legacy render");
+        let matrix_output = matrix_engine
+            .render_cycle(256, &sources)
+            .expect("matrix render");
+        let legacy_sink = legacy_output.sinks.get("mix").expect("legacy sink");
+        let matrix_sink = matrix_output.sinks.get("mix").expect("matrix sink");
+
+        assert_eq!(legacy_sink.len(), matrix_sink.len());
+        for (legacy, matrix) in legacy_sink.iter().zip(matrix_sink.iter()) {
+            assert!((*legacy - *matrix).abs() < 1e-6);
+        }
     }
 
     #[test]
