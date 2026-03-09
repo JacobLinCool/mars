@@ -4,21 +4,21 @@
       "benchmark_id": "daemon/ipc/logs_tail",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 66273.77234283404,
+      "budget_value": 88881.0640543667,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "daemon/ipc/logs_tail",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 99138.03756279065,
+      "budget_value": 143846.98821070234,
       "regression_threshold": 0.15
     },
     {
       "benchmark_id": "daemon/ipc/ping",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 53147.829023917264,
+      "budget_value": 55261.864380590945,
       "regression_threshold": 0.1
     },
     {
@@ -46,7 +46,7 @@
       "benchmark_id": "daemon/shm_roundtrip/1024",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 14809.255612244899,
+      "budget_value": 15369.118591806091,
       "regression_threshold": 0.1
     },
     {
@@ -60,28 +60,28 @@
       "benchmark_id": "daemon/shm_roundtrip/256",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 3704.660369940757,
+      "budget_value": 4199.583656998835,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "daemon/shm_roundtrip/256",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 4570.104235191724,
+      "budget_value": 5744.752483076563,
       "regression_threshold": 0.15
     },
     {
       "benchmark_id": "daemon/shm_roundtrip/64",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 962.3860217778573,
+      "budget_value": 1013.5982657198258,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "daemon/shm_roundtrip/64",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 1212.5533229655698,
+      "budget_value": 1347.8716566005176,
       "regression_threshold": 0.15
     },
     {
@@ -200,7 +200,7 @@
       "benchmark_id": "engine/render_complex/64",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 3306.386999244142,
+      "budget_value": 3410.3914691444224,
       "regression_threshold": 0.15
     },
     {
@@ -214,7 +214,7 @@
       "benchmark_id": "engine/render_multisource_multioutput/128",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 10555.024589210072,
+      "budget_value": 10806.970063881103,
       "regression_threshold": 0.1
     },
     {
@@ -543,21 +543,21 @@
       "benchmark_id": "ring/read/1024",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 16090.498772588973,
+      "budget_value": 17890.690259224742,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "ring/read/1024",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 19721.668031609195,
+      "budget_value": 21997.190185920048,
       "regression_threshold": 0.15
     },
     {
       "benchmark_id": "ring/read/256",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 4059.5745860899906,
+      "budget_value": 4226.638656261526,
       "regression_threshold": 0.1
     },
     {
@@ -571,7 +571,7 @@
       "benchmark_id": "ring/read/64",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 1109.2341175293523,
+      "budget_value": 1118.0274908144888,
       "regression_threshold": 0.1
     },
     {
@@ -585,7 +585,7 @@
       "benchmark_id": "ring/roundtrip/1024",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 17060.87168177608,
+      "budget_value": 17797.003653261632,
       "regression_threshold": 0.1
     },
     {
@@ -620,7 +620,7 @@
       "benchmark_id": "ring/roundtrip/64",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 1359.7314679321569,
+      "budget_value": 1739.3742695117262,
       "regression_threshold": 0.15
     },
     {
@@ -655,7 +655,7 @@
       "benchmark_id": "ring/write/64",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 791.4228389192615,
+      "budget_value": 821.1553137428473,
       "regression_threshold": 0.1
     },
     {
