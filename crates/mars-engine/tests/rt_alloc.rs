@@ -61,9 +61,32 @@ fn render_cycle_into_has_zero_heap_allocation_after_prepare() {
             "limiter": false
         }),
     });
+    profile.processors.push(ProcessorDefinition {
+        id: "den-rt".to_string(),
+        kind: ProcessorKind::Denoise,
+        config: serde_json::json!({
+            "threshold_db": -40.0,
+            "reduction_db": 20.0,
+            "attack_ms": 2.0,
+            "release_ms": 120.0
+        }),
+    });
+    profile.processors.push(ProcessorDefinition {
+        id: "ts-rt".to_string(),
+        kind: ProcessorKind::TimeShift,
+        config: serde_json::json!({
+            "delay_ms": 8.0,
+            "max_delay_ms": 50.0
+        }),
+    });
     profile.processor_chains.push(ProcessorChain {
         id: "chain-rt".to_string(),
-        processors: vec!["eq-rt".to_string(), "dyn-rt".to_string()],
+        processors: vec![
+            "eq-rt".to_string(),
+            "dyn-rt".to_string(),
+            "den-rt".to_string(),
+            "ts-rt".to_string(),
+        ],
     });
     profile.routes.push(Route {
         id: "matrix-main".to_string(),

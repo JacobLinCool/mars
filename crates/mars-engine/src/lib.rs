@@ -151,6 +151,24 @@ struct DynamicsProcessorBlock {
     counters: ProcessorCounters,
 }
 
+#[derive(Debug)]
+struct DenoiseProcessorBlock {
+    id: String,
+    config: DenoiseConfig,
+    state: Mutex<DenoiseProcessorState>,
+    prepared: AtomicBool,
+    counters: ProcessorCounters,
+}
+
+#[derive(Debug)]
+struct TimeShiftProcessorBlock {
+    id: String,
+    config: TimeShiftConfig,
+    state: Mutex<TimeShiftProcessorState>,
+    prepared: AtomicBool,
+    counters: ProcessorCounters,
+}
+
 #[derive(Debug, Clone)]
 struct EqConfig {
     bands: Vec<EqBandConfig>,
@@ -172,6 +190,20 @@ struct DynamicsConfig {
     release_ms: f32,
     makeup_gain_db: f32,
     limiter: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DenoiseConfig {
+    threshold_db: f32,
+    reduction_db: f32,
+    attack_ms: f32,
+    release_ms: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TimeShiftConfig {
+    delay_ms: f32,
+    max_delay_ms: f32,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -198,6 +230,22 @@ struct DynamicsConfigSerde {
     release_ms: f32,
     makeup_gain_db: f32,
     limiter: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct DenoiseConfigSerde {
+    threshold_db: f32,
+    reduction_db: f32,
+    attack_ms: f32,
+    release_ms: f32,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct TimeShiftConfigSerde {
+    delay_ms: f32,
+    max_delay_ms: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -234,6 +282,22 @@ struct DynamicsProcessorState {
     envelope: Vec<f32>,
     gain: Vec<f32>,
     sample_rate_hz: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DenoiseProcessorState {
+    envelope: Vec<f32>,
+    gain: Vec<f32>,
+    sample_rate_hz: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TimeShiftProcessorState {
+    ring: Vec<f32>,
+    ring_frames: usize,
+    write_frame: usize,
+    delay_frames: usize,
+    channels: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +353,26 @@ const fn default_dynamics_release_ms() -> f32 {
     100.0
 }
 
+const fn default_denoise_threshold_db() -> f32 {
+    -45.0
+}
+
+const fn default_denoise_reduction_db() -> f32 {
+    18.0
+}
+
+const fn default_denoise_attack_ms() -> f32 {
+    5.0
+}
+
+const fn default_denoise_release_ms() -> f32 {
+    120.0
+}
+
+const fn default_timeshift_max_delay_ms() -> f32 {
+    2_000.0
+}
+
 impl Default for EqBandConfigSerde {
     fn default() -> Self {
         Self {
@@ -309,6 +393,26 @@ impl Default for DynamicsConfigSerde {
             release_ms: default_dynamics_release_ms(),
             makeup_gain_db: 0.0,
             limiter: false,
+        }
+    }
+}
+
+impl Default for DenoiseConfigSerde {
+    fn default() -> Self {
+        Self {
+            threshold_db: default_denoise_threshold_db(),
+            reduction_db: default_denoise_reduction_db(),
+            attack_ms: default_denoise_attack_ms(),
+            release_ms: default_denoise_release_ms(),
+        }
+    }
+}
+
+impl Default for TimeShiftConfigSerde {
+    fn default() -> Self {
+        Self {
+            delay_ms: 0.0,
+            max_delay_ms: default_timeshift_max_delay_ms(),
         }
     }
 }
@@ -355,6 +459,44 @@ impl DynamicsConfig {
             release_ms: parsed.release_ms,
             makeup_gain_db: parsed.makeup_gain_db,
             limiter: parsed.limiter,
+        }
+    }
+}
+
+impl DenoiseConfig {
+    fn from_config_json(config_json: &str) -> Self {
+        let value =
+            serde_json::from_str::<Value>(config_json).expect("compiled config must be valid JSON");
+        let parsed = if value.is_null() {
+            DenoiseConfigSerde::default()
+        } else {
+            serde_json::from_value::<DenoiseConfigSerde>(value)
+                .expect("compiled denoise config must match validated shape")
+        };
+
+        Self {
+            threshold_db: parsed.threshold_db,
+            reduction_db: parsed.reduction_db,
+            attack_ms: parsed.attack_ms,
+            release_ms: parsed.release_ms,
+        }
+    }
+}
+
+impl TimeShiftConfig {
+    fn from_config_json(config_json: &str) -> Self {
+        let value =
+            serde_json::from_str::<Value>(config_json).expect("compiled config must be valid JSON");
+        let parsed = if value.is_null() {
+            TimeShiftConfigSerde::default()
+        } else {
+            serde_json::from_value::<TimeShiftConfigSerde>(value)
+                .expect("compiled time-shift config must match validated shape")
+        };
+
+        Self {
+            delay_ms: parsed.delay_ms,
+            max_delay_ms: parsed.max_delay_ms,
         }
     }
 }
@@ -432,6 +574,14 @@ impl ProcessorSchedule {
                     ProcessorKind::Dynamics => Arc::new(DynamicsProcessorBlock::new(
                         compiled.id.clone(),
                         DynamicsConfig::from_config_json(&compiled.config_json),
+                    )),
+                    ProcessorKind::Denoise => Arc::new(DenoiseProcessorBlock::new(
+                        compiled.id.clone(),
+                        DenoiseConfig::from_config_json(&compiled.config_json),
+                    )),
+                    ProcessorKind::TimeShift => Arc::new(TimeShiftProcessorBlock::new(
+                        compiled.id.clone(),
+                        TimeShiftConfig::from_config_json(&compiled.config_json),
                     )),
                     _ => Arc::new(PassthroughProcessorBlock::new(
                         compiled.id.clone(),
@@ -758,6 +908,224 @@ impl ProcessorBlock for DynamicsProcessorBlock {
             let mut state = self.state.lock();
             state.envelope.clear();
             state.gain.clear();
+            self.counters.reset_calls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn stats(&self) -> ProcessorRuntimeStats {
+        ProcessorRuntimeStats {
+            prepare_calls: self.counters.prepare_calls.load(Ordering::Relaxed),
+            process_calls: self.counters.process_calls.load(Ordering::Relaxed),
+            reset_calls: self.counters.reset_calls.load(Ordering::Relaxed),
+            last_generation: self.counters.last_generation.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl DenoiseProcessorBlock {
+    fn new(id: String, config: DenoiseConfig) -> Self {
+        Self {
+            id,
+            config,
+            state: Mutex::new(DenoiseProcessorState::default()),
+            prepared: AtomicBool::new(false),
+            counters: ProcessorCounters::default(),
+        }
+    }
+}
+
+impl ProcessorBlock for DenoiseProcessorBlock {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn prepare(&self, context: ProcessorPrepareContext) {
+        let mut state = self.state.lock();
+        state.envelope = vec![0.0; context.channels];
+        state.gain = vec![1.0; context.channels];
+        state.sample_rate_hz = context.sample_rate.max(1);
+        self.prepared.store(true, Ordering::Relaxed);
+        self.counters.prepare_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn process(
+        &self,
+        samples: &mut [f32],
+        channels: usize,
+        _frames: usize,
+        control: Option<&ProcessorControl>,
+        bypass: bool,
+    ) {
+        if bypass || !self.prepared.load(Ordering::Relaxed) {
+            return;
+        }
+        if channels == 0 {
+            return;
+        }
+        if let Some(control) = control {
+            self.counters
+                .last_generation
+                .store(control.generation, Ordering::Relaxed);
+        }
+
+        let mut state = self.state.lock();
+        if state.envelope.len() != channels {
+            state.envelope.resize(channels, 0.0);
+            state.gain.resize(channels, 1.0);
+        }
+
+        let sample_rate = state.sample_rate_hz.max(1) as f32;
+        let attack_coeff = (-1.0 / (self.config.attack_ms.max(0.1) * 0.001 * sample_rate)).exp();
+        let release_coeff = (-1.0 / (self.config.release_ms.max(1.0) * 0.001 * sample_rate)).exp();
+        let threshold = 10.0_f32.powf(self.config.threshold_db / 20.0).max(1e-9);
+        let min_gain = 10.0_f32
+            .powf(-self.config.reduction_db.max(0.0) / 20.0)
+            .clamp(0.0, 1.0);
+
+        for frame in samples.chunks_exact_mut(channels) {
+            for (channel_index, sample) in frame.iter_mut().enumerate() {
+                let input = *sample;
+                let level = input.abs().max(1e-12);
+                let current_env = state.envelope[channel_index];
+                let env_coeff = if level > current_env {
+                    attack_coeff
+                } else {
+                    release_coeff
+                };
+                let envelope = env_coeff * current_env + (1.0 - env_coeff) * level;
+                state.envelope[channel_index] = envelope;
+
+                let target_gain = if envelope >= threshold { 1.0 } else { min_gain };
+                let current_gain = state.gain[channel_index];
+                let coeff = if target_gain > current_gain {
+                    attack_coeff
+                } else {
+                    release_coeff
+                };
+                let smoothed_gain = coeff * current_gain + (1.0 - coeff) * target_gain;
+                state.gain[channel_index] = smoothed_gain;
+                *sample = input * smoothed_gain;
+            }
+        }
+
+        self.counters.process_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn reset(&self) {
+        if self.prepared.swap(false, Ordering::Relaxed) {
+            let mut state = self.state.lock();
+            state.envelope.clear();
+            state.gain.clear();
+            self.counters.reset_calls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn stats(&self) -> ProcessorRuntimeStats {
+        ProcessorRuntimeStats {
+            prepare_calls: self.counters.prepare_calls.load(Ordering::Relaxed),
+            process_calls: self.counters.process_calls.load(Ordering::Relaxed),
+            reset_calls: self.counters.reset_calls.load(Ordering::Relaxed),
+            last_generation: self.counters.last_generation.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl TimeShiftProcessorBlock {
+    fn new(id: String, config: TimeShiftConfig) -> Self {
+        Self {
+            id,
+            config,
+            state: Mutex::new(TimeShiftProcessorState::default()),
+            prepared: AtomicBool::new(false),
+            counters: ProcessorCounters::default(),
+        }
+    }
+
+    fn delay_frames(delay_ms: f32, sample_rate: u32) -> usize {
+        ((delay_ms.max(0.0) * 0.001) * sample_rate.max(1) as f32)
+            .round()
+            .max(0.0) as usize
+    }
+}
+
+impl ProcessorBlock for TimeShiftProcessorBlock {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn prepare(&self, context: ProcessorPrepareContext) {
+        let channels = context.channels.max(1);
+        let max_delay_frames =
+            Self::delay_frames(self.config.max_delay_ms.max(1.0), context.sample_rate).max(1);
+        let delay_frames = Self::delay_frames(self.config.delay_ms, context.sample_rate);
+        let ring_frames = max_delay_frames.saturating_add(1);
+        let mut state = self.state.lock();
+        state.ring = vec![0.0; ring_frames.saturating_mul(channels)];
+        state.ring_frames = ring_frames;
+        state.write_frame = 0;
+        state.delay_frames = delay_frames.min(max_delay_frames);
+        state.channels = channels;
+        self.prepared.store(true, Ordering::Relaxed);
+        self.counters.prepare_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn process(
+        &self,
+        samples: &mut [f32],
+        channels: usize,
+        _frames: usize,
+        control: Option<&ProcessorControl>,
+        bypass: bool,
+    ) {
+        if bypass || !self.prepared.load(Ordering::Relaxed) {
+            return;
+        }
+        if channels == 0 {
+            return;
+        }
+        if let Some(control) = control {
+            self.counters
+                .last_generation
+                .store(control.generation, Ordering::Relaxed);
+        }
+
+        let mut state = self.state.lock();
+        if state.delay_frames == 0 {
+            self.counters.process_calls.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if state.channels != channels || state.ring_frames == 0 || state.ring.is_empty() {
+            self.counters.process_calls.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        for frame in samples.chunks_exact_mut(channels) {
+            let read_frame =
+                (state.write_frame + state.ring_frames - state.delay_frames) % state.ring_frames;
+            let read_base = read_frame.saturating_mul(channels);
+            let write_base = state.write_frame.saturating_mul(channels);
+
+            for (channel_index, sample) in frame.iter_mut().enumerate() {
+                let input = *sample;
+                let delayed = state.ring[read_base + channel_index];
+                state.ring[write_base + channel_index] = input;
+                *sample = delayed;
+            }
+
+            state.write_frame = (state.write_frame + 1) % state.ring_frames;
+        }
+
+        self.counters.process_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn reset(&self) {
+        if self.prepared.swap(false, Ordering::Relaxed) {
+            let mut state = self.state.lock();
+            state.ring.clear();
+            state.ring_frames = 0;
+            state.write_frame = 0;
+            state.delay_frames = 0;
+            state.channels = 0;
             self.counters.reset_calls.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -1576,6 +1944,166 @@ mod tests {
 
         assert!(late_mean > early_mean + 0.01);
         assert!((late_mean - 0.1).abs() < 0.01);
+    }
+
+    #[test]
+    fn denoise_reduces_low_level_noise_and_preserves_primary_signal() {
+        let sample_rate = 48_000u32;
+        let frames = 256usize;
+        let engine = single_processor_profile(
+            ProcessorKind::Denoise,
+            json!({
+                "threshold_db": -30.0,
+                "reduction_db": 24.0,
+                "attack_ms": 2.0,
+                "release_ms": 120.0
+            }),
+            sample_rate,
+            frames as u32,
+        );
+
+        let low_amp = 0.005_f32;
+        let mut low_sources = HashMap::new();
+        low_sources.insert("src".to_string(), vec![low_amp; frames]);
+        let mut low_capture = Vec::new();
+        for cycle in 0..100 {
+            let output = engine.render_cycle(frames, &low_sources).expect("render");
+            if cycle >= 40 {
+                low_capture.extend_from_slice(output.sinks.get("sink").expect("sink"));
+            }
+        }
+        let low_out_rms = rms(&low_capture);
+
+        let high_amp = 0.2_f32;
+        let mut high_sources = HashMap::new();
+        high_sources.insert("src".to_string(), vec![high_amp; frames]);
+        let mut high_capture = Vec::new();
+        for cycle in 0..60 {
+            let output = engine.render_cycle(frames, &high_sources).expect("render");
+            if cycle >= 20 {
+                high_capture.extend_from_slice(output.sinks.get("sink").expect("sink"));
+            }
+        }
+        let high_out_rms = rms(&high_capture);
+
+        assert!(low_out_rms <= low_amp * 0.15);
+        assert!(high_out_rms >= high_amp * 0.85);
+    }
+
+    #[test]
+    fn time_shift_matches_configured_latency() {
+        let sample_rate = 1_000u32;
+        let frames = 20usize;
+        let delay_frames = 60usize;
+        let engine = single_processor_profile(
+            ProcessorKind::TimeShift,
+            json!({
+                "delay_ms": delay_frames as f32,
+                "max_delay_ms": 200.0
+            }),
+            sample_rate,
+            frames as u32,
+        );
+
+        let mut captured = Vec::new();
+        for cycle in 0..6 {
+            let mut sources = HashMap::new();
+            let mut input = vec![0.0_f32; frames];
+            if cycle == 0 {
+                input[0] = 1.0;
+            }
+            sources.insert("src".to_string(), input);
+            let output = engine.render_cycle(frames, &sources).expect("render");
+            captured.extend_from_slice(output.sinks.get("sink").expect("sink"));
+        }
+
+        assert!(
+            captured
+                .iter()
+                .take(delay_frames)
+                .all(|sample| sample.abs() < 1e-9)
+        );
+        assert!((captured[delay_frames] - 1.0).abs() < 1e-6);
+        assert!(
+            captured
+                .iter()
+                .enumerate()
+                .all(|(index, sample)| index == delay_frames || sample.abs() < 1e-5)
+        );
+    }
+
+    #[test]
+    fn time_shift_state_resets_on_snapshot_swap() {
+        let sample_rate = 1_000u32;
+        let frames = 10usize;
+        let mut profile = Profile::default();
+        profile.virtual_devices.outputs.push(VirtualOutputDevice {
+            id: "src".to_string(),
+            name: "Src".to_string(),
+            channels: Some(1),
+            uid: None,
+            hidden: false,
+        });
+        profile.virtual_devices.inputs.push(VirtualInputDevice {
+            id: "sink".to_string(),
+            name: "Sink".to_string(),
+            channels: Some(1),
+            uid: None,
+            mix: None,
+        });
+        profile.processors.push(ProcessorDefinition {
+            id: "ts".to_string(),
+            kind: ProcessorKind::TimeShift,
+            config: json!({
+                "delay_ms": 20.0,
+                "max_delay_ms": 200.0
+            }),
+        });
+        profile.processor_chains.push(ProcessorChain {
+            id: "chain".to_string(),
+            processors: vec!["ts".to_string()],
+        });
+        profile.routes.push(Route {
+            id: "route".to_string(),
+            from: "src".to_string(),
+            to: "sink".to_string(),
+            enabled: true,
+            matrix: RouteMatrix {
+                rows: 1,
+                cols: 1,
+                coefficients: vec![vec![1.0]],
+            },
+            chain: Some("chain".to_string()),
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+        let graph = build_routing_graph(&profile).expect("graph");
+        let snapshot = EngineSnapshot {
+            graph,
+            sample_rate,
+            buffer_frames: frames as u32,
+        };
+        let engine = Engine::new(snapshot.clone());
+
+        let mut cycle1 = HashMap::new();
+        let mut impulse = vec![0.0_f32; frames];
+        impulse[0] = 1.0;
+        cycle1.insert("src".to_string(), impulse);
+        let out1 = engine.render_cycle(frames, &cycle1).expect("cycle1");
+        assert!(out1.sinks["sink"].iter().all(|sample| sample.abs() < 1e-9));
+
+        let mut silence = HashMap::new();
+        silence.insert("src".to_string(), vec![0.0_f32; frames]);
+        let out2 = engine.render_cycle(frames, &silence).expect("cycle2");
+        assert!(out2.sinks["sink"].iter().all(|sample| sample.abs() < 1e-9));
+
+        engine.swap_snapshot(snapshot);
+        let out3 = engine.render_cycle(frames, &silence).expect("cycle3");
+        let out4 = engine.render_cycle(frames, &silence).expect("cycle4");
+        assert!(out3.sinks["sink"].iter().all(|sample| sample.abs() < 1e-9));
+        assert!(out4.sinks["sink"].iter().all(|sample| sample.abs() < 1e-9));
     }
 
     #[test]
