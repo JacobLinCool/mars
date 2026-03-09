@@ -1,4 +1,4 @@
-name: Engine Perf Gate
+name: Benchmark Budget Gate
 
 on:
   push:
@@ -8,27 +8,38 @@ on:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
-      - "crates/mars-engine/**"
-      - "crates/mars-graph/**"
-      - "crates/mars-types/**"
+      - "crates/**"
+      - "scripts/bench/**"
+      - "benches/budgets/**"
       - ".github/workflows/engine-perf-gate.yml"
 
 jobs:
-  engine-soak-tests:
-    runs-on: ubuntu-latest
+  mars-engine-tests:
+    runs-on: macos-15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run mars-engine tests (includes soak/concurrency integration tests)
+      - name: Run mars-engine tests
         run: cargo test -p mars-engine
 
-  engine-perf-gate:
-    needs: engine-soak-tests
-    runs-on: ubuntu-latest
+  benchmark-budget-gate:
+    needs: mars-engine-tests
+    runs-on: macos-15
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run release perf regression gate
-        run: cargo test -p mars-engine --release --test perf_gate -- --ignored
+      - name: Verify non-finite metric guardrails
+        run: scripts/bench/test_non_finite.sh
+      - name: Run benchmark budget verification
+        run: scripts/bench/verify.sh --platform macos-15
+      - name: Upload benchmark metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-metrics
+          path: target/bench/latest/metrics.json
+          if-no-files-found: ignore
