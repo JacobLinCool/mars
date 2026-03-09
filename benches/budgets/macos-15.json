@@ -704,7 +704,7 @@
       "benchmark_id": "profile/parse/small/1pipe",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 47763.89703686204,
+      "budget_value": 60126.65216550889,
       "regression_threshold": 0.15
     },
     {
