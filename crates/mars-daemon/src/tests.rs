@@ -1,0 +1,348 @@
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use mars_engine::{Engine, EngineSnapshot};
+use mars_graph::build_routing_graph;
+use mars_ipc::{DaemonRequest, DaemonResponse, IpcClient, LogRequest};
+use mars_shm::{RingSpec, StreamDirection, global_registry, stream_name};
+use mars_types::{
+    AutoOrU32, DeviceDescriptor, NodeKind, Pipe, Profile, VirtualInputDevice, VirtualOutputDevice,
+};
+
+use super::{MarsDaemon, diff_profiles, is_driver_compatible};
+
+fn temp_log_path(case: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("mars-daemon-{case}-{nanos}.log"))
+}
+
+fn temp_socket_path(case: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("mars-daemon-{case}-{nanos}.sock"))
+}
+
+#[test]
+fn diff_detects_create_remove() {
+    let mut before = Profile::default();
+    before.virtual_devices.outputs.push(VirtualOutputDevice {
+        id: "old".to_string(),
+        name: "Old".to_string(),
+        channels: Some(2),
+        uid: None,
+        hidden: false,
+    });
+
+    let mut after = Profile::default();
+    after.virtual_devices.outputs.push(VirtualOutputDevice {
+        id: "new".to_string(),
+        name: "New".to_string(),
+        channels: Some(2),
+        uid: None,
+        hidden: false,
+    });
+    after.virtual_devices.inputs.push(VirtualInputDevice {
+        id: "mix".to_string(),
+        name: "Mix".to_string(),
+        channels: Some(2),
+        uid: None,
+        mix: None,
+    });
+    after.pipes.push(Pipe {
+        from: "new".to_string(),
+        to: "mix".to_string(),
+        enabled: true,
+        gain_db: 0.0,
+        mute: false,
+        pan: 0.0,
+        delay_ms: 0.0,
+    });
+
+    let diff = diff_profiles(Some(&before), Some(&after));
+    assert!(
+        diff.changes
+            .iter()
+            .any(|change| matches!(change.kind, mars_types::PlanChangeKind::CreateDevice))
+    );
+    assert!(
+        diff.changes
+            .iter()
+            .any(|change| matches!(change.kind, mars_types::PlanChangeKind::RemoveDevice))
+    );
+}
+
+#[test]
+fn clear_diff_when_none() {
+    let before = Profile::default();
+    let diff = diff_profiles(Some(&before), None);
+    assert!(!diff.changes.is_empty());
+}
+
+#[test]
+fn driver_compatibility_requires_install_and_load() {
+    assert!(!is_driver_compatible(false, false, Some("0.1.0"), "0.1.0"));
+    assert!(!is_driver_compatible(false, true, Some("0.1.0"), "0.1.0"));
+    assert!(!is_driver_compatible(true, false, Some("0.1.0"), "0.1.0"));
+    assert!(!is_driver_compatible(true, true, None, "0.1.0"));
+    assert!(!is_driver_compatible(true, true, Some("2.1.0"), "1.4.0"));
+    assert!(is_driver_compatible(true, true, Some("1.2.0"), "1.4.0"));
+}
+
+#[test]
+fn apply_deadline_zero_disables_timeout() {
+    let deadline = MarsDaemon::apply_deadline(0);
+    assert!(MarsDaemon::ensure_within_deadline(deadline, "any-stage").is_ok());
+}
+
+#[test]
+fn apply_deadline_reports_stage_timeout() {
+    let deadline = MarsDaemon::apply_deadline(1);
+    thread::sleep(Duration::from_millis(5));
+    let error =
+        MarsDaemon::ensure_within_deadline(deadline, "driver-stage").expect_err("timed out");
+    assert!(error.message.contains("driver-stage"));
+}
+
+#[test]
+fn logs_cursor_returns_incremental_lines() {
+    let path = temp_log_path("incremental");
+    fs::write(&path, "one\ntwo\nthree\n").expect("seed log");
+    let daemon = MarsDaemon::new(path.clone());
+
+    let initial = daemon
+        .logs_internal(&LogRequest {
+            follow: false,
+            cursor: None,
+            limit: Some(2),
+        })
+        .expect("initial logs");
+    assert_eq!(initial.lines, vec!["two".to_string(), "three".to_string()]);
+
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("open append");
+    writeln!(file, "four").expect("append four");
+    writeln!(file, "five").expect("append five");
+
+    let delta = daemon
+        .logs_internal(&LogRequest {
+            follow: true,
+            cursor: Some(initial.next_cursor),
+            limit: None,
+        })
+        .expect("delta logs");
+    assert_eq!(delta.lines, vec!["four".to_string(), "five".to_string()]);
+    assert!(delta.next_cursor > initial.next_cursor);
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn logs_cursor_beyond_file_len_falls_back_to_tail() {
+    let path = temp_log_path("cursor-fallback");
+    fs::write(&path, "a\nb\nc\nd\n").expect("seed log");
+    let daemon = MarsDaemon::new(path.clone());
+
+    let result = daemon
+        .logs_internal(&LogRequest {
+            follow: false,
+            cursor: Some(9_999),
+            limit: Some(2),
+        })
+        .expect("fallback logs");
+    assert_eq!(result.lines, vec!["c".to_string(), "d".to_string()]);
+
+    let len = fs::metadata(&path).expect("metadata").len();
+    assert_eq!(result.next_cursor, len);
+
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_ipc_shm_soak_survives_ring_churn_and_reports_deadline_pressure() {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let short = format!("{:x}", suffix % 0xFFFFF);
+    let vout_uid = format!("v{short}");
+    let vin_uid = format!("i{short}");
+
+    let mut profile = Profile::default();
+    profile.audio.sample_rate = AutoOrU32::Value(384_000);
+    profile.audio.buffer_frames = 16;
+    profile.virtual_devices.outputs.push(VirtualOutputDevice {
+        id: "app".to_string(),
+        name: "App".to_string(),
+        channels: Some(2),
+        uid: Some(vout_uid.clone()),
+        hidden: false,
+    });
+    profile.virtual_devices.inputs.push(VirtualInputDevice {
+        id: "mix".to_string(),
+        name: "Mix".to_string(),
+        channels: Some(2),
+        uid: Some(vin_uid.clone()),
+        mix: None,
+    });
+    profile.pipes.push(Pipe {
+        from: "app".to_string(),
+        to: "mix".to_string(),
+        enabled: true,
+        gain_db: 0.0,
+        mute: false,
+        pan: 0.0,
+        delay_ms: 0.0,
+    });
+
+    let graph = build_routing_graph(&profile).expect("graph");
+    let engine = Arc::new(Engine::new(EngineSnapshot {
+        graph: graph.clone(),
+        sample_rate: 384_000,
+        buffer_frames: 16,
+    }));
+
+    let devices = vec![
+        DeviceDescriptor {
+            id: "app".to_string(),
+            name: "App".to_string(),
+            uid: vout_uid.clone(),
+            kind: NodeKind::VirtualOutput,
+            channels: 2,
+            managed: true,
+        },
+        DeviceDescriptor {
+            id: "mix".to_string(),
+            name: "Mix".to_string(),
+            uid: vin_uid.clone(),
+            kind: NodeKind::VirtualInput,
+            channels: 2,
+            managed: true,
+        },
+    ];
+
+    let log_path = temp_log_path("ipc-shm-soak");
+    fs::write(&log_path, "boot\nready\n").expect("seed log file");
+    let daemon = Arc::new(MarsDaemon::new(log_path.clone()));
+    {
+        let mut state = daemon.state.lock();
+        state.current_profile_path = Some("in-memory-profile".to_string());
+        state.current_profile = Some(profile.clone());
+        state.graph = Some(graph);
+        state.engine = Some(engine);
+        state.devices = devices;
+    }
+    daemon.sync_render_runtime().expect("start render runtime");
+
+    let socket_path = temp_socket_path("ipc-shm-soak");
+    let daemon_for_server = Arc::clone(&daemon);
+    let socket_for_server = socket_path.clone();
+    let server = tokio::spawn(async move {
+        let _ = daemon_for_server.run(&socket_for_server).await;
+    });
+
+    for _ in 0..80 {
+        if socket_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(socket_path.exists());
+
+    let client = IpcClient::new(socket_path.clone(), Duration::from_millis(500));
+
+    let ping = client.send(DaemonRequest::Ping).await.expect("ping");
+    assert!(matches!(ping, DaemonResponse::Pong));
+
+    let logs = client
+        .send(DaemonRequest::Logs(LogRequest {
+            follow: false,
+            cursor: None,
+            limit: Some(2),
+        }))
+        .await
+        .expect("logs request");
+    assert!(matches!(
+        logs,
+        DaemonResponse::Logs(response)
+        if response.lines == vec!["boot".to_string(), "ready".to_string()]
+    ));
+
+    let ring_spec = RingSpec {
+        sample_rate: 384_000,
+        channels: 2,
+        capacity_frames: 128,
+    };
+    let vout_name = stream_name(StreamDirection::Vout, &vout_uid);
+    let vin_name = stream_name(StreamDirection::Vin, &vin_uid);
+
+    let mut saw_sink_frames = false;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    for cycle in 0..220_u32 {
+        let vout = global_registry()
+            .create_or_open(&vout_name, ring_spec)
+            .expect("open vout ring");
+        let source = [0.25_f32, -0.25_f32].repeat(16);
+        if cycle % 25 == 0 {
+            let _ = vout.lock().write_interleaved(&[0.25_f32]);
+        }
+        vout.lock()
+            .write_interleaved(&source)
+            .expect("write source sample");
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        let vin = global_registry()
+            .create_or_open(&vin_name, ring_spec)
+            .expect("open vin ring");
+        let mut rendered = vec![0.0_f32; 32];
+        let read_frames = vin
+            .lock()
+            .read_interleaved(&mut rendered)
+            .expect("read sink sample");
+        if read_frames > 0 {
+            saw_sink_frames = true;
+        }
+
+        if cycle % 40 == 0 {
+            let status = client.send(DaemonRequest::Status).await.expect("status");
+            let DaemonResponse::Status(payload) = status else {
+                panic!("expected status response");
+            };
+            assert!(payload.running);
+            assert_eq!(payload.sample_rate, 384_000);
+            assert_eq!(payload.buffer_frames, 16);
+        }
+    }
+
+    assert!(saw_sink_frames);
+    let final_status = client
+        .send(DaemonRequest::Status)
+        .await
+        .expect("final status");
+    let DaemonResponse::Status(payload) = final_status else {
+        panic!("expected final status response");
+    };
+    assert!(
+        payload.counters.deadline_miss_count > 0,
+        "fault injection should produce deadline pressure"
+    );
+
+    daemon.stop_render_runtime();
+    server.abort();
+    let _ = server.await;
+    let _ = global_registry().remove(&vout_name);
+    let _ = global_registry().remove(&vin_name);
+    let _ = fs::remove_file(&socket_path);
+    let _ = fs::remove_file(&log_path);
+}

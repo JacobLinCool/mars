@@ -13,10 +13,6 @@ workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-[features]
-default = []
-legacy-ffi = []
-
 [dependencies]
 dashmap.workspace = true
 nix = { version = "0.31", features = ["fs", "mman"] }

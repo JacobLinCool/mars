@@ -265,25 +265,19 @@ pub struct ExternalDevices {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalInput {
     pub id: String,
     pub r#match: DeviceMatch,
-    #[serde(default)]
-    pub fallback: Option<FallbackMatch>,
-    #[serde(default)]
-    pub on_missing: Option<MissingExternalPolicy>,
     #[serde(default)]
     pub channels: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalOutput {
     pub id: String,
     pub r#match: DeviceMatch,
-    #[serde(default)]
-    pub fallback: Option<FallbackMatch>,
-    #[serde(default)]
-    pub on_missing: Option<MissingExternalPolicy>,
     #[serde(default)]
     pub channels: Option<u16>,
 }
@@ -300,14 +294,6 @@ pub struct DeviceMatch {
     pub manufacturer: Option<String>,
     #[serde(default)]
     pub transport: Option<TransportType>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Default)]
-pub struct FallbackMatch {
-    #[serde(default)]
-    pub uid: Option<String>,
-    #[serde(default)]
-    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

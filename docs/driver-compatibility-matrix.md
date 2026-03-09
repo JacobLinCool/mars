@@ -13,5 +13,4 @@
 - `mars doctor` surfaces install and compatibility status.
 - `marsd` now always enforces real HAL install/load checks during apply.
 - `scripts/build-driver.sh` requires `Developer ID Application` by default.
-- On SIP-disabled hosts, build/install auto-falls back to local insecure signing.
-- You can always force fallback explicitly via `MARS_ALLOW_INSECURE_SIGNING=1`.
+- Local insecure signing is opt-in only via `MARS_ALLOW_INSECURE_SIGNING=1`.

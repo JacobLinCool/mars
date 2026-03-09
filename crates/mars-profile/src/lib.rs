@@ -65,10 +65,6 @@ pub enum ProfileError {
         pattern: String,
         reason: String,
     },
-    #[error("external endpoint '{id}' uses unsupported fallback matcher in strict mode")]
-    UnsupportedFallbackMatcher { id: String },
-    #[error("external endpoint '{id}' uses unsupported on_missing override in strict mode")]
-    UnsupportedOnMissingOverride { id: String },
     #[error("graph validation failed: {0}")]
     Graph(#[from] GraphError),
 }
@@ -95,7 +91,6 @@ pub fn validate_profile(profile: Profile) -> Result<ValidatedProfile, ProfileErr
     validate_ids(&profile)?;
     validate_pipe_ranges(&profile)?;
     validate_external_matchers(&profile)?;
-    validate_strict_policy(&profile)?;
     let graph = build_routing_graph(&profile)?;
 
     let warnings = Vec::new();
@@ -185,36 +180,6 @@ fn validate_external_matchers(profile: &Profile) -> Result<(), ProfileError> {
                 pattern: pattern.to_string(),
                 reason: error.to_string(),
             })?;
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_strict_policy(profile: &Profile) -> Result<(), ProfileError> {
-    for endpoint in &profile.external.inputs {
-        if endpoint.fallback.is_some() {
-            return Err(ProfileError::UnsupportedFallbackMatcher {
-                id: endpoint.id.clone(),
-            });
-        }
-        if endpoint.on_missing.is_some() {
-            return Err(ProfileError::UnsupportedOnMissingOverride {
-                id: endpoint.id.clone(),
-            });
-        }
-    }
-
-    for endpoint in &profile.external.outputs {
-        if endpoint.fallback.is_some() {
-            return Err(ProfileError::UnsupportedFallbackMatcher {
-                id: endpoint.id.clone(),
-            });
-        }
-        if endpoint.on_missing.is_some() {
-            return Err(ProfileError::UnsupportedOnMissingOverride {
-                id: endpoint.id.clone(),
-            });
         }
     }
 
@@ -465,7 +430,7 @@ pipes: []
     }
 
     #[test]
-    fn rejects_on_missing_override_in_strict_mode() {
+    fn rejects_legacy_on_missing_override_field() {
         let yaml = r#"
 version: 1
 virtual:
@@ -479,13 +444,13 @@ external:
       on_missing: error
 pipes: []
 "#;
-        let profile = parse_profile_str(yaml).expect("yaml parse should work");
-        let err = validate_profile(profile).expect_err("validation must fail");
-        assert!(err.to_string().contains("unsupported on_missing override"));
+        let err = parse_profile_str(yaml).expect_err("yaml parse must fail");
+        assert!(err.to_string().contains("on_missing"));
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]
-    fn rejects_fallback_matcher_in_strict_mode() {
+    fn rejects_legacy_fallback_matcher_field() {
         let yaml = r#"
 version: 1
 virtual:
@@ -500,9 +465,9 @@ external:
         name: "Built-in Microphone"
 pipes: []
 "#;
-        let profile = parse_profile_str(yaml).expect("yaml parse should work");
-        let err = validate_profile(profile).expect_err("validation must fail");
-        assert!(err.to_string().contains("unsupported fallback matcher"));
+        let err = parse_profile_str(yaml).expect_err("yaml parse must fail");
+        assert!(err.to_string().contains("fallback"));
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]

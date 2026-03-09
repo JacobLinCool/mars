@@ -191,8 +191,7 @@ Quick install:
 
 Run as your normal user (do not prefix with `sudo`).
 
-On SIP-disabled systems, installer now auto-enables local insecure signing fallback.
-You can still force it explicitly:
+If you need local-only insecure signing for development, opt in explicitly:
 
 ```bash
 MARS_ALLOW_INSECURE_SIGNING=1 ./scripts/install.sh

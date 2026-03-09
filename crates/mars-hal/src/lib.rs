@@ -393,8 +393,6 @@ fn normalize_kind(kind: &str) -> String {
 pub mod ffi {
     //! FFI boundary for AudioServerPlugIn host integration.
 
-    #[cfg(feature = "legacy-ffi")]
-    use std::ffi::c_void;
     use std::ffi::{CStr, c_char};
 
     use super::{
@@ -428,23 +426,6 @@ pub mod ffi {
         get_configuration_summary_json: mars_hal_get_configuration_summary_json,
         get_applied_device_count: mars_hal_get_applied_device_count,
     };
-
-    /// Legacy factory entrypoint. The real AudioServerPlugIn factory is in
-    /// `plugin.rs`. This is retained behind `legacy-ffi` for test compatibility.
-    ///
-    /// # Safety
-    /// Called via C ABI by external callers. The incoming pointers may be null
-    /// and are ignored by this shim.
-    #[cfg(feature = "legacy-ffi")]
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn MarsAudioServerPlugInFactoryLegacy(
-        _allocator: *const c_void,
-        _requested_type_uuid: *const c_void,
-    ) -> *mut c_void {
-        (&DRIVER_INTERFACE as *const MarsAudioServerPlugInInterface)
-            .cast_mut()
-            .cast::<c_void>()
-    }
 
     /// Accessor for tests/tooling that want a strongly typed interface pointer.
     ///
