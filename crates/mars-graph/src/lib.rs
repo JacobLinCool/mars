@@ -4,7 +4,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use mars_types::{
-    NodeDescriptor, NodeKind, PipeDescriptor, Profile, VirtualInputDevice, VirtualOutputDevice,
+    NodeDescriptor, NodeKind, PipeDescriptor, ProcessorKind, Profile, VirtualInputDevice,
+    VirtualOutputDevice,
 };
 use thiserror::Error;
 
@@ -12,6 +13,23 @@ use thiserror::Error;
 pub struct CompiledRoutePlan {
     pub topological_order: Vec<String>,
     pub routes: Vec<CompiledRoute>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CompiledProcessorPlan {
+    pub chains: BTreeMap<String, CompiledProcessorChain>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledProcessorChain {
+    pub id: String,
+    pub processors: Vec<CompiledProcessor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledProcessor {
+    pub id: String,
+    pub kind: ProcessorKind,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -36,6 +54,7 @@ pub struct RoutingGraph {
     pub nodes: BTreeMap<String, NodeDescriptor>,
     pub edges: Vec<PipeDescriptor>,
     route_plan: CompiledRoutePlan,
+    processor_plan: CompiledProcessorPlan,
 }
 
 impl RoutingGraph {
@@ -47,6 +66,11 @@ impl RoutingGraph {
     #[must_use]
     pub fn compiled_route_plan(&self) -> &CompiledRoutePlan {
         &self.route_plan
+    }
+
+    #[must_use]
+    pub fn processor_plan(&self) -> &CompiledProcessorPlan {
+        &self.processor_plan
     }
 
     pub fn outgoing<'a>(&'a self, id: &'a str) -> impl Iterator<Item = &'a PipeDescriptor> {
@@ -74,6 +98,13 @@ pub enum GraphError {
     InvalidDestinationType(String),
     #[error("duplicate route id in compiled graph: {0}")]
     DuplicateRouteId(String),
+    #[error("route '{route_id}' references unknown processor chain '{chain_id}'")]
+    UnknownRouteChain { route_id: String, chain_id: String },
+    #[error("processor chain '{chain_id}' references unknown processor '{processor_id}'")]
+    UnknownProcessorDefinition {
+        chain_id: String,
+        processor_id: String,
+    },
     #[error(
         "channel mismatch not supported in legacy pipe mode: {from} ({from_channels}) -> {to} ({to_channels})"
     )]
@@ -172,10 +203,11 @@ pub fn build_routing_graph(profile: &Profile) -> Result<RoutingGraph, GraphError
         )?;
     }
 
+    let processor_plan = compile_processor_plan(profile)?;
     let (edges, routes) = if profile.routes.is_empty() {
         compile_legacy_pipes(profile, &nodes)?
     } else {
-        compile_routes(profile, &nodes)?
+        compile_routes(profile, &nodes, &processor_plan)?
     };
 
     let topological_order = compile_topological_order(&nodes, &edges)?;
@@ -186,12 +218,14 @@ pub fn build_routing_graph(profile: &Profile) -> Result<RoutingGraph, GraphError
             topological_order,
             routes,
         },
+        processor_plan,
     })
 }
 
 fn compile_routes(
     profile: &Profile,
     nodes: &BTreeMap<String, NodeDescriptor>,
+    processor_plan: &CompiledProcessorPlan,
 ) -> Result<(Vec<PipeDescriptor>, Vec<CompiledRoute>), GraphError> {
     let mut edges = Vec::new();
     let mut routes = Vec::new();
@@ -217,6 +251,14 @@ fn compile_routes(
         }
         if !destination.kind.is_sink() {
             return Err(GraphError::InvalidDestinationType(destination.id.clone()));
+        }
+        if let Some(chain_id) = route.chain.as_deref() {
+            if !processor_plan.chains.contains_key(chain_id) {
+                return Err(GraphError::UnknownRouteChain {
+                    route_id: route.id.clone(),
+                    chain_id: chain_id.to_string(),
+                });
+            }
         }
 
         if !seen_route_ids.insert(route.id.clone()) {
@@ -297,6 +339,40 @@ fn compile_routes(
     }
 
     Ok((edges, routes))
+}
+
+fn compile_processor_plan(profile: &Profile) -> Result<CompiledProcessorPlan, GraphError> {
+    let definitions = profile
+        .processors
+        .iter()
+        .map(|processor| (processor.id.clone(), processor.kind))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut chains = BTreeMap::<String, CompiledProcessorChain>::new();
+    for chain in &profile.processor_chains {
+        let mut processors = Vec::with_capacity(chain.processors.len());
+        for processor_id in &chain.processors {
+            let Some(kind) = definitions.get(processor_id) else {
+                return Err(GraphError::UnknownProcessorDefinition {
+                    chain_id: chain.id.clone(),
+                    processor_id: processor_id.clone(),
+                });
+            };
+            processors.push(CompiledProcessor {
+                id: processor_id.clone(),
+                kind: *kind,
+            });
+        }
+        chains.insert(
+            chain.id.clone(),
+            CompiledProcessorChain {
+                id: chain.id.clone(),
+                processors,
+            },
+        );
+    }
+
+    Ok(CompiledProcessorPlan { chains })
 }
 
 fn compile_legacy_pipes(
@@ -478,7 +554,8 @@ fn node_from_vin(device: &VirtualInputDevice, default_channels: u16) -> NodeDesc
 #[allow(clippy::expect_used)]
 mod tests {
     use mars_types::{
-        Bus, Pipe, Profile, Route, RouteMatrix, VirtualInputDevice, VirtualOutputDevice,
+        Bus, Pipe, ProcessorChain, ProcessorDefinition, ProcessorKind, Profile, Route, RouteMatrix,
+        VirtualInputDevice, VirtualOutputDevice,
     };
 
     use super::{GraphError, build_routing_graph};
@@ -794,6 +871,106 @@ mod tests {
         let graph = build_routing_graph(&profile).expect("route with 64 channels should compile");
         assert_eq!(graph.compiled_route_plan().routes.len(), 1);
         assert_eq!(graph.compiled_route_plan().routes[0].matrix.len(), 64 * 64);
+    }
+
+    #[test]
+    fn compiles_processor_plan_for_route_chain() {
+        let mut profile = Profile::default();
+        profile.virtual_devices.outputs.push(VirtualOutputDevice {
+            id: "app".to_string(),
+            name: "App".to_string(),
+            channels: Some(2),
+            uid: None,
+            hidden: false,
+        });
+        profile.virtual_devices.inputs.push(VirtualInputDevice {
+            id: "mix".to_string(),
+            name: "Mix".to_string(),
+            channels: Some(2),
+            uid: None,
+            mix: None,
+        });
+        profile.processors.push(ProcessorDefinition {
+            id: "proc-eq".to_string(),
+            kind: ProcessorKind::Eq,
+            config: Default::default(),
+        });
+        profile.processor_chains.push(ProcessorChain {
+            id: "voice-chain".to_string(),
+            processors: vec!["proc-eq".to_string()],
+        });
+        profile.routes.push(Route {
+            id: "route-main".to_string(),
+            from: "app".to_string(),
+            to: "mix".to_string(),
+            enabled: true,
+            matrix: RouteMatrix {
+                rows: 2,
+                cols: 2,
+                coefficients: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            },
+            chain: Some("voice-chain".to_string()),
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+
+        let graph = build_routing_graph(&profile).expect("must compile");
+        let chain = graph
+            .processor_plan()
+            .chains
+            .get("voice-chain")
+            .expect("compiled chain");
+        assert_eq!(chain.processors.len(), 1);
+        assert_eq!(chain.processors[0].id, "proc-eq");
+        assert_eq!(chain.processors[0].kind, ProcessorKind::Eq);
+        assert_eq!(
+            graph.compiled_route_plan().routes[0].chain.as_deref(),
+            Some("voice-chain")
+        );
+    }
+
+    #[test]
+    fn rejects_route_with_unknown_processor_chain() {
+        let mut profile = Profile::default();
+        profile.virtual_devices.outputs.push(VirtualOutputDevice {
+            id: "app".to_string(),
+            name: "App".to_string(),
+            channels: Some(2),
+            uid: None,
+            hidden: false,
+        });
+        profile.virtual_devices.inputs.push(VirtualInputDevice {
+            id: "mix".to_string(),
+            name: "Mix".to_string(),
+            channels: Some(2),
+            uid: None,
+            mix: None,
+        });
+        profile.routes.push(Route {
+            id: "route-main".to_string(),
+            from: "app".to_string(),
+            to: "mix".to_string(),
+            enabled: true,
+            matrix: RouteMatrix {
+                rows: 2,
+                cols: 2,
+                coefficients: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            },
+            chain: Some("missing-chain".to_string()),
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+
+        let err = build_routing_graph(&profile).expect_err("must fail");
+        assert!(matches!(
+            err,
+            GraphError::UnknownRouteChain { route_id, chain_id }
+                if route_id == "route-main" && chain_id == "missing-chain"
+        ));
     }
 
     #[test]

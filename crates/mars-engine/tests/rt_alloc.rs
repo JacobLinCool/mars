@@ -4,7 +4,10 @@ use std::collections::HashMap;
 
 use mars_engine::{Engine, EngineSnapshot};
 use mars_graph::build_routing_graph;
-use mars_types::{Profile, Route, RouteMatrix, VirtualInputDevice, VirtualOutputDevice};
+use mars_types::{
+    ProcessorChain, ProcessorDefinition, ProcessorKind, Profile, Route, RouteMatrix,
+    VirtualInputDevice, VirtualOutputDevice,
+};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 
 #[global_allocator]
@@ -41,13 +44,22 @@ fn render_cycle_into_has_zero_heap_allocation_after_prepare() {
         uid: None,
         mix: None,
     });
+    profile.processors.push(ProcessorDefinition {
+        id: "proc-rt".to_string(),
+        kind: ProcessorKind::Eq,
+        config: Default::default(),
+    });
+    profile.processor_chains.push(ProcessorChain {
+        id: "chain-rt".to_string(),
+        processors: vec!["proc-rt".to_string()],
+    });
     profile.routes.push(Route {
         id: "matrix-main".to_string(),
         from: "app".to_string(),
         to: "mix".to_string(),
         enabled: true,
         matrix: identity_matrix(8),
-        chain: None,
+        chain: Some("chain-rt".to_string()),
         gain_db: 0.0,
         mute: false,
         pan: 0.0,

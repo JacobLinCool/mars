@@ -1,13 +1,14 @@
 #![forbid(unsafe_code)]
 //! Realtime-safe-ish audio graph rendering engine.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::f32::consts::FRAC_PI_4;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use mars_graph::RoutingGraph;
-use mars_types::{MixMode, RuntimeCounters};
+use mars_types::{MixMode, ProcessorKind, RuntimeCounters};
 use parking_lot::Mutex;
 use thiserror::Error;
 
@@ -36,6 +37,8 @@ pub enum EngineError {
 pub struct Engine {
     snapshot: ArcSwap<EngineSnapshot>,
     state: Mutex<EngineState>,
+    processor_schedule: ArcSwap<ProcessorSchedule>,
+    processor_controls: ArcSwap<ProcessorControlSnapshot>,
 }
 
 #[derive(Debug, Default)]
@@ -49,8 +52,9 @@ struct EngineState {
     counters: RuntimeCounters,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct RouteRuntime {
+    id: String,
     from: String,
     to: String,
     source_channels: usize,
@@ -60,6 +64,71 @@ struct RouteRuntime {
     mute: bool,
     pan: f32,
     delay_line: DelayLine,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProcessorControl {
+    pub bypass: bool,
+    pub generation: u64,
+    pub params: BTreeMap<String, f32>,
+}
+
+pub type ProcessorControlSnapshot = BTreeMap<String, ProcessorControl>;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcessorRuntimeStats {
+    pub prepare_calls: u64,
+    pub process_calls: u64,
+    pub reset_calls: u64,
+    pub last_generation: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProcessorSchedule {
+    route_chains: BTreeMap<String, ProcessorRouteChain>,
+}
+
+#[derive(Debug, Clone)]
+struct ProcessorRouteChain {
+    processors: Vec<Arc<dyn ProcessorBlock>>,
+}
+
+trait ProcessorBlock: Send + Sync + std::fmt::Debug {
+    fn id(&self) -> &str;
+    fn prepare(&self, context: ProcessorPrepareContext);
+    fn process(
+        &self,
+        samples: &mut [f32],
+        channels: usize,
+        frames: usize,
+        control: Option<&ProcessorControl>,
+        bypass: bool,
+    );
+    fn reset(&self);
+    fn stats(&self) -> ProcessorRuntimeStats;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProcessorPrepareContext {
+    channels: usize,
+    sample_rate: u32,
+    max_frames: usize,
+}
+
+#[derive(Debug, Default)]
+struct ProcessorCounters {
+    prepare_calls: AtomicU64,
+    process_calls: AtomicU64,
+    reset_calls: AtomicU64,
+    last_generation: AtomicU64,
+}
+
+#[derive(Debug)]
+struct PassthroughProcessorBlock {
+    id: String,
+    kind: ProcessorKind,
+    prepared: AtomicBool,
+    counters: ProcessorCounters,
 }
 
 #[derive(Debug, Clone)]
@@ -91,22 +160,207 @@ impl DelayLine {
     }
 }
 
+impl ProcessorSchedule {
+    #[must_use]
+    pub fn from_snapshot(snapshot: &EngineSnapshot) -> Self {
+        let mut route_chains = BTreeMap::<String, ProcessorRouteChain>::new();
+
+        for route in &snapshot.graph.compiled_route_plan().routes {
+            let Some(chain_id) = route.chain.as_ref() else {
+                continue;
+            };
+            let Some(compiled_chain) = snapshot.graph.processor_plan().chains.get(chain_id) else {
+                continue;
+            };
+
+            let mut processors =
+                Vec::<Arc<dyn ProcessorBlock>>::with_capacity(compiled_chain.processors.len());
+            let context = ProcessorPrepareContext {
+                channels: route.destination_channels as usize,
+                sample_rate: snapshot.sample_rate,
+                max_frames: snapshot.buffer_frames as usize,
+            };
+            for compiled in &compiled_chain.processors {
+                let processor: Arc<dyn ProcessorBlock> = Arc::new(PassthroughProcessorBlock::new(
+                    compiled.id.clone(),
+                    compiled.kind,
+                ));
+                processor.prepare(context);
+                processors.push(processor);
+            }
+
+            route_chains.insert(route.id.clone(), ProcessorRouteChain { processors });
+        }
+
+        Self { route_chains }
+    }
+
+    fn process_route(
+        &self,
+        route_id: &str,
+        samples: &mut [f32],
+        channels: usize,
+        frames: usize,
+        controls: &ProcessorControlSnapshot,
+    ) {
+        let Some(chain) = self.route_chains.get(route_id) else {
+            return;
+        };
+        chain.process(samples, channels, frames, controls);
+    }
+
+    fn stats(&self) -> BTreeMap<String, ProcessorRuntimeStats> {
+        let mut merged = BTreeMap::<String, ProcessorRuntimeStats>::new();
+        for chain in self.route_chains.values() {
+            for processor in &chain.processors {
+                let current = processor.stats();
+                let entry = merged.entry(processor.id().to_string()).or_default();
+                entry.prepare_calls += current.prepare_calls;
+                entry.process_calls += current.process_calls;
+                entry.reset_calls += current.reset_calls;
+                entry.last_generation = entry.last_generation.max(current.last_generation);
+            }
+        }
+        merged
+    }
+}
+
+impl Drop for ProcessorSchedule {
+    fn drop(&mut self) {
+        for chain in self.route_chains.values() {
+            chain.reset();
+        }
+    }
+}
+
+impl ProcessorRouteChain {
+    fn process(
+        &self,
+        samples: &mut [f32],
+        channels: usize,
+        frames: usize,
+        controls: &ProcessorControlSnapshot,
+    ) {
+        for processor in &self.processors {
+            let control = controls.get(processor.id());
+            let bypass = control.is_some_and(|item| item.bypass);
+            processor.process(samples, channels, frames, control, bypass);
+        }
+    }
+
+    fn reset(&self) {
+        for processor in &self.processors {
+            processor.reset();
+        }
+    }
+}
+
+impl PassthroughProcessorBlock {
+    fn new(id: String, kind: ProcessorKind) -> Self {
+        Self {
+            id,
+            kind,
+            prepared: AtomicBool::new(false),
+            counters: ProcessorCounters::default(),
+        }
+    }
+}
+
+impl ProcessorBlock for PassthroughProcessorBlock {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn prepare(&self, context: ProcessorPrepareContext) {
+        let _ = (
+            context.channels,
+            context.sample_rate,
+            context.max_frames,
+            self.kind,
+        );
+        self.prepared.store(true, Ordering::Relaxed);
+        self.counters.prepare_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn process(
+        &self,
+        _samples: &mut [f32],
+        _channels: usize,
+        _frames: usize,
+        control: Option<&ProcessorControl>,
+        bypass: bool,
+    ) {
+        if bypass || !self.prepared.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(control) = control {
+            self.counters
+                .last_generation
+                .store(control.generation, Ordering::Relaxed);
+        }
+        self.counters.process_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn reset(&self) {
+        if self.prepared.swap(false, Ordering::Relaxed) {
+            self.counters.reset_calls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn stats(&self) -> ProcessorRuntimeStats {
+        ProcessorRuntimeStats {
+            prepare_calls: self.counters.prepare_calls.load(Ordering::Relaxed),
+            process_calls: self.counters.process_calls.load(Ordering::Relaxed),
+            reset_calls: self.counters.reset_calls.load(Ordering::Relaxed),
+            last_generation: self.counters.last_generation.load(Ordering::Relaxed),
+        }
+    }
+}
+
 impl Engine {
     #[must_use]
     pub fn new(snapshot: EngineSnapshot) -> Self {
         let arc = Arc::new(snapshot);
         let state = EngineState::from_snapshot(arc.as_ref());
+        let processor_schedule = Arc::new(ProcessorSchedule::from_snapshot(arc.as_ref()));
         Self {
             snapshot: ArcSwap::from(arc),
             state: Mutex::new(state),
+            processor_schedule: ArcSwap::from(processor_schedule),
+            processor_controls: ArcSwap::from_pointee(ProcessorControlSnapshot::default()),
         }
     }
 
     pub fn swap_snapshot(&self, snapshot: EngineSnapshot) {
         let arc = Arc::new(snapshot);
+        self.processor_schedule
+            .store(Arc::new(ProcessorSchedule::from_snapshot(arc.as_ref())));
         let mut state = self.state.lock();
         *state = EngineState::from_snapshot(arc.as_ref());
         self.snapshot.store(arc);
+    }
+
+    pub fn swap_processor_schedule(&self, schedule: ProcessorSchedule) {
+        self.processor_schedule.store(Arc::new(schedule));
+    }
+
+    pub fn replace_processor_controls(&self, controls: ProcessorControlSnapshot) {
+        self.processor_controls.store(Arc::new(controls));
+    }
+
+    pub fn update_processor_control(
+        &self,
+        processor_id: impl Into<String>,
+        control: ProcessorControl,
+    ) {
+        let mut next = self.processor_controls.load().as_ref().clone();
+        next.insert(processor_id.into(), control);
+        self.processor_controls.store(Arc::new(next));
+    }
+
+    #[must_use]
+    pub fn processor_runtime_stats(&self) -> BTreeMap<String, ProcessorRuntimeStats> {
+        self.processor_schedule.load().stats()
     }
 
     pub fn render_cycle(
@@ -154,6 +408,8 @@ impl Engine {
 
         let snapshot = self.snapshot.load();
         let graph = &snapshot.graph;
+        let processor_schedule = self.processor_schedule.load();
+        let processor_controls = self.processor_controls.load();
         let mut state = self.state.lock();
         prepare_node_buffers(&mut state.node_buffers, graph, frames);
 
@@ -218,6 +474,13 @@ impl Engine {
                     );
                 }
 
+                processor_schedule.process_route(
+                    &route.id,
+                    scratch,
+                    route.destination_channels,
+                    frames,
+                    processor_controls.as_ref(),
+                );
                 apply_gain(scratch, route.gain_db, route.mute);
                 apply_pan(scratch, route.destination_channels, clamp_pan(route.pan));
                 route.delay_line.process_in_place(scratch);
@@ -274,6 +537,7 @@ impl EngineState {
                 .max(0.0) as usize;
             let route_index = routes.len();
             routes.push(RouteRuntime {
+                id: route.id.clone(),
                 from: route.from.clone(),
                 to: route.to.clone(),
                 source_channels: route.source_channels as usize,
@@ -430,15 +694,16 @@ fn prepare_node_buffers(
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::f32::consts::{FRAC_1_SQRT_2, PI};
 
     use mars_graph::build_routing_graph;
     use mars_types::{
-        Bus, MixConfig, Pipe, Profile, Route, RouteMatrix, VirtualInputDevice, VirtualOutputDevice,
+        Bus, MixConfig, Pipe, ProcessorChain, ProcessorDefinition, ProcessorKind, Profile, Route,
+        RouteMatrix, VirtualInputDevice, VirtualOutputDevice,
     };
 
-    use super::{Engine, EngineSnapshot};
+    use super::{Engine, EngineSnapshot, ProcessorControl, ProcessorSchedule};
 
     fn test_engine() -> Engine {
         let mut profile = Profile::default();
@@ -576,6 +841,142 @@ mod tests {
         for (legacy, matrix) in legacy_sink.iter().zip(matrix_sink.iter()) {
             assert!((*legacy - *matrix).abs() < 1e-6);
         }
+    }
+
+    fn processor_chain_profile(chain_id: &str, processor_id: &str) -> Profile {
+        let mut profile = Profile::default();
+        profile.virtual_devices.outputs.push(VirtualOutputDevice {
+            id: "app".to_string(),
+            name: "App".to_string(),
+            channels: Some(2),
+            uid: None,
+            hidden: false,
+        });
+        profile.virtual_devices.inputs.push(VirtualInputDevice {
+            id: "mix".to_string(),
+            name: "Mix".to_string(),
+            channels: Some(2),
+            uid: None,
+            mix: None,
+        });
+        profile.processors.push(ProcessorDefinition {
+            id: processor_id.to_string(),
+            kind: ProcessorKind::Eq,
+            config: Default::default(),
+        });
+        profile.processor_chains.push(ProcessorChain {
+            id: chain_id.to_string(),
+            processors: vec![processor_id.to_string()],
+        });
+        profile.routes.push(Route {
+            id: "main-route".to_string(),
+            from: "app".to_string(),
+            to: "mix".to_string(),
+            enabled: true,
+            matrix: stereo_identity_matrix(),
+            chain: Some(chain_id.to_string()),
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+        profile
+    }
+
+    #[test]
+    fn processor_chain_executes_and_supports_bypass_control() {
+        let profile = processor_chain_profile("voice", "proc-a");
+        let graph = build_routing_graph(&profile).expect("graph");
+        let engine = Engine::new(EngineSnapshot {
+            graph,
+            sample_rate: 48_000,
+            buffer_frames: 256,
+        });
+
+        let mut sources = HashMap::new();
+        sources.insert("app".to_string(), vec![0.25; 256 * 2]);
+
+        for _ in 0..8 {
+            engine.render_cycle(256, &sources).expect("render");
+        }
+        let before = engine
+            .processor_runtime_stats()
+            .get("proc-a")
+            .expect("processor stats")
+            .process_calls;
+        assert!(before > 0);
+
+        engine.update_processor_control(
+            "proc-a",
+            ProcessorControl {
+                bypass: true,
+                generation: 3,
+                params: BTreeMap::new(),
+            },
+        );
+        for _ in 0..8 {
+            engine.render_cycle(256, &sources).expect("render");
+        }
+        let after = engine
+            .processor_runtime_stats()
+            .get("proc-a")
+            .expect("processor stats")
+            .process_calls;
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn processor_schedule_hot_swap_rebinds_active_chain() {
+        let profile_a = processor_chain_profile("voice-a", "proc-a");
+        let graph_a = build_routing_graph(&profile_a).expect("graph a");
+        let profile_b = processor_chain_profile("voice-b", "proc-b");
+        let graph_b = build_routing_graph(&profile_b).expect("graph b");
+
+        let engine = Engine::new(EngineSnapshot {
+            graph: graph_a.clone(),
+            sample_rate: 48_000,
+            buffer_frames: 256,
+        });
+        let mut sources = HashMap::new();
+        sources.insert("app".to_string(), vec![0.2; 256 * 2]);
+
+        for _ in 0..4 {
+            engine.render_cycle(256, &sources).expect("render");
+        }
+        let before = engine.processor_runtime_stats();
+        assert!(
+            before
+                .get("proc-a")
+                .map(|item| item.process_calls)
+                .unwrap_or(0)
+                > 0
+        );
+
+        let swapped_snapshot = EngineSnapshot {
+            graph: graph_b.clone(),
+            sample_rate: 48_000,
+            buffer_frames: 256,
+        };
+        engine.swap_processor_schedule(ProcessorSchedule::from_snapshot(&swapped_snapshot));
+        for _ in 0..4 {
+            engine.render_cycle(256, &sources).expect("render");
+        }
+
+        let after = engine.processor_runtime_stats();
+        assert!(
+            after
+                .get("proc-b")
+                .map(|item| item.process_calls)
+                .unwrap_or(0)
+                > 0
+        );
+        assert_eq!(
+            after
+                .get("proc-a")
+                .map(|item| item.process_calls)
+                .unwrap_or(0),
+            0
+        );
     }
 
     #[test]

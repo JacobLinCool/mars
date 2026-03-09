@@ -1,13 +1,13 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use mars_engine::{Engine, EngineSnapshot};
+use mars_engine::{Engine, EngineSnapshot, ProcessorControl};
 use mars_graph::build_routing_graph;
 use mars_types::{
-    Bus, MixConfig, MixMode, Pipe, Profile, Route, RouteMatrix, VirtualInputDevice,
-    VirtualOutputDevice,
+    Bus, MixConfig, MixMode, Pipe, ProcessorChain, ProcessorDefinition, ProcessorKind, Profile,
+    Route, RouteMatrix, VirtualInputDevice, VirtualOutputDevice,
 };
 
 fn identity_matrix(channels: u16) -> RouteMatrix {
@@ -341,6 +341,52 @@ fn matrix_profile(channels: u16) -> Profile {
     p
 }
 
+fn chain_profile(chain_length: usize) -> Profile {
+    let mut p = Profile::default();
+    p.virtual_devices.outputs.push(VirtualOutputDevice {
+        id: "chain-src".into(),
+        name: "Chain Source".into(),
+        channels: Some(2),
+        uid: None,
+        hidden: false,
+    });
+    p.virtual_devices.inputs.push(VirtualInputDevice {
+        id: "chain-sink".into(),
+        name: "Chain Sink".into(),
+        channels: Some(2),
+        uid: None,
+        mix: None,
+    });
+
+    let mut processor_ids = Vec::with_capacity(chain_length);
+    for index in 0..chain_length {
+        let processor_id = format!("proc-{index}");
+        p.processors.push(ProcessorDefinition {
+            id: processor_id.clone(),
+            kind: ProcessorKind::Eq,
+            config: Default::default(),
+        });
+        processor_ids.push(processor_id);
+    }
+    p.processor_chains.push(ProcessorChain {
+        id: "main-chain".into(),
+        processors: processor_ids,
+    });
+    p.routes.push(Route {
+        id: "chain-route".into(),
+        from: "chain-src".into(),
+        to: "chain-sink".into(),
+        enabled: true,
+        matrix: identity_matrix(2),
+        chain: Some("main-chain".into()),
+        gain_db: 0.0,
+        mute: false,
+        pan: 0.0,
+        delay_ms: 0.0,
+    });
+    p
+}
+
 fn make_engine(profile: &Profile) -> Engine {
     let graph = build_routing_graph(profile).unwrap();
     Engine::new(EngineSnapshot {
@@ -503,6 +549,65 @@ fn bench_render_matrix(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_render_chain_length(c: &mut Criterion) {
+    let mut group = c.benchmark_group("engine/render_chain_length");
+    let frames = 256usize;
+
+    for chain_length in [1usize, 4, 8, 16] {
+        let profile = chain_profile(chain_length);
+        let engine = make_engine(&profile);
+        let sources: HashMap<String, Vec<f32>> =
+            [stereo_source("chain-src", frames)].into_iter().collect();
+
+        group.bench_with_input(
+            BenchmarkId::new(format!("{chain_length}"), frames),
+            &(frames, &sources),
+            |b, (f, s)| {
+                b.iter(|| engine.render_cycle(*f, s).unwrap());
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_render_param_updates(c: &mut Criterion) {
+    let mut group = c.benchmark_group("engine/render_param_updates");
+    let frames = 256usize;
+    let profile = chain_profile(8);
+    let engine = make_engine(&profile);
+    let sources: HashMap<String, Vec<f32>> =
+        [stereo_source("chain-src", frames)].into_iter().collect();
+    let processor_ids = (0..8)
+        .map(|index| format!("proc-{index}"))
+        .collect::<Vec<_>>();
+
+    for updates_per_cycle in [1usize, 8, 32] {
+        group.bench_with_input(
+            BenchmarkId::new(format!("{updates_per_cycle}"), frames),
+            &(updates_per_cycle, &sources),
+            |b, (updates, s)| {
+                b.iter(|| {
+                    for index in 0..*updates {
+                        let processor_id = &processor_ids[index % processor_ids.len()];
+                        engine.update_processor_control(
+                            processor_id.as_str(),
+                            ProcessorControl {
+                                bypass: index % 2 == 0,
+                                generation: index as u64,
+                                params: BTreeMap::from([("amount".to_string(), index as f32)]),
+                            },
+                        );
+                    }
+                    engine.render_cycle(frames, s).unwrap();
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_render_simple,
@@ -510,6 +615,8 @@ criterion_group!(
     bench_render_with_delay,
     bench_render_channel_conversion,
     bench_render_multisource_multioutput,
-    bench_render_matrix
+    bench_render_matrix,
+    bench_render_chain_length,
+    bench_render_param_updates
 );
 criterion_main!(benches);
