@@ -88,14 +88,14 @@
       "benchmark_id": "engine/render_channel_conversion/1024",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 3959.183679670095,
+      "budget_value": 4370.975559369438,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "engine/render_channel_conversion/1024",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 5122.99112667242,
+      "budget_value": 4563.580019335974,
       "regression_threshold": 0.15
     },
     {
@@ -109,14 +109,14 @@
       "benchmark_id": "engine/render_channel_conversion/256",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 1964.2629042743376,
+      "budget_value": 1374.4198097926694,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "engine/render_channel_conversion/256",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 2665.691785107294,
+      "budget_value": 1446.0593856001303,
       "regression_threshold": 0.15
     },
     {
@@ -130,14 +130,14 @@
       "benchmark_id": "engine/render_channel_conversion/64",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 1612.5387352369737,
+      "budget_value": 620.5105945110133,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "engine/render_channel_conversion/64",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 2446.968317862166,
+      "budget_value": 713.0385893011216,
       "regression_threshold": 0.15
     },
     {
@@ -151,14 +151,14 @@
       "benchmark_id": "engine/render_complex/1024",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 19024.780677044724,
+      "budget_value": 21311.803060224975,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "engine/render_complex/1024",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 28794.83035087719,
+      "budget_value": 21792.3898798627,
       "regression_threshold": 0.15
     },
     {
@@ -172,14 +172,14 @@
       "benchmark_id": "engine/render_complex/256",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 6295.109305588029,
+      "budget_value": 5957.958919549164,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "engine/render_complex/256",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 9345.888142226942,
+      "budget_value": 6249.128990187554,
       "regression_threshold": 0.15
     },
     {
@@ -193,18 +193,81 @@
       "benchmark_id": "engine/render_complex/64",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 3644.996343247197,
+      "budget_value": 2114.8394562647754,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "engine/render_complex/64",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 4406.437503342193,
+      "budget_value": 2280.3583775075986,
       "regression_threshold": 0.15
     },
     {
       "benchmark_id": "engine/render_complex/64",
+      "platform": "macos-15",
+      "metric": "rt_cycle_p99_ratio",
+      "budget_value": 0.75,
+      "regression_threshold": 0.0
+    },
+    {
+      "benchmark_id": "engine/render_matrix/16x16/256",
+      "platform": "macos-15",
+      "metric": "median_ns",
+      "budget_value": 38754.365196078434,
+      "regression_threshold": 0.1
+    },
+    {
+      "benchmark_id": "engine/render_matrix/16x16/256",
+      "platform": "macos-15",
+      "metric": "p95_ns",
+      "budget_value": 59220.60317818181,
+      "regression_threshold": 0.15
+    },
+    {
+      "benchmark_id": "engine/render_matrix/16x16/256",
+      "platform": "macos-15",
+      "metric": "rt_cycle_p99_ratio",
+      "budget_value": 0.75,
+      "regression_threshold": 0.0
+    },
+    {
+      "benchmark_id": "engine/render_matrix/32x32/256",
+      "platform": "macos-15",
+      "metric": "median_ns",
+      "budget_value": 145691.55762796925,
+      "regression_threshold": 0.1
+    },
+    {
+      "benchmark_id": "engine/render_matrix/32x32/256",
+      "platform": "macos-15",
+      "metric": "p95_ns",
+      "budget_value": 189614.85456780536,
+      "regression_threshold": 0.15
+    },
+    {
+      "benchmark_id": "engine/render_matrix/32x32/256",
+      "platform": "macos-15",
+      "metric": "rt_cycle_p99_ratio",
+      "budget_value": 0.75,
+      "regression_threshold": 0.0
+    },
+    {
+      "benchmark_id": "engine/render_matrix/8x8/256",
+      "platform": "macos-15",
+      "metric": "median_ns",
+      "budget_value": 12458.895691609978,
+      "regression_threshold": 0.1
+    },
+    {
+      "benchmark_id": "engine/render_matrix/8x8/256",
+      "platform": "macos-15",
+      "metric": "p95_ns",
+      "budget_value": 18038.291155396328,
+      "regression_threshold": 0.15
+    },
+    {
+      "benchmark_id": "engine/render_matrix/8x8/256",
       "platform": "macos-15",
       "metric": "rt_cycle_p99_ratio",
       "budget_value": 0.75,
@@ -214,14 +277,14 @@
       "benchmark_id": "engine/render_multisource_multioutput/128",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 13596.286757440952,
+      "budget_value": 10534.264302006237,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "engine/render_multisource_multioutput/128",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 18497.14214005305,
+      "budget_value": 11167.807200089432,
       "regression_threshold": 0.15
     },
     {
@@ -235,14 +298,14 @@
       "benchmark_id": "engine/render_multisource_multioutput/256",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 16244.159749405524,
+      "budget_value": 26449.296607905984,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "engine/render_multisource_multioutput/256",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 24373.576260640762,
+      "budget_value": 64250.84709542815,
       "regression_threshold": 0.15
     },
     {
@@ -256,14 +319,14 @@
       "benchmark_id": "engine/render_multisource_multioutput/512",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 23538.58875528541,
+      "budget_value": 33890.91599190283,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "engine/render_multisource_multioutput/512",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 36236.49553571428,
+      "budget_value": 79120.3488372093,
       "regression_threshold": 0.15
     },
     {
@@ -277,14 +340,14 @@
       "benchmark_id": "engine/render_simple/1024",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 2763.497003652827,
+      "budget_value": 5370.373223244147,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "engine/render_simple/1024",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 3548.5891196172247,
+      "budget_value": 5933.282019927536,
       "regression_threshold": 0.15
     },
     {
@@ -298,14 +361,14 @@
       "benchmark_id": "engine/render_simple/256",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 1754.3860783158445,
+      "budget_value": 1624.1416098269547,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "engine/render_simple/256",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 2401.427960946745,
+      "budget_value": 1743.1187545030327,
       "regression_threshold": 0.15
     },
     {
@@ -319,14 +382,14 @@
       "benchmark_id": "engine/render_simple/64",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 1642.9538060617506,
+      "budget_value": 700.5180146697595,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "engine/render_simple/64",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 2189.2606127340823,
+      "budget_value": 768.4408310352962,
       "regression_threshold": 0.15
     },
     {
@@ -340,14 +403,14 @@
       "benchmark_id": "engine/render_with_delay/1024",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 6096.849859848485,
+      "budget_value": 7363.0899641403375,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "engine/render_with_delay/1024",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 7217.108733963816,
+      "budget_value": 7643.9998300165835,
       "regression_threshold": 0.15
     },
     {
@@ -361,14 +424,14 @@
       "benchmark_id": "engine/render_with_delay/256",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 2633.988078100787,
+      "budget_value": 2132.7627688172042,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "engine/render_with_delay/256",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 3360.011929838248,
+      "budget_value": 2280.6879874794745,
       "regression_threshold": 0.15
     },
     {
@@ -382,14 +445,14 @@
       "benchmark_id": "engine/render_with_delay/64",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 1803.2253474167624,
+      "budget_value": 817.7782830899456,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "engine/render_with_delay/64",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 2571.5438212211807,
+      "budget_value": 925.6531256670402,
       "regression_threshold": 0.15
     },
     {

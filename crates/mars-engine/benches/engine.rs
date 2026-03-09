@@ -5,7 +5,23 @@ use std::collections::HashMap;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use mars_engine::{Engine, EngineSnapshot};
 use mars_graph::build_routing_graph;
-use mars_types::{Bus, MixConfig, MixMode, Pipe, Profile, VirtualInputDevice, VirtualOutputDevice};
+use mars_types::{
+    Bus, MixConfig, MixMode, Pipe, Profile, Route, RouteMatrix, VirtualInputDevice,
+    VirtualOutputDevice,
+};
+
+fn identity_matrix(channels: u16) -> RouteMatrix {
+    let channels = channels as usize;
+    let mut coefficients = vec![vec![0.0; channels]; channels];
+    for (index, row) in coefficients.iter_mut().enumerate() {
+        row[index] = 1.0;
+    }
+    RouteMatrix {
+        rows: channels as u16,
+        cols: channels as u16,
+        coefficients,
+    }
+}
 
 fn simple_profile() -> Profile {
     let mut p = Profile::default();
@@ -294,6 +310,37 @@ fn multisource_multioutput_profile() -> Profile {
     p
 }
 
+fn matrix_profile(channels: u16) -> Profile {
+    let mut p = Profile::default();
+    p.virtual_devices.outputs.push(VirtualOutputDevice {
+        id: "matrix-src".into(),
+        name: "Matrix Source".into(),
+        channels: Some(channels),
+        uid: None,
+        hidden: false,
+    });
+    p.virtual_devices.inputs.push(VirtualInputDevice {
+        id: "matrix-sink".into(),
+        name: "Matrix Sink".into(),
+        channels: Some(channels),
+        uid: None,
+        mix: None,
+    });
+    p.routes.push(Route {
+        id: "matrix-route".into(),
+        from: "matrix-src".into(),
+        to: "matrix-sink".into(),
+        enabled: true,
+        matrix: identity_matrix(channels),
+        chain: None,
+        gain_db: 0.0,
+        mute: false,
+        pan: 0.0,
+        delay_ms: 0.0,
+    });
+    p
+}
+
 fn make_engine(profile: &Profile) -> Engine {
     let graph = build_routing_graph(profile).unwrap();
     Engine::new(EngineSnapshot {
@@ -310,6 +357,13 @@ fn stereo_source(id: &str, frames: usize) -> (String, Vec<f32>) {
 
 fn mono_source(id: &str, frames: usize) -> (String, Vec<f32>) {
     let samples: Vec<f32> = (0..frames).map(|i| (i as f32 * 0.001).sin()).collect();
+    (id.to_string(), samples)
+}
+
+fn multichannel_source(id: &str, frames: usize, channels: usize) -> (String, Vec<f32>) {
+    let samples: Vec<f32> = (0..frames * channels)
+        .map(|i| (i as f32 * 0.0007).sin())
+        .collect();
     (id.to_string(), samples)
 }
 
@@ -424,12 +478,38 @@ fn bench_render_multisource_multioutput(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_render_matrix(c: &mut Criterion) {
+    let mut group = c.benchmark_group("engine/render_matrix");
+
+    for channels in [8_u16, 16_u16, 32_u16] {
+        let profile = matrix_profile(channels);
+        let engine = make_engine(&profile);
+        let frames = 256usize;
+        let sources: HashMap<String, Vec<f32>> =
+            [multichannel_source("matrix-src", frames, channels as usize)]
+                .into_iter()
+                .collect();
+
+        group.throughput(Throughput::Elements((frames * channels as usize) as u64));
+        group.bench_with_input(
+            BenchmarkId::new(format!("{channels}x{channels}"), frames),
+            &(frames, &sources),
+            |b, (f, s)| {
+                b.iter(|| engine.render_cycle(*f, s).unwrap());
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_render_simple,
     bench_render_complex,
     bench_render_with_delay,
     bench_render_channel_conversion,
-    bench_render_multisource_multioutput
+    bench_render_multisource_multioutput,
+    bench_render_matrix
 );
 criterion_main!(benches);

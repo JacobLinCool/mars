@@ -19,6 +19,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+stats_alloc = "0.1.10"
 
 [[bench]]
 name = "engine"

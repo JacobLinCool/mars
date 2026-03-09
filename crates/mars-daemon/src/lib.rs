@@ -273,6 +273,7 @@ fn run_render_loop(
             vec![0.0; frames.saturating_mul(sink.channels as usize)],
         );
     }
+    let mut rendered_sinks = sink_silence.clone();
 
     let mut source_rings = config
         .vout_sources
@@ -335,7 +336,14 @@ fn run_render_loop(
             }
         }
 
-        if let Ok(rendered) = engine.render_cycle(frames, &source_buffers) {
+        for buffer in rendered_sinks.values_mut() {
+            buffer.fill(0.0);
+        }
+
+        if engine
+            .render_cycle_into(frames, &source_buffers, &mut rendered_sinks)
+            .is_ok()
+        {
             for (endpoint, ring_handle) in &mut sink_rings {
                 if ring_handle.is_none() {
                     let spec = RingSpec {
@@ -350,7 +358,7 @@ fn run_render_loop(
                 let Some(handle) = ring_handle else {
                     continue;
                 };
-                let data = rendered.sinks.get(&endpoint.node_id).map_or_else(
+                let data = rendered_sinks.get(&endpoint.node_id).map_or_else(
                     || {
                         sink_silence
                             .get(&endpoint.node_id)
@@ -365,7 +373,7 @@ fn run_render_loop(
 
             if let Some(external_runtime) = external_runtime.as_ref() {
                 for endpoint in &config.external_outputs {
-                    let data = rendered.sinks.get(&endpoint.node_id).map_or_else(
+                    let data = rendered_sinks.get(&endpoint.node_id).map_or_else(
                         || {
                             sink_silence
                                 .get(&endpoint.node_id)
