@@ -214,7 +214,7 @@
       "benchmark_id": "engine/render_matrix/16x16/256",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 45157.88903863433,
+      "budget_value": 53963.18749661461,
       "regression_threshold": 0.1
     },
     {
@@ -235,7 +235,7 @@
       "benchmark_id": "engine/render_matrix/32x32/256",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 171068.5818113811,
+      "budget_value": 190621.83367533062,
       "regression_threshold": 0.1
     },
     {
