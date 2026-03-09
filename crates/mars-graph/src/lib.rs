@@ -30,6 +30,7 @@ pub struct CompiledProcessorChain {
 pub struct CompiledProcessor {
     pub id: String,
     pub kind: ProcessorKind,
+    pub config_json: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -345,14 +346,19 @@ fn compile_processor_plan(profile: &Profile) -> Result<CompiledProcessorPlan, Gr
     let definitions = profile
         .processors
         .iter()
-        .map(|processor| (processor.id.clone(), processor.kind))
+        .map(|processor| {
+            (
+                processor.id.clone(),
+                (processor.kind, processor.config.to_string()),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
 
     let mut chains = BTreeMap::<String, CompiledProcessorChain>::new();
     for chain in &profile.processor_chains {
         let mut processors = Vec::with_capacity(chain.processors.len());
         for processor_id in &chain.processors {
-            let Some(kind) = definitions.get(processor_id) else {
+            let Some((kind, config_json)) = definitions.get(processor_id) else {
                 return Err(GraphError::UnknownProcessorDefinition {
                     chain_id: chain.id.clone(),
                     processor_id: processor_id.clone(),
@@ -361,6 +367,7 @@ fn compile_processor_plan(profile: &Profile) -> Result<CompiledProcessorPlan, Gr
             processors.push(CompiledProcessor {
                 id: processor_id.clone(),
                 kind: *kind,
+                config_json: config_json.clone(),
             });
         }
         chains.insert(
@@ -925,6 +932,7 @@ mod tests {
         assert_eq!(chain.processors.len(), 1);
         assert_eq!(chain.processors[0].id, "proc-eq");
         assert_eq!(chain.processors[0].kind, ProcessorKind::Eq);
+        assert_eq!(chain.processors[0].config_json, "null");
         assert_eq!(
             graph.compiled_route_plan().routes[0].chain.as_deref(),
             Some("voice-chain")

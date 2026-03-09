@@ -2,7 +2,7 @@
 //! Realtime-safe-ish audio graph rendering engine.
 
 use std::collections::{BTreeMap, HashMap};
-use std::f32::consts::FRAC_PI_4;
+use std::f32::consts::{FRAC_PI_4, PI};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -10,6 +10,8 @@ use arc_swap::ArcSwap;
 use mars_graph::RoutingGraph;
 use mars_types::{MixMode, ProcessorKind, RuntimeCounters};
 use parking_lot::Mutex;
+use serde::Deserialize;
+use serde_json::Value;
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
@@ -126,9 +128,112 @@ struct ProcessorCounters {
 #[derive(Debug)]
 struct PassthroughProcessorBlock {
     id: String,
-    kind: ProcessorKind,
+    _kind: ProcessorKind,
     prepared: AtomicBool,
     counters: ProcessorCounters,
+}
+
+#[derive(Debug)]
+struct EqProcessorBlock {
+    id: String,
+    config: EqConfig,
+    state: Mutex<EqProcessorState>,
+    prepared: AtomicBool,
+    counters: ProcessorCounters,
+}
+
+#[derive(Debug)]
+struct DynamicsProcessorBlock {
+    id: String,
+    config: DynamicsConfig,
+    state: Mutex<DynamicsProcessorState>,
+    prepared: AtomicBool,
+    counters: ProcessorCounters,
+}
+
+#[derive(Debug, Clone)]
+struct EqConfig {
+    bands: Vec<EqBandConfig>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EqBandConfig {
+    freq_hz: f32,
+    q: f32,
+    gain_db: f32,
+    enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DynamicsConfig {
+    threshold_db: f32,
+    ratio: f32,
+    attack_ms: f32,
+    release_ms: f32,
+    makeup_gain_db: f32,
+    limiter: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct EqConfigSerde {
+    bands: Vec<EqBandConfigSerde>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct EqBandConfigSerde {
+    freq_hz: f32,
+    q: f32,
+    gain_db: f32,
+    enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct DynamicsConfigSerde {
+    threshold_db: f32,
+    ratio: f32,
+    attack_ms: f32,
+    release_ms: f32,
+    makeup_gain_db: f32,
+    limiter: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BiquadCoefficients {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BiquadState {
+    x1: f32,
+    x2: f32,
+    y1: f32,
+    y2: f32,
+}
+
+#[derive(Debug, Clone)]
+struct EqBandRuntime {
+    enabled: bool,
+    coefficients: BiquadCoefficients,
+    channel_state: Vec<BiquadState>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct EqProcessorState {
+    bands: Vec<EqBandRuntime>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DynamicsProcessorState {
+    envelope: Vec<f32>,
+    gain: Vec<f32>,
+    sample_rate_hz: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +265,144 @@ impl DelayLine {
     }
 }
 
+const fn default_eq_freq_hz() -> f32 {
+    1_000.0
+}
+
+const fn default_eq_q() -> f32 {
+    1.0
+}
+
+const fn default_dynamics_threshold_db() -> f32 {
+    -18.0
+}
+
+const fn default_dynamics_ratio() -> f32 {
+    4.0
+}
+
+const fn default_dynamics_attack_ms() -> f32 {
+    10.0
+}
+
+const fn default_dynamics_release_ms() -> f32 {
+    100.0
+}
+
+impl Default for EqBandConfigSerde {
+    fn default() -> Self {
+        Self {
+            freq_hz: default_eq_freq_hz(),
+            q: default_eq_q(),
+            gain_db: 0.0,
+            enabled: true,
+        }
+    }
+}
+
+impl Default for DynamicsConfigSerde {
+    fn default() -> Self {
+        Self {
+            threshold_db: default_dynamics_threshold_db(),
+            ratio: default_dynamics_ratio(),
+            attack_ms: default_dynamics_attack_ms(),
+            release_ms: default_dynamics_release_ms(),
+            makeup_gain_db: 0.0,
+            limiter: false,
+        }
+    }
+}
+
+impl EqConfig {
+    fn from_config_json(config_json: &str) -> Self {
+        let value =
+            serde_json::from_str::<Value>(config_json).expect("compiled config must be valid JSON");
+        let parsed = if value.is_null() {
+            EqConfigSerde::default()
+        } else {
+            serde_json::from_value::<EqConfigSerde>(value)
+                .expect("compiled eq config must match validated shape")
+        };
+        let bands = parsed
+            .bands
+            .into_iter()
+            .map(|band| EqBandConfig {
+                freq_hz: band.freq_hz,
+                q: band.q,
+                gain_db: band.gain_db,
+                enabled: band.enabled,
+            })
+            .collect::<Vec<_>>();
+        Self { bands }
+    }
+}
+
+impl DynamicsConfig {
+    fn from_config_json(config_json: &str) -> Self {
+        let value =
+            serde_json::from_str::<Value>(config_json).expect("compiled config must be valid JSON");
+        let parsed = if value.is_null() {
+            DynamicsConfigSerde::default()
+        } else {
+            serde_json::from_value::<DynamicsConfigSerde>(value)
+                .expect("compiled dynamics config must match validated shape")
+        };
+
+        Self {
+            threshold_db: parsed.threshold_db,
+            ratio: parsed.ratio,
+            attack_ms: parsed.attack_ms,
+            release_ms: parsed.release_ms,
+            makeup_gain_db: parsed.makeup_gain_db,
+            limiter: parsed.limiter,
+        }
+    }
+}
+
+fn peaking_coefficients(
+    sample_rate_hz: u32,
+    freq_hz: f32,
+    q: f32,
+    gain_db: f32,
+) -> BiquadCoefficients {
+    let sample_rate = sample_rate_hz.max(1) as f32;
+    let omega = 2.0 * PI * (freq_hz / sample_rate);
+    let sin_omega = omega.sin();
+    let cos_omega = omega.cos();
+    let alpha = sin_omega / (2.0 * q.max(0.0001));
+    let a = 10.0_f32.powf(gain_db / 40.0);
+
+    let b0 = 1.0 + alpha * a;
+    let b1 = -2.0 * cos_omega;
+    let b2 = 1.0 - alpha * a;
+    let a0 = 1.0 + alpha / a;
+    let a1 = -2.0 * cos_omega;
+    let a2 = 1.0 - alpha / a;
+
+    BiquadCoefficients {
+        b0: b0 / a0,
+        b1: b1 / a0,
+        b2: b2 / a0,
+        a1: a1 / a0,
+        a2: a2 / a0,
+    }
+}
+
+fn process_biquad_sample(
+    coefficients: BiquadCoefficients,
+    sample: f32,
+    state: &mut BiquadState,
+) -> f32 {
+    let output = coefficients.b0 * sample + coefficients.b1 * state.x1 + coefficients.b2 * state.x2
+        - coefficients.a1 * state.y1
+        - coefficients.a2 * state.y2;
+    state.x2 = state.x1;
+    state.x1 = sample;
+    state.y2 = state.y1;
+    state.y1 = output;
+    output
+}
+
 impl ProcessorSchedule {
     #[must_use]
     pub fn from_snapshot(snapshot: &EngineSnapshot) -> Self {
@@ -181,10 +424,20 @@ impl ProcessorSchedule {
                 max_frames: snapshot.buffer_frames as usize,
             };
             for compiled in &compiled_chain.processors {
-                let processor: Arc<dyn ProcessorBlock> = Arc::new(PassthroughProcessorBlock::new(
-                    compiled.id.clone(),
-                    compiled.kind,
-                ));
+                let processor: Arc<dyn ProcessorBlock> = match compiled.kind {
+                    ProcessorKind::Eq => Arc::new(EqProcessorBlock::new(
+                        compiled.id.clone(),
+                        EqConfig::from_config_json(&compiled.config_json),
+                    )),
+                    ProcessorKind::Dynamics => Arc::new(DynamicsProcessorBlock::new(
+                        compiled.id.clone(),
+                        DynamicsConfig::from_config_json(&compiled.config_json),
+                    )),
+                    _ => Arc::new(PassthroughProcessorBlock::new(
+                        compiled.id.clone(),
+                        compiled.kind,
+                    )),
+                };
                 processor.prepare(context);
                 processors.push(processor);
             }
@@ -259,7 +512,7 @@ impl PassthroughProcessorBlock {
     fn new(id: String, kind: ProcessorKind) -> Self {
         Self {
             id,
-            kind,
+            _kind: kind,
             prepared: AtomicBool::new(false),
             counters: ProcessorCounters::default(),
         }
@@ -272,12 +525,7 @@ impl ProcessorBlock for PassthroughProcessorBlock {
     }
 
     fn prepare(&self, context: ProcessorPrepareContext) {
-        let _ = (
-            context.channels,
-            context.sample_rate,
-            context.max_frames,
-            self.kind,
-        );
+        let _ = (context.channels, context.sample_rate, context.max_frames);
         self.prepared.store(true, Ordering::Relaxed);
         self.counters.prepare_calls.fetch_add(1, Ordering::Relaxed);
     }
@@ -303,6 +551,213 @@ impl ProcessorBlock for PassthroughProcessorBlock {
 
     fn reset(&self) {
         if self.prepared.swap(false, Ordering::Relaxed) {
+            self.counters.reset_calls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn stats(&self) -> ProcessorRuntimeStats {
+        ProcessorRuntimeStats {
+            prepare_calls: self.counters.prepare_calls.load(Ordering::Relaxed),
+            process_calls: self.counters.process_calls.load(Ordering::Relaxed),
+            reset_calls: self.counters.reset_calls.load(Ordering::Relaxed),
+            last_generation: self.counters.last_generation.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl EqProcessorBlock {
+    fn new(id: String, config: EqConfig) -> Self {
+        Self {
+            id,
+            config,
+            state: Mutex::new(EqProcessorState::default()),
+            prepared: AtomicBool::new(false),
+            counters: ProcessorCounters::default(),
+        }
+    }
+}
+
+impl ProcessorBlock for EqProcessorBlock {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn prepare(&self, context: ProcessorPrepareContext) {
+        let mut state = self.state.lock();
+        state.bands.clear();
+        for band in &self.config.bands {
+            state.bands.push(EqBandRuntime {
+                enabled: band.enabled,
+                coefficients: peaking_coefficients(
+                    context.sample_rate,
+                    band.freq_hz,
+                    band.q,
+                    band.gain_db,
+                ),
+                channel_state: vec![BiquadState::default(); context.channels],
+            });
+        }
+        self.prepared.store(true, Ordering::Relaxed);
+        self.counters.prepare_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn process(
+        &self,
+        samples: &mut [f32],
+        channels: usize,
+        _frames: usize,
+        control: Option<&ProcessorControl>,
+        bypass: bool,
+    ) {
+        if bypass || !self.prepared.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(control) = control {
+            self.counters
+                .last_generation
+                .store(control.generation, Ordering::Relaxed);
+        }
+
+        let mut state = self.state.lock();
+        if state.bands.is_empty() || channels == 0 {
+            self.counters.process_calls.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        for frame in samples.chunks_exact_mut(channels) {
+            for (channel_index, sample) in frame.iter_mut().enumerate() {
+                let mut output = *sample;
+                for band in &mut state.bands {
+                    if !band.enabled {
+                        continue;
+                    }
+                    let Some(channel_state) = band.channel_state.get_mut(channel_index) else {
+                        continue;
+                    };
+                    output = process_biquad_sample(band.coefficients, output, channel_state);
+                }
+                *sample = output;
+            }
+        }
+        self.counters.process_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn reset(&self) {
+        if self.prepared.swap(false, Ordering::Relaxed) {
+            self.state.lock().bands.clear();
+            self.counters.reset_calls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn stats(&self) -> ProcessorRuntimeStats {
+        ProcessorRuntimeStats {
+            prepare_calls: self.counters.prepare_calls.load(Ordering::Relaxed),
+            process_calls: self.counters.process_calls.load(Ordering::Relaxed),
+            reset_calls: self.counters.reset_calls.load(Ordering::Relaxed),
+            last_generation: self.counters.last_generation.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl DynamicsProcessorBlock {
+    fn new(id: String, config: DynamicsConfig) -> Self {
+        Self {
+            id,
+            config,
+            state: Mutex::new(DynamicsProcessorState::default()),
+            prepared: AtomicBool::new(false),
+            counters: ProcessorCounters::default(),
+        }
+    }
+}
+
+impl ProcessorBlock for DynamicsProcessorBlock {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn prepare(&self, context: ProcessorPrepareContext) {
+        let mut state = self.state.lock();
+        state.envelope = vec![0.0; context.channels];
+        state.gain = vec![1.0; context.channels];
+        state.sample_rate_hz = context.sample_rate.max(1);
+        self.prepared.store(true, Ordering::Relaxed);
+        self.counters.prepare_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn process(
+        &self,
+        samples: &mut [f32],
+        channels: usize,
+        _frames: usize,
+        control: Option<&ProcessorControl>,
+        bypass: bool,
+    ) {
+        if bypass || !self.prepared.load(Ordering::Relaxed) {
+            return;
+        }
+        if channels == 0 {
+            return;
+        }
+        if let Some(control) = control {
+            self.counters
+                .last_generation
+                .store(control.generation, Ordering::Relaxed);
+        }
+
+        let mut state = self.state.lock();
+        if state.envelope.len() != channels {
+            state.envelope.resize(channels, 0.0);
+            state.gain.resize(channels, 1.0);
+        }
+
+        let sample_rate = state.sample_rate_hz.max(1) as f32;
+        let attack_coeff = (-1.0 / (self.config.attack_ms.max(0.1) * 0.001 * sample_rate)).exp();
+        let release_coeff = (-1.0 / (self.config.release_ms.max(1.0) * 0.001 * sample_rate)).exp();
+        let makeup_gain = 10.0_f32.powf(self.config.makeup_gain_db / 20.0);
+
+        for frame in samples.chunks_exact_mut(channels) {
+            for (channel_index, sample) in frame.iter_mut().enumerate() {
+                let input = *sample;
+                let level = input.abs().max(1e-12);
+                let current_env = state.envelope[channel_index];
+                let env_coeff = if level > current_env {
+                    attack_coeff
+                } else {
+                    release_coeff
+                };
+                let envelope = env_coeff * current_env + (1.0 - env_coeff) * level;
+                state.envelope[channel_index] = envelope;
+                let level_db = 20.0 * envelope.max(1e-12).log10();
+                let over_db = (level_db - self.config.threshold_db).max(0.0);
+                let compressed_over_db = over_db / self.config.ratio.max(1.0);
+                let gain_reduction_db = compressed_over_db - over_db;
+                let target_gain = 10.0_f32.powf(gain_reduction_db / 20.0) * makeup_gain;
+
+                let current_gain = state.gain[channel_index];
+                let coeff = if target_gain < current_gain {
+                    attack_coeff
+                } else {
+                    release_coeff
+                };
+                let smoothed_gain = coeff * current_gain + (1.0 - coeff) * target_gain;
+                state.gain[channel_index] = smoothed_gain;
+
+                let mut output = input * smoothed_gain;
+                if self.config.limiter {
+                    output = output.clamp(-1.0, 1.0);
+                }
+                *sample = output;
+            }
+        }
+
+        self.counters.process_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn reset(&self) {
+        if self.prepared.swap(false, Ordering::Relaxed) {
+            let mut state = self.state.lock();
+            state.envelope.clear();
+            state.gain.clear();
             self.counters.reset_calls.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -702,6 +1157,7 @@ mod tests {
         Bus, MixConfig, Pipe, ProcessorChain, ProcessorDefinition, ProcessorKind, Profile, Route,
         RouteMatrix, VirtualInputDevice, VirtualOutputDevice,
     };
+    use serde_json::json;
 
     use super::{Engine, EngineSnapshot, ProcessorControl, ProcessorSchedule};
 
@@ -881,6 +1337,245 @@ mod tests {
             delay_ms: 0.0,
         });
         profile
+    }
+
+    fn single_processor_profile(
+        processor_kind: ProcessorKind,
+        processor_config: serde_json::Value,
+        sample_rate: u32,
+        buffer_frames: u32,
+    ) -> Engine {
+        let mut profile = Profile::default();
+        profile.virtual_devices.outputs.push(VirtualOutputDevice {
+            id: "src".to_string(),
+            name: "Src".to_string(),
+            channels: Some(1),
+            uid: None,
+            hidden: false,
+        });
+        profile.virtual_devices.inputs.push(VirtualInputDevice {
+            id: "sink".to_string(),
+            name: "Sink".to_string(),
+            channels: Some(1),
+            uid: None,
+            mix: None,
+        });
+        profile.processors.push(ProcessorDefinition {
+            id: "proc-1".to_string(),
+            kind: processor_kind,
+            config: processor_config,
+        });
+        profile.processor_chains.push(ProcessorChain {
+            id: "chain-1".to_string(),
+            processors: vec!["proc-1".to_string()],
+        });
+        profile.routes.push(Route {
+            id: "route-1".to_string(),
+            from: "src".to_string(),
+            to: "sink".to_string(),
+            enabled: true,
+            matrix: RouteMatrix {
+                rows: 1,
+                cols: 1,
+                coefficients: vec![vec![1.0]],
+            },
+            chain: Some("chain-1".to_string()),
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+
+        let graph = build_routing_graph(&profile).expect("graph");
+        Engine::new(EngineSnapshot {
+            graph,
+            sample_rate,
+            buffer_frames,
+        })
+    }
+
+    fn rms(samples: &[f32]) -> f32 {
+        if samples.is_empty() {
+            return 0.0;
+        }
+        (samples.iter().map(|item| item * item).sum::<f32>() / samples.len() as f32).sqrt()
+    }
+
+    fn biquad_reference_gain_db(
+        coefficients: super::BiquadCoefficients,
+        sample_rate: u32,
+        freq_hz: f32,
+    ) -> f32 {
+        let omega = 2.0 * PI * (freq_hz / sample_rate as f32);
+        let cos1 = omega.cos();
+        let sin1 = omega.sin();
+        let cos2 = (2.0 * omega).cos();
+        let sin2 = (2.0 * omega).sin();
+
+        let numerator_re = coefficients.b0 + coefficients.b1 * cos1 + coefficients.b2 * cos2;
+        let numerator_im = -(coefficients.b1 * sin1 + coefficients.b2 * sin2);
+        let denominator_re = 1.0 + coefficients.a1 * cos1 + coefficients.a2 * cos2;
+        let denominator_im = -(coefficients.a1 * sin1 + coefficients.a2 * sin2);
+
+        let numerator_mag = (numerator_re * numerator_re + numerator_im * numerator_im).sqrt();
+        let denominator_mag =
+            (denominator_re * denominator_re + denominator_im * denominator_im).sqrt();
+        20.0 * (numerator_mag / denominator_mag).max(1e-12).log10()
+    }
+
+    #[test]
+    fn eq_gain_matches_reference_vectors() {
+        let sample_rate = 48_000u32;
+        let frames = 256usize;
+        let test_freqs = [250.0_f32, 1_000.0, 4_000.0];
+        let eq_config = json!({
+            "bands": [{
+                "freq_hz": 1000.0,
+                "q": 1.0,
+                "gain_db": 6.0,
+                "enabled": true
+            }]
+        });
+        let coefficients = super::peaking_coefficients(sample_rate, 1_000.0, 1.0, 6.0);
+
+        for freq_hz in test_freqs {
+            let engine = single_processor_profile(
+                ProcessorKind::Eq,
+                eq_config.clone(),
+                sample_rate,
+                frames as u32,
+            );
+            let mut captured_in = Vec::new();
+            let mut captured_out = Vec::new();
+            let mut phase = 0.0_f32;
+            let phase_step = 2.0 * PI * freq_hz / sample_rate as f32;
+
+            for cycle in 0..100 {
+                let mut input = Vec::with_capacity(frames);
+                for _ in 0..frames {
+                    input.push(phase.sin());
+                    phase += phase_step;
+                    if phase > 2.0 * PI {
+                        phase -= 2.0 * PI;
+                    }
+                }
+                let mut sources = HashMap::new();
+                sources.insert("src".to_string(), input.clone());
+                let output = engine.render_cycle(frames, &sources).expect("render");
+                if cycle >= 40 {
+                    captured_in.extend(input);
+                    captured_out.extend_from_slice(output.sinks.get("sink").expect("sink"));
+                }
+            }
+
+            let measured_gain_db =
+                20.0 * (rms(&captured_out) / rms(&captured_in)).max(1e-12).log10();
+            let expected_gain_db = biquad_reference_gain_db(coefficients, sample_rate, freq_hz);
+            assert!(
+                (measured_gain_db - expected_gain_db).abs() < 0.75,
+                "freq={freq_hz}Hz measured={measured_gain_db:.3}dB expected={expected_gain_db:.3}dB"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamics_threshold_and_ratio_match_expected_reduction() {
+        let sample_rate = 48_000u32;
+        let frames = 256usize;
+        let engine = single_processor_profile(
+            ProcessorKind::Dynamics,
+            json!({
+                "threshold_db": -12.0,
+                "ratio": 4.0,
+                "attack_ms": 0.1,
+                "release_ms": 250.0,
+                "makeup_gain_db": 0.0,
+                "limiter": false
+            }),
+            sample_rate,
+            frames as u32,
+        );
+
+        let mut sources = HashMap::new();
+        sources.insert("src".to_string(), vec![1.0_f32; frames]);
+        let mut captured = Vec::new();
+        for cycle in 0..80 {
+            let output = engine.render_cycle(frames, &sources).expect("render");
+            if cycle >= 40 {
+                captured.extend_from_slice(output.sinks.get("sink").expect("sink"));
+            }
+        }
+
+        let observed = captured.iter().map(|item| item.abs()).sum::<f32>() / captured.len() as f32;
+        let expected_gain = 10.0_f32.powf(-9.0 / 20.0);
+        assert!((observed - expected_gain).abs() < 0.04);
+    }
+
+    #[test]
+    fn dynamics_attack_and_release_have_expected_temporal_shape() {
+        let sample_rate = 48_000u32;
+        let frames = 256usize;
+        let engine = single_processor_profile(
+            ProcessorKind::Dynamics,
+            json!({
+                "threshold_db": -18.0,
+                "ratio": 8.0,
+                "attack_ms": 2.0,
+                "release_ms": 120.0,
+                "makeup_gain_db": 0.0,
+                "limiter": false
+            }),
+            sample_rate,
+            frames as u32,
+        );
+
+        let mut silence = HashMap::new();
+        silence.insert("src".to_string(), vec![0.0_f32; frames]);
+        engine.render_cycle(frames, &silence).expect("render");
+
+        let mut hot = HashMap::new();
+        hot.insert("src".to_string(), vec![1.0_f32; frames]);
+        let attack_output = engine.render_cycle(frames, &hot).expect("render");
+        let attack_sink = attack_output.sinks.get("sink").expect("sink");
+        let early_mean = attack_sink[..32].iter().map(|item| item.abs()).sum::<f32>() / 32.0;
+        let late_mean = attack_sink[(frames - 32)..]
+            .iter()
+            .map(|item| item.abs())
+            .sum::<f32>()
+            / 32.0;
+        assert!(early_mean > late_mean + 0.03);
+
+        for _ in 0..40 {
+            engine.render_cycle(frames, &hot).expect("render");
+        }
+
+        let mut cool = HashMap::new();
+        cool.insert("src".to_string(), vec![0.1_f32; frames]);
+        let release_early = engine.render_cycle(frames, &cool).expect("render");
+        let early_mean = release_early
+            .sinks
+            .get("sink")
+            .expect("sink")
+            .iter()
+            .map(|item| item.abs())
+            .sum::<f32>()
+            / frames as f32;
+
+        for _ in 0..140 {
+            engine.render_cycle(frames, &cool).expect("render");
+        }
+        let release_late = engine.render_cycle(frames, &cool).expect("render");
+        let late_mean = release_late
+            .sinks
+            .get("sink")
+            .expect("sink")
+            .iter()
+            .map(|item| item.abs())
+            .sum::<f32>()
+            / frames as f32;
+
+        assert!(late_mean > early_mean + 0.01);
+        assert!((late_mean - 0.1).abs() < 0.01);
     }
 
     #[test]
