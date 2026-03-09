@@ -43,3 +43,9 @@ Reuse existing Criterion results (skip rerun):
 ```bash
 scripts/bench/verify.sh --skip-bench --criterion-dir /abs/path/to/criterion --platform macos-15
 ```
+
+Sanity-check that non-finite values fail the gate:
+
+```bash
+scripts/bench/test_non_finite.sh
+```

@@ -14,13 +14,26 @@ on:
       - ".github/workflows/engine-perf-gate.yml"
 
 jobs:
+  mars-engine-tests:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run mars-engine tests
+        run: cargo test -p mars-engine
+
   benchmark-budget-gate:
+    needs: mars-engine-tests
     runs-on: macos-15
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Verify non-finite metric guardrails
+        run: scripts/bench/test_non_finite.sh
       - name: Run benchmark budget verification
         run: scripts/bench/verify.sh --platform macos-15
       - name: Upload benchmark metrics artifact

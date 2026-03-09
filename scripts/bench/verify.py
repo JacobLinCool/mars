@@ -23,6 +23,16 @@ def detect_platform() -> str:
     return sys.platform
 
 
+def parse_finite_float(raw: object, context: str) -> float:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise SystemExit(f"invalid numeric value for {context}: {raw!r}") from None
+    if not math.isfinite(value):
+        raise SystemExit(f"non-finite numeric value for {context}: {raw!r}")
+    return value
+
+
 def load_json(path: Path) -> dict | list:
     with path.open("r", encoding="utf-8") as fh:
         return json.load(fh)
@@ -63,11 +73,14 @@ def load_budget_entries(budgets_dir: Path) -> list[dict]:
 
 def validate_policy(entries: list[dict]) -> list[str]:
     failures: list[str] = []
-    for entry in entries:
+    for index, entry in enumerate(entries):
         benchmark_id = str(entry["benchmark_id"])
         metric = str(entry["metric"])
-        budget = float(entry["budget_value"])
-        threshold = float(entry["regression_threshold"])
+        budget = parse_finite_float(entry["budget_value"], f"budget[{index}] {benchmark_id} budget_value")
+        threshold = parse_finite_float(
+            entry["regression_threshold"],
+            f"budget[{index}] {benchmark_id} regression_threshold",
+        )
 
         if metric == "median_ns" and not math.isclose(threshold, POLICY_MEDIAN_THRESHOLD, rel_tol=0.0, abs_tol=1e-12):
             failures.append(
@@ -119,14 +132,17 @@ def main() -> int:
         raise SystemExit(f"metrics payload missing records array: {args.metrics}")
 
     metrics_map: dict[tuple[str, str], float] = {}
-    for record in metric_records:
+    for index, record in enumerate(metric_records):
         if not isinstance(record, dict):
             continue
         benchmark_id = record.get("benchmark_id")
         metric = record.get("metric")
         value = record.get("value")
         if isinstance(benchmark_id, str) and isinstance(metric, str):
-            metrics_map[(benchmark_id, metric)] = float(value)
+            metrics_map[(benchmark_id, metric)] = parse_finite_float(
+                value,
+                f"metrics[{index}] {benchmark_id} {metric} value",
+            )
 
     relevant_budgets = [entry for entry in budget_entries if str(entry["platform"]) == args.platform]
     if not relevant_budgets:
@@ -141,8 +157,11 @@ def main() -> int:
     ):
         benchmark_id = str(entry["benchmark_id"])
         metric = str(entry["metric"])
-        baseline = float(entry["budget_value"])
-        threshold = float(entry["regression_threshold"])
+        baseline = parse_finite_float(entry["budget_value"], f"budget {benchmark_id} {metric} budget_value")
+        threshold = parse_finite_float(
+            entry["regression_threshold"],
+            f"budget {benchmark_id} {metric} regression_threshold",
+        )
 
         observed = metrics_map.get((benchmark_id, metric))
         if observed is None:
@@ -153,6 +172,9 @@ def main() -> int:
             allowed = POLICY_RT_P99_MAX_RATIO
         else:
             allowed = baseline * (1.0 + threshold)
+        if not math.isfinite(allowed):
+            failures.append(f"invalid computed allowed budget for '{benchmark_id}' '{metric}': {allowed!r}")
+            continue
 
         checked += 1
         if observed > allowed:
