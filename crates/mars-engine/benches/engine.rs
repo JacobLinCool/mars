@@ -9,6 +9,7 @@ use mars_types::{
     Bus, MixConfig, MixMode, Pipe, ProcessorChain, ProcessorDefinition, ProcessorKind, Profile,
     Route, RouteMatrix, VirtualInputDevice, VirtualOutputDevice,
 };
+use serde_json::json;
 
 fn identity_matrix(channels: u16) -> RouteMatrix {
     let channels = channels as usize;
@@ -341,7 +342,31 @@ fn matrix_profile(channels: u16) -> Profile {
     p
 }
 
-fn chain_profile(chain_length: usize) -> Profile {
+fn processor_config(kind: ProcessorKind) -> serde_json::Value {
+    match kind {
+        ProcessorKind::Eq => json!({
+            "bands": [
+                {
+                    "freq_hz": 1200.0,
+                    "q": 1.0,
+                    "gain_db": 3.0,
+                    "enabled": true
+                }
+            ]
+        }),
+        ProcessorKind::Dynamics => json!({
+            "threshold_db": -18.0,
+            "ratio": 4.0,
+            "attack_ms": 10.0,
+            "release_ms": 100.0,
+            "makeup_gain_db": 0.0,
+            "limiter": false
+        }),
+        _ => serde_json::Value::Null,
+    }
+}
+
+fn chain_profile(kinds: &[ProcessorKind]) -> Profile {
     let mut p = Profile::default();
     p.virtual_devices.outputs.push(VirtualOutputDevice {
         id: "chain-src".into(),
@@ -358,13 +383,13 @@ fn chain_profile(chain_length: usize) -> Profile {
         mix: None,
     });
 
-    let mut processor_ids = Vec::with_capacity(chain_length);
-    for index in 0..chain_length {
+    let mut processor_ids = Vec::with_capacity(kinds.len());
+    for (index, kind) in kinds.iter().copied().enumerate() {
         let processor_id = format!("proc-{index}");
         p.processors.push(ProcessorDefinition {
             id: processor_id.clone(),
-            kind: ProcessorKind::Eq,
-            config: Default::default(),
+            kind,
+            config: processor_config(kind),
         });
         processor_ids.push(processor_id);
     }
@@ -554,7 +579,7 @@ fn bench_render_chain_length(c: &mut Criterion) {
     let frames = 256usize;
 
     for chain_length in [1usize, 4, 8, 16] {
-        let profile = chain_profile(chain_length);
+        let profile = chain_profile(&vec![ProcessorKind::Eq; chain_length]);
         let engine = make_engine(&profile);
         let sources: HashMap<String, Vec<f32>> =
             [stereo_source("chain-src", frames)].into_iter().collect();
@@ -574,7 +599,7 @@ fn bench_render_chain_length(c: &mut Criterion) {
 fn bench_render_param_updates(c: &mut Criterion) {
     let mut group = c.benchmark_group("engine/render_param_updates");
     let frames = 256usize;
-    let profile = chain_profile(8);
+    let profile = chain_profile(&[ProcessorKind::Eq; 8]);
     let engine = make_engine(&profile);
     let sources: HashMap<String, Vec<f32>> =
         [stereo_source("chain-src", frames)].into_iter().collect();
@@ -608,6 +633,68 @@ fn bench_render_param_updates(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_render_processor_block(c: &mut Criterion) {
+    let mut group = c.benchmark_group("engine/render_processor_block");
+    let frames = 256usize;
+
+    for (name, kind) in [
+        ("eq", ProcessorKind::Eq),
+        ("dynamics", ProcessorKind::Dynamics),
+    ] {
+        let profile = chain_profile(&[kind]);
+        let engine = make_engine(&profile);
+        let sources: HashMap<String, Vec<f32>> =
+            [stereo_source("chain-src", frames)].into_iter().collect();
+        group.bench_with_input(
+            BenchmarkId::new(name, frames),
+            &(frames, &sources),
+            |b, (f, s)| {
+                b.iter(|| engine.render_cycle(*f, s).unwrap());
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_render_processor_chain_kind(c: &mut Criterion) {
+    let mut group = c.benchmark_group("engine/render_processor_chain_kind");
+    let frames = 256usize;
+    let cases = vec![
+        ("eqx4", vec![ProcessorKind::Eq; 4]),
+        ("dynamicsx4", vec![ProcessorKind::Dynamics; 4]),
+        (
+            "mix8",
+            vec![
+                ProcessorKind::Eq,
+                ProcessorKind::Dynamics,
+                ProcessorKind::Eq,
+                ProcessorKind::Dynamics,
+                ProcessorKind::Eq,
+                ProcessorKind::Dynamics,
+                ProcessorKind::Eq,
+                ProcessorKind::Dynamics,
+            ],
+        ),
+    ];
+
+    for (name, kinds) in cases {
+        let profile = chain_profile(&kinds);
+        let engine = make_engine(&profile);
+        let sources: HashMap<String, Vec<f32>> =
+            [stereo_source("chain-src", frames)].into_iter().collect();
+        group.bench_with_input(
+            BenchmarkId::new(name, frames),
+            &(frames, &sources),
+            |b, (f, s)| {
+                b.iter(|| engine.render_cycle(*f, s).unwrap());
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_render_simple,
@@ -617,6 +704,8 @@ criterion_group!(
     bench_render_multisource_multioutput,
     bench_render_matrix,
     bench_render_chain_length,
-    bench_render_param_updates
+    bench_render_param_updates,
+    bench_render_processor_block,
+    bench_render_processor_chain_kind
 );
 criterion_main!(benches);

@@ -15,6 +15,8 @@ arc-swap.workspace = true
 mars-graph = { path = "../mars-graph" }
 mars-types = { path = "../mars-types" }
 parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

@@ -45,13 +45,25 @@ fn render_cycle_into_has_zero_heap_allocation_after_prepare() {
         mix: None,
     });
     profile.processors.push(ProcessorDefinition {
-        id: "proc-rt".to_string(),
+        id: "eq-rt".to_string(),
         kind: ProcessorKind::Eq,
         config: Default::default(),
     });
+    profile.processors.push(ProcessorDefinition {
+        id: "dyn-rt".to_string(),
+        kind: ProcessorKind::Dynamics,
+        config: serde_json::json!({
+            "threshold_db": -18.0,
+            "ratio": 4.0,
+            "attack_ms": 5.0,
+            "release_ms": 100.0,
+            "makeup_gain_db": 0.0,
+            "limiter": false
+        }),
+    });
     profile.processor_chains.push(ProcessorChain {
         id: "chain-rt".to_string(),
-        processors: vec!["proc-rt".to_string()],
+        processors: vec!["eq-rt".to_string(), "dyn-rt".to_string()],
     });
     profile.routes.push(Route {
         id: "matrix-main".to_string(),

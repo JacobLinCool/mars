@@ -6,7 +6,7 @@ use std::fs;
 use std::path::Path;
 
 use mars_graph::{GraphError, RoutingGraph, build_routing_graph};
-use mars_types::{AutoOrU16, AutoOrU32, PROFILE_VERSION, Profile, ValidationReport};
+use mars_types::{AutoOrU16, AutoOrU32, PROFILE_VERSION, ProcessorKind, Profile, ValidationReport};
 use regex::Regex;
 use schemars::schema_for;
 use thiserror::Error;
@@ -105,6 +105,16 @@ pub enum ProfileError {
     UnknownProcessorInChain {
         chain_id: String,
         processor_id: String,
+    },
+    #[error("processor '{processor_id}' eq config is invalid: {reason}")]
+    InvalidEqConfig {
+        processor_id: String,
+        reason: String,
+    },
+    #[error("processor '{processor_id}' dynamics config is invalid: {reason}")]
+    InvalidDynamicsConfig {
+        processor_id: String,
+        reason: String,
     },
     #[error("file sink '{sink_id}' path must not be empty")]
     EmptyFileSinkPath { sink_id: String },
@@ -325,7 +335,177 @@ fn validate_routes(profile: &Profile) -> Result<(), ProfileError> {
     Ok(())
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EqConfig {
+    #[serde(default)]
+    bands: Vec<EqBandConfig>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EqBandConfig {
+    #[serde(default = "default_eq_freq_hz")]
+    freq_hz: f32,
+    #[serde(default = "default_eq_q")]
+    q: f32,
+    #[serde(default)]
+    gain_db: f32,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DynamicsConfig {
+    #[serde(default = "default_dynamics_threshold_db")]
+    threshold_db: f32,
+    #[serde(default = "default_dynamics_ratio")]
+    ratio: f32,
+    #[serde(default = "default_dynamics_attack_ms")]
+    attack_ms: f32,
+    #[serde(default = "default_dynamics_release_ms")]
+    release_ms: f32,
+    #[serde(default)]
+    makeup_gain_db: f32,
+    #[serde(default)]
+    limiter: bool,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_eq_freq_hz() -> f32 {
+    1_000.0
+}
+
+const fn default_eq_q() -> f32 {
+    1.0
+}
+
+const fn default_dynamics_threshold_db() -> f32 {
+    -18.0
+}
+
+const fn default_dynamics_ratio() -> f32 {
+    4.0
+}
+
+const fn default_dynamics_attack_ms() -> f32 {
+    10.0
+}
+
+const fn default_dynamics_release_ms() -> f32 {
+    100.0
+}
+
+fn validate_eq_config(config: &EqConfig, processor_id: &str) -> Result<(), ProfileError> {
+    if config.bands.len() > 16 {
+        return Err(ProfileError::InvalidEqConfig {
+            processor_id: processor_id.to_string(),
+            reason: "bands length must be <= 16".to_string(),
+        });
+    }
+
+    for (index, band) in config.bands.iter().enumerate() {
+        if !band.freq_hz.is_finite() || band.freq_hz <= 0.0 || band.freq_hz > 24_000.0 {
+            return Err(ProfileError::InvalidEqConfig {
+                processor_id: processor_id.to_string(),
+                reason: format!("band[{index}] freq_hz must be finite in (0, 24000]"),
+            });
+        }
+        if !band.q.is_finite() || band.q <= 0.0 || band.q > 24.0 {
+            return Err(ProfileError::InvalidEqConfig {
+                processor_id: processor_id.to_string(),
+                reason: format!("band[{index}] q must be finite in (0, 24]"),
+            });
+        }
+        if !band.gain_db.is_finite() || band.gain_db < -36.0 || band.gain_db > 36.0 {
+            return Err(ProfileError::InvalidEqConfig {
+                processor_id: processor_id.to_string(),
+                reason: format!("band[{index}] gain_db must be finite in [-36, 36]"),
+            });
+        }
+        let _ = band.enabled;
+    }
+    Ok(())
+}
+
+fn validate_dynamics_config(
+    config: &DynamicsConfig,
+    processor_id: &str,
+) -> Result<(), ProfileError> {
+    let in_range =
+        |value: f32, min: f32, max: f32| value.is_finite() && value >= min && value <= max;
+    if !in_range(config.threshold_db, -96.0, 0.0) {
+        return Err(ProfileError::InvalidDynamicsConfig {
+            processor_id: processor_id.to_string(),
+            reason: "threshold_db must be finite in [-96, 0]".to_string(),
+        });
+    }
+    if !in_range(config.ratio, 1.0, 32.0) {
+        return Err(ProfileError::InvalidDynamicsConfig {
+            processor_id: processor_id.to_string(),
+            reason: "ratio must be finite in [1, 32]".to_string(),
+        });
+    }
+    if !in_range(config.attack_ms, 0.1, 500.0) {
+        return Err(ProfileError::InvalidDynamicsConfig {
+            processor_id: processor_id.to_string(),
+            reason: "attack_ms must be finite in [0.1, 500]".to_string(),
+        });
+    }
+    if !in_range(config.release_ms, 1.0, 5_000.0) {
+        return Err(ProfileError::InvalidDynamicsConfig {
+            processor_id: processor_id.to_string(),
+            reason: "release_ms must be finite in [1, 5000]".to_string(),
+        });
+    }
+    if !in_range(config.makeup_gain_db, -36.0, 36.0) {
+        return Err(ProfileError::InvalidDynamicsConfig {
+            processor_id: processor_id.to_string(),
+            reason: "makeup_gain_db must be finite in [-36, 36]".to_string(),
+        });
+    }
+    let _ = config.limiter;
+    Ok(())
+}
+
+fn normalized_processor_config(config: &serde_json::Value) -> serde_json::Value {
+    if config.is_null() {
+        return serde_json::Value::Object(serde_json::Map::new());
+    }
+    config.clone()
+}
+
 fn validate_processor_chains(profile: &Profile) -> Result<(), ProfileError> {
+    for processor in &profile.processors {
+        match processor.kind {
+            ProcessorKind::Eq => {
+                let config = serde_json::from_value::<EqConfig>(normalized_processor_config(
+                    &processor.config,
+                ))
+                .map_err(|error| ProfileError::InvalidEqConfig {
+                    processor_id: processor.id.clone(),
+                    reason: error.to_string(),
+                })?;
+                validate_eq_config(&config, &processor.id)?;
+            }
+            ProcessorKind::Dynamics => {
+                let config = serde_json::from_value::<DynamicsConfig>(normalized_processor_config(
+                    &processor.config,
+                ))
+                .map_err(|error| ProfileError::InvalidDynamicsConfig {
+                    processor_id: processor.id.clone(),
+                    reason: error.to_string(),
+                })?;
+                validate_dynamics_config(&config, &processor.id)?;
+            }
+            _ => {}
+        }
+    }
+
     let processors = profile
         .processors
         .iter()
@@ -960,5 +1140,87 @@ pipes: []
         let err = parse_profile_str(yaml).expect_err("yaml parse must fail");
         assert!(err.to_string().contains("invalid yaml"));
         assert!(err.to_string().contains("not_a_processor"));
+    }
+
+    #[test]
+    fn accepts_eq_and_dynamics_with_default_null_config() {
+        let yaml = r#"
+version: 2
+virtual:
+  outputs:
+    - id: app
+      name: App
+  inputs:
+    - id: mix
+      name: Mix
+processors:
+  - id: eq1
+    kind: eq
+  - id: dyn1
+    kind: dynamics
+processor_chains:
+  - id: chain1
+    processors: [eq1, dyn1]
+routes:
+  - id: r1
+    from: app
+    to: mix
+    chain: chain1
+    matrix:
+      rows: 2
+      cols: 2
+      coefficients:
+        - [1.0, 0.0]
+        - [0.0, 1.0]
+pipes: []
+"#;
+        let profile = parse_profile_str(yaml).expect("yaml parse should work");
+        validate_profile(profile).expect("validation should pass");
+    }
+
+    #[test]
+    fn rejects_invalid_eq_config_range() {
+        let yaml = r#"
+version: 2
+virtual:
+  outputs: []
+  inputs: []
+processors:
+  - id: eq1
+    kind: eq
+    config:
+      bands:
+        - freq_hz: 1000.0
+          q: 0.0
+          gain_db: 3.0
+pipes: []
+"#;
+        let profile = parse_profile_str(yaml).expect("yaml parse should work");
+        let err = validate_profile(profile).expect_err("validation must fail");
+        assert!(err.to_string().contains("eq config is invalid"));
+        assert!(err.to_string().contains("q must be finite in (0, 24]"));
+    }
+
+    #[test]
+    fn rejects_invalid_dynamics_config_range() {
+        let yaml = r#"
+version: 2
+virtual:
+  outputs: []
+  inputs: []
+processors:
+  - id: dyn1
+    kind: dynamics
+    config:
+      threshold_db: -12.0
+      ratio: 0.5
+      attack_ms: 5.0
+      release_ms: 80.0
+pipes: []
+"#;
+        let profile = parse_profile_str(yaml).expect("yaml parse should work");
+        let err = validate_profile(profile).expect_err("validation must fail");
+        assert!(err.to_string().contains("dynamics config is invalid"));
+        assert!(err.to_string().contains("ratio must be finite in [1, 32]"));
     }
 }
