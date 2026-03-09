@@ -4,7 +4,7 @@ MARS (macOS Audio Router Service) is an audio routing system for macOS.
 
 ## What is included
 
-- `mars` CLI with commands: `create`, `open`, `apply`, `clear`, `validate`, `plan`, `status`, `devices`, `logs`, `doctor`
+- `mars` CLI with commands: `create`, `open`, `apply`, `clear`, `validate`, `plan`, `status`, `devices`, `test`, `logs`, `doctor`
 - `marsd` daemon with declarative apply transaction and rollback semantics
 - `mars-hal` AudioServerPlugIn driver crate and `mars.driver` bundle scaffold
 - Shared profile schema, graph validator, ring-buffer model, and realtime engine core
@@ -191,7 +191,8 @@ Quick install:
 
 Run as your normal user (do not prefix with `sudo`).
 
-For local-only development on SIP-disabled systems, you can explicitly opt in to insecure signing:
+On SIP-disabled systems, installer now auto-enables local insecure signing fallback.
+You can still force it explicitly:
 
 ```bash
 MARS_ALLOW_INSECURE_SIGNING=1 ./scripts/install.sh
@@ -219,8 +220,13 @@ mars plan demo
 mars apply demo
 mars status --json
 mars doctor
+mars test
+mars test --route
 mars clear
 ```
+
+`mars test` measures internal MARS data-plane latency only.
+`mars test --route` verifies the microphone-to-speaker and microphone-to-virtual-capture route.
 
 ## Uninstall
 

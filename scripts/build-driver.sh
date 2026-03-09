@@ -75,7 +75,20 @@ with open(path, 'wb') as f:
 # Code-sign the bundle with hardened runtime. macOS 14+ loads HAL plugins
 # out-of-process in com.apple.audio.DriverHelper which enforces library
 # validation; only "Developer ID Application" certificates pass.
-ALLOW_INSECURE_SIGNING="${MARS_ALLOW_INSECURE_SIGNING:-0}"
+#
+# On SIP-disabled hosts, allow insecure local signing by default unless the
+# caller explicitly sets MARS_ALLOW_INSECURE_SIGNING.
+ALLOW_INSECURE_SIGNING="${MARS_ALLOW_INSECURE_SIGNING:-}"
+if [ -z "$ALLOW_INSECURE_SIGNING" ]; then
+    SIP_STATUS="$(csrutil status 2>/dev/null || true)"
+    if echo "$SIP_STATUS" | grep -qi "disabled"; then
+        ALLOW_INSECURE_SIGNING="1"
+        echo "warning: SIP appears disabled; enabling insecure local signing fallback." >&2
+    else
+        ALLOW_INSECURE_SIGNING="0"
+    fi
+fi
+
 DEV_ID="$(security find-identity -v -p codesigning 2>/dev/null | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/' || true)"
 
 if [ -n "$DEV_ID" ]; then

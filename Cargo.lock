@@ -774,11 +774,13 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "dirs",
+ "mars-coreaudio",
  "mars-ipc",
  "mars-profile",
  "mars-types",
  "serde",
  "serde_json",
+ "serde_yaml",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -788,6 +790,7 @@ name = "mars-coreaudio"
 version = "0.1.0"
 dependencies = [
  "cpal",
+ "mars-shm",
  "mars-types",
  "parking_lot",
  "regex",

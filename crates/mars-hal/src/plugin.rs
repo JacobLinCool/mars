@@ -1,6 +1,6 @@
 //! AudioServerPlugIn COM-style driver implementation.
 //!
-//! This module implements the real `AudioServerPlugInDriverInterface` vtable that
+//! This module implements the real `AudioServerPlugInDriverInterface` struct that
 //! coreaudiod loads.  Config updates arrive via `SetPropertyData` on the custom
 //! properties (`kMarsPropertyDesiredState`, etc.) and flow through the existing
 //! `DRIVER_STATE` machinery in `crate::lib`.
@@ -27,6 +27,7 @@ use crate::{
 
 struct MarsDriverPlugin {
     ref_count: AtomicU32,
+    plugin_object_id: AtomicU32,
     host: Mutex<Option<AudioServerPlugInHostRef>>,
     object_registry: Mutex<ObjectRegistry>,
 }
@@ -48,11 +49,13 @@ struct ObjectRegistry {
 struct DeviceObjectInfo {
     device_id: AudioObjectID,
     stream_id: AudioObjectID,
+    volume_control_id: Option<AudioObjectID>,
     uid: String,
     name: String,
     kind: String,
     channels: u16,
     hidden: bool,
+    volume_scalar: Float32,
     io_running: bool,
     sample_time_frames: u64,
     zero_ts_seed: u64,
@@ -89,6 +92,21 @@ impl ObjectRegistry {
         self.devices.values().find(|d| d.stream_id == stream_id)
     }
 
+    fn find_device_by_control(&self, control_id: AudioObjectID) -> Option<&DeviceObjectInfo> {
+        self.devices
+            .values()
+            .find(|d| d.volume_control_id == Some(control_id))
+    }
+
+    fn find_device_by_control_mut(
+        &mut self,
+        control_id: AudioObjectID,
+    ) -> Option<&mut DeviceObjectInfo> {
+        self.devices
+            .values_mut()
+            .find(|d| d.volume_control_id == Some(control_id))
+    }
+
     fn all_device_ids(&self) -> Vec<AudioObjectID> {
         self.devices.values().map(|d| d.device_id).collect()
     }
@@ -96,15 +114,17 @@ impl ObjectRegistry {
 
 static PLUGIN: Lazy<MarsDriverPlugin> = Lazy::new(|| MarsDriverPlugin {
     ref_count: AtomicU32::new(1),
+    plugin_object_id: AtomicU32::new(0),
     host: Mutex::new(None),
     object_registry: Mutex::new(ObjectRegistry::default()),
 });
 
 // ===========================================================================
-// COM vtable (static)
+// COM interface (static)
 // ===========================================================================
 
-static VTABLE: AudioServerPlugInDriverVTable = AudioServerPlugInDriverVTable {
+static INTERFACE: AudioServerPlugInDriverInterface = AudioServerPlugInDriverInterface {
+    _reserved: core::ptr::null_mut(),
     query_interface: plugin_query_interface,
     add_ref: plugin_add_ref,
     release: plugin_release,
@@ -131,20 +151,21 @@ static VTABLE: AudioServerPlugInDriverVTable = AudioServerPlugInDriverVTable {
 
 /// Wrapper for a raw pointer that is `Sync + Send`.
 ///
-/// The vtable pointer is to a `static` and lives for the entire process — it is
-/// safe to share across threads.
-struct SyncVTablePtr(*const AudioServerPlugInDriverVTable);
-unsafe impl Sync for SyncVTablePtr {}
-unsafe impl Send for SyncVTablePtr {}
+/// The interface pointer is to a `static` and lives for the entire process — it
+/// is safe to share across threads.
+struct SyncInterfacePtr(*const AudioServerPlugInDriverInterface);
+unsafe impl Sync for SyncInterfacePtr {}
+unsafe impl Send for SyncInterfacePtr {}
 
-static VTABLE_PTR: SyncVTablePtr = SyncVTablePtr(&VTABLE);
+static INTERFACE_PTR: SyncInterfacePtr = SyncInterfacePtr(&INTERFACE);
 
 // ===========================================================================
 // Factory function — the single exported symbol for CoreAudio host
 // ===========================================================================
 
-/// CoreAudio host calls this to create the driver.  Returns a COM double-indirection
-/// pointer (`**vtable`).
+/// CoreAudio host calls this to create the driver. Returns an
+/// `AudioServerPlugInDriverRef`, which is a pointer to a pointer to the driver
+/// interface struct.
 ///
 /// # Safety
 /// Must only be called by the CoreAudio host with valid CFAllocatorRef and CFUUID parameters.
@@ -155,8 +176,7 @@ pub unsafe extern "C" fn MarsAudioServerPlugInFactory(
 ) -> *mut c_void {
     // Force lazy init.
     let _ = &*PLUGIN;
-    // Return pointer-to-pointer (COM convention).
-    (&VTABLE_PTR.0 as *const *const AudioServerPlugInDriverVTable)
+    (&INTERFACE_PTR.0 as *const *const AudioServerPlugInDriverInterface)
         .cast_mut()
         .cast::<c_void>()
 }
@@ -170,18 +190,15 @@ unsafe extern "C" fn plugin_query_interface(
     iid: REFIID,
     interface: *mut *mut c_void,
 ) -> HRESULT {
-    if iid.is_null() || interface.is_null() {
+    if interface.is_null() {
         return E_NOINTERFACE;
     }
 
-    // SAFETY: The IID is a 16-byte UUID passed by the host.
-    let iid_bytes: &[u8; 16] = unsafe { &*iid.cast::<[u8; 16]>() };
-
-    if *iid_bytes == IID_IUNKNOWN || *iid_bytes == IID_AUDIO_SERVER_PLUGIN_DRIVER {
+    if iid == IID_IUNKNOWN || iid == IID_AUDIO_SERVER_PLUGIN_DRIVER {
         PLUGIN.ref_count.fetch_add(1, Ordering::Relaxed);
         // SAFETY: `interface` is non-null, checked above.
         unsafe {
-            *interface = (&VTABLE_PTR.0 as *const *const AudioServerPlugInDriverVTable)
+            *interface = (&INTERFACE_PTR.0 as *const *const AudioServerPlugInDriverInterface)
                 .cast_mut()
                 .cast::<c_void>();
         }
@@ -205,7 +222,7 @@ unsafe extern "C" fn plugin_release(_driver: *mut c_void) -> ULONG {
 // ===========================================================================
 
 unsafe extern "C" fn plugin_initialize(
-    _driver: *mut c_void,
+    _driver: AudioServerPlugInDriverRef,
     host: AudioServerPlugInHostRef,
 ) -> OSStatus {
     *PLUGIN.host.lock() = Some(host);
@@ -213,8 +230,8 @@ unsafe extern "C" fn plugin_initialize(
 }
 
 unsafe extern "C" fn plugin_create_device(
-    _driver: *mut c_void,
-    _description: *const c_void,
+    _driver: AudioServerPlugInDriverRef,
+    _description: CFDictionaryRef,
     _client_info: *const AudioServerPlugInClientInfo,
     _device_object_id: *mut AudioObjectID,
 ) -> OSStatus {
@@ -222,7 +239,7 @@ unsafe extern "C" fn plugin_create_device(
 }
 
 unsafe extern "C" fn plugin_destroy_device(
-    _driver: *mut c_void,
+    _driver: AudioServerPlugInDriverRef,
     device_object_id: AudioObjectID,
 ) -> OSStatus {
     let mut reg = PLUGIN.object_registry.lock();
@@ -240,7 +257,7 @@ unsafe extern "C" fn plugin_destroy_device(
 }
 
 unsafe extern "C" fn plugin_add_device_client(
-    _driver: *mut c_void,
+    _driver: AudioServerPlugInDriverRef,
     _device_object_id: AudioObjectID,
     _client_info: *const AudioServerPlugInClientInfo,
 ) -> OSStatus {
@@ -248,7 +265,7 @@ unsafe extern "C" fn plugin_add_device_client(
 }
 
 unsafe extern "C" fn plugin_remove_device_client(
-    _driver: *mut c_void,
+    _driver: AudioServerPlugInDriverRef,
     _device_object_id: AudioObjectID,
     _client_info: *const AudioServerPlugInClientInfo,
 ) -> OSStatus {
@@ -260,7 +277,7 @@ unsafe extern "C" fn plugin_remove_device_client(
 // ===========================================================================
 
 unsafe extern "C" fn plugin_perform_device_configuration_change(
-    _driver: *mut c_void,
+    _driver: AudioServerPlugInDriverRef,
     _device_object_id: AudioObjectID,
     change_action: u64,
     _change_info: *const c_void,
@@ -281,7 +298,7 @@ unsafe extern "C" fn plugin_perform_device_configuration_change(
 }
 
 unsafe extern "C" fn plugin_abort_device_configuration_change(
-    _driver: *mut c_void,
+    _driver: AudioServerPlugInDriverRef,
     _device_object_id: AudioObjectID,
     _change_action: u64,
     _change_info: *const c_void,
@@ -301,10 +318,15 @@ enum ObjectType {
     Plugin,
     Device,
     Stream,
+    Control,
 }
 
+const VOLUME_MIN_DECIBELS: Float32 = -96.0;
+const VOLUME_MAX_DECIBELS: Float32 = 0.0;
+
 fn classify_object(object_id: AudioObjectID) -> Option<ObjectType> {
-    if object_id == K_AUDIO_OBJECT_PLUGIN_OBJECT {
+    let runtime_plugin_object_id = runtime_plugin_object_id();
+    if object_id == K_AUDIO_OBJECT_PLUGIN_OBJECT || object_id == runtime_plugin_object_id {
         return Some(ObjectType::Plugin);
     }
     let reg = PLUGIN.object_registry.lock();
@@ -314,7 +336,166 @@ fn classify_object(object_id: AudioObjectID) -> Option<ObjectType> {
     if reg.find_device_by_stream(object_id).is_some() {
         return Some(ObjectType::Stream);
     }
+    if reg.find_device_by_control(object_id).is_some() {
+        return Some(ObjectType::Control);
+    }
     None
+}
+
+fn remember_plugin_object_id(object_id: AudioObjectID) {
+    if object_id != 0 {
+        PLUGIN.plugin_object_id.store(object_id, Ordering::Relaxed);
+    }
+}
+
+fn runtime_plugin_object_id() -> AudioObjectID {
+    match PLUGIN.plugin_object_id.load(Ordering::Relaxed) {
+        0 => K_AUDIO_OBJECT_PLUGIN_OBJECT,
+        object_id => object_id,
+    }
+}
+
+fn class_matches_qualifier(object_class: UInt32, qualifier_class: UInt32) -> bool {
+    match object_class {
+        K_AUDIO_OBJECT_CLASS_ID => qualifier_class == K_AUDIO_OBJECT_CLASS_ID,
+        K_AUDIO_PLUG_IN_CLASS_ID => {
+            matches!(
+                qualifier_class,
+                K_AUDIO_PLUG_IN_CLASS_ID | K_AUDIO_OBJECT_CLASS_ID
+            )
+        }
+        K_AUDIO_DEVICE_CLASS_ID => {
+            matches!(
+                qualifier_class,
+                K_AUDIO_DEVICE_CLASS_ID | K_AUDIO_OBJECT_CLASS_ID
+            )
+        }
+        K_AUDIO_STREAM_CLASS_ID => {
+            matches!(
+                qualifier_class,
+                K_AUDIO_STREAM_CLASS_ID | K_AUDIO_OBJECT_CLASS_ID
+            )
+        }
+        K_AUDIO_CONTROL_CLASS_ID => {
+            matches!(
+                qualifier_class,
+                K_AUDIO_CONTROL_CLASS_ID | K_AUDIO_OBJECT_CLASS_ID
+            )
+        }
+        K_AUDIO_LEVEL_CONTROL_CLASS_ID => matches!(
+            qualifier_class,
+            K_AUDIO_LEVEL_CONTROL_CLASS_ID | K_AUDIO_CONTROL_CLASS_ID | K_AUDIO_OBJECT_CLASS_ID
+        ),
+        K_AUDIO_VOLUME_CONTROL_CLASS_ID => matches!(
+            qualifier_class,
+            K_AUDIO_VOLUME_CONTROL_CLASS_ID
+                | K_AUDIO_LEVEL_CONTROL_CLASS_ID
+                | K_AUDIO_CONTROL_CLASS_ID
+                | K_AUDIO_OBJECT_CLASS_ID
+        ),
+        _ => qualifier_class == object_class || qualifier_class == K_AUDIO_OBJECT_CLASS_ID,
+    }
+}
+
+fn qualifier_allows_class(
+    qualifier_data_size: UInt32,
+    qualifier_data: *const c_void,
+    object_class: UInt32,
+) -> bool {
+    if qualifier_data_size == 0 {
+        return true;
+    }
+    if qualifier_data.is_null()
+        || !(qualifier_data_size as usize).is_multiple_of(size_of::<UInt32>())
+    {
+        return false;
+    }
+
+    let class_count = (qualifier_data_size as usize) / size_of::<UInt32>();
+    // SAFETY: null is rejected above and the host guarantees the qualifier buffer
+    // is valid for `qualifier_data_size` bytes.
+    let qualifier_classes =
+        unsafe { core::slice::from_raw_parts(qualifier_data.cast::<UInt32>(), class_count) };
+
+    qualifier_classes
+        .iter()
+        .copied()
+        .any(|qualifier_class| class_matches_qualifier(object_class, qualifier_class))
+}
+
+fn device_scope_matches_stream(dev: &DeviceObjectInfo, scope: UInt32) -> bool {
+    match scope {
+        K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL => true,
+        K_AUDIO_OBJECT_PROPERTY_SCOPE_INPUT => dev.kind.contains("input"),
+        K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT => !dev.kind.contains("input"),
+        _ => false,
+    }
+}
+
+fn device_supports_volume(dev: &DeviceObjectInfo) -> bool {
+    !dev.kind.contains("input")
+}
+
+fn device_volume_element_matches(dev: &DeviceObjectInfo, element: UInt32) -> bool {
+    element == K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN
+        || (1..=UInt32::from(dev.channels)).contains(&element)
+}
+
+fn device_volume_address_matches(
+    dev: &DeviceObjectInfo,
+    addr: &AudioObjectPropertyAddress,
+) -> bool {
+    device_supports_volume(dev)
+        && matches!(
+            addr.m_scope,
+            K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL | K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT
+        )
+        && device_volume_element_matches(dev, addr.m_element)
+}
+
+fn volume_scalar_to_decibels(volume_scalar: Float32) -> Float32 {
+    if volume_scalar <= 0.0 {
+        VOLUME_MIN_DECIBELS
+    } else {
+        (20.0 * volume_scalar.log10()).clamp(VOLUME_MIN_DECIBELS, VOLUME_MAX_DECIBELS)
+    }
+}
+
+fn volume_decibels_to_scalar(volume_db: Float32) -> Float32 {
+    if volume_db <= VOLUME_MIN_DECIBELS {
+        0.0
+    } else {
+        10.0_f32
+            .powf(volume_db.clamp(VOLUME_MIN_DECIBELS, VOLUME_MAX_DECIBELS) / 20.0)
+            .clamp(0.0, 1.0)
+    }
+}
+
+fn clamp_volume_scalar(volume_scalar: Float32) -> Float32 {
+    volume_scalar.clamp(0.0, 1.0)
+}
+
+fn write_audio_object_ids(
+    ids: &[AudioObjectID],
+    data_size: UInt32,
+    out_data_size: *mut UInt32,
+    data: *mut c_void,
+) -> OSStatus {
+    let byte_len = size_of_val(ids);
+    if byte_len == 0 {
+        // SAFETY: `out_data_size` is guaranteed by the caller.
+        unsafe { *out_data_size = 0 };
+        return K_AUDIO_HARDWARE_NO_ERROR;
+    }
+    if (data_size as usize) < byte_len {
+        return K_AUDIO_HARDWARE_ILLEGAL_OPERATION_ERROR;
+    }
+    // SAFETY: buffer bounds checked above and `ids` is a contiguous slice.
+    unsafe {
+        core::ptr::copy_nonoverlapping(ids.as_ptr(), data.cast::<AudioObjectID>(), ids.len());
+        *out_data_size = byte_len as UInt32;
+    }
+    K_AUDIO_HARDWARE_NO_ERROR
 }
 
 fn plugin_has_property_for(selector: UInt32) -> bool {
@@ -335,13 +516,30 @@ fn plugin_has_property_for(selector: UInt32) -> bool {
     )
 }
 
-fn device_has_property_for(selector: UInt32) -> bool {
+fn device_has_property_for(object_id: AudioObjectID, addr: &AudioObjectPropertyAddress) -> bool {
+    let volume_selector_matches = matches!(
+        addr.m_selector,
+        K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR
+            | K_AUDIO_DEVICE_PROPERTY_VOLUME_DECIBELS
+            | K_AUDIO_DEVICE_PROPERTY_VOLUME_RANGE_DECIBELS
+            | K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR_TO_DECIBELS
+            | K_AUDIO_DEVICE_PROPERTY_VOLUME_DECIBELS_TO_SCALAR
+    );
+    if volume_selector_matches {
+        let reg = PLUGIN.object_registry.lock();
+        let Some(dev) = reg.find_device_by_object(object_id) else {
+            return false;
+        };
+        return device_volume_address_matches(dev, addr);
+    }
+
     matches!(
-        selector,
+        addr.m_selector,
         K_AUDIO_OBJECT_PROPERTY_BASE_CLASS
             | K_AUDIO_OBJECT_PROPERTY_CLASS
             | K_AUDIO_OBJECT_PROPERTY_OWNER
             | K_AUDIO_OBJECT_PROPERTY_OWNED_OBJECTS
+            | K_AUDIO_OBJECT_PROPERTY_CONTROL_LIST
             | K_AUDIO_OBJECT_PROPERTY_NAME
             | K_AUDIO_OBJECT_PROPERTY_MANUFACTURER
             | K_AUDIO_DEVICE_PROPERTY_DEVICE_UID
@@ -381,12 +579,45 @@ fn stream_has_property_for(selector: UInt32) -> bool {
     )
 }
 
+fn control_has_property_for(selector: UInt32) -> bool {
+    matches!(
+        selector,
+        K_AUDIO_OBJECT_PROPERTY_BASE_CLASS
+            | K_AUDIO_OBJECT_PROPERTY_CLASS
+            | K_AUDIO_OBJECT_PROPERTY_OWNER
+            | K_AUDIO_OBJECT_PROPERTY_OWNED_OBJECTS
+            | K_AUDIO_OBJECT_PROPERTY_NAME
+            | K_AUDIO_OBJECT_PROPERTY_MANUFACTURER
+            | K_AUDIO_CONTROL_PROPERTY_SCOPE
+            | K_AUDIO_CONTROL_PROPERTY_ELEMENT
+            | K_AUDIO_LEVEL_CONTROL_PROPERTY_SCALAR_VALUE
+            | K_AUDIO_LEVEL_CONTROL_PROPERTY_DECIBEL_VALUE
+            | K_AUDIO_LEVEL_CONTROL_PROPERTY_DECIBEL_RANGE
+            | K_AUDIO_LEVEL_CONTROL_PROPERTY_CONVERT_SCALAR_TO_DECIBELS
+            | K_AUDIO_LEVEL_CONTROL_PROPERTY_CONVERT_DECIBELS_TO_SCALAR
+    )
+}
+
+fn resolve_property_object(object_id: AudioObjectID, selector: UInt32) -> Option<ObjectType> {
+    if let Some(object_type) = classify_object(object_id) {
+        if object_type == ObjectType::Plugin {
+            remember_plugin_object_id(object_id);
+        }
+        return Some(object_type);
+    }
+    if plugin_has_property_for(selector) {
+        remember_plugin_object_id(object_id);
+        return Some(ObjectType::Plugin);
+    }
+    None
+}
+
 // ===========================================================================
 // Property operations
 // ===========================================================================
 
 unsafe extern "C" fn plugin_has_property(
-    _driver: *mut c_void,
+    _driver: AudioServerPlugInDriverRef,
     object_id: AudioObjectID,
     _client_process_id: i32,
     address: *const AudioObjectPropertyAddress,
@@ -396,17 +627,19 @@ unsafe extern "C" fn plugin_has_property(
     }
     // SAFETY: `address` is non-null, provided by the host.
     let addr = unsafe { &*address };
-    let has = match classify_object(object_id) {
+    let resolved = resolve_property_object(object_id, addr.m_selector);
+    let has = match resolved {
         Some(ObjectType::Plugin) => plugin_has_property_for(addr.m_selector),
-        Some(ObjectType::Device) => device_has_property_for(addr.m_selector),
+        Some(ObjectType::Device) => device_has_property_for(object_id, addr),
         Some(ObjectType::Stream) => stream_has_property_for(addr.m_selector),
+        Some(ObjectType::Control) => control_has_property_for(addr.m_selector),
         None => false,
     };
     if has { 1 } else { 0 }
 }
 
 unsafe extern "C" fn plugin_is_property_settable(
-    _driver: *mut c_void,
+    _driver: AudioServerPlugInDriverRef,
     object_id: AudioObjectID,
     _client_process_id: i32,
     address: *const AudioObjectPropertyAddress,
@@ -418,12 +651,30 @@ unsafe extern "C" fn plugin_is_property_settable(
     // SAFETY: `address` is non-null, provided by the host.
     let addr = unsafe { &*address };
 
-    let settable = match classify_object(object_id) {
+    let resolved = resolve_property_object(object_id, addr.m_selector);
+    let settable = match resolved {
         Some(ObjectType::Plugin) => addr.m_selector == K_MARS_PROPERTY_DESIRED_STATE,
-        Some(ObjectType::Device) => addr.m_selector == K_AUDIO_DEVICE_PROPERTY_NOMINAL_SAMPLE_RATE,
+        Some(ObjectType::Device) => {
+            addr.m_selector == K_AUDIO_DEVICE_PROPERTY_NOMINAL_SAMPLE_RATE
+                || (matches!(
+                    addr.m_selector,
+                    K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR | K_AUDIO_DEVICE_PROPERTY_VOLUME_DECIBELS
+                ) && {
+                    let reg = PLUGIN.object_registry.lock();
+                    let Some(dev) = reg.find_device_by_object(object_id) else {
+                        return K_AUDIO_HARDWARE_BAD_OBJECT_ERROR;
+                    };
+                    device_volume_address_matches(dev, addr)
+                })
+        }
         Some(ObjectType::Stream) => matches!(
             addr.m_selector,
             K_AUDIO_STREAM_PROPERTY_VIRTUAL_FORMAT | K_AUDIO_STREAM_PROPERTY_PHYSICAL_FORMAT
+        ),
+        Some(ObjectType::Control) => matches!(
+            addr.m_selector,
+            K_AUDIO_LEVEL_CONTROL_PROPERTY_SCALAR_VALUE
+                | K_AUDIO_LEVEL_CONTROL_PROPERTY_DECIBEL_VALUE
         ),
         None => return K_AUDIO_HARDWARE_BAD_OBJECT_ERROR,
     };
@@ -434,12 +685,12 @@ unsafe extern "C" fn plugin_is_property_settable(
 }
 
 unsafe extern "C" fn plugin_get_property_data_size(
-    _driver: *mut c_void,
+    _driver: AudioServerPlugInDriverRef,
     object_id: AudioObjectID,
     _client_process_id: i32,
     address: *const AudioObjectPropertyAddress,
-    _qualifier_data_size: UInt32,
-    _qualifier_data: *const c_void,
+    qualifier_data_size: UInt32,
+    qualifier_data: *const c_void,
     data_size: *mut UInt32,
 ) -> OSStatus {
     if address.is_null() || data_size.is_null() {
@@ -448,10 +699,16 @@ unsafe extern "C" fn plugin_get_property_data_size(
     // SAFETY: `address` is non-null, provided by the host.
     let addr = unsafe { &*address };
 
-    let size = match classify_object(object_id) {
-        Some(ObjectType::Plugin) => plugin_property_data_size(addr.m_selector),
-        Some(ObjectType::Device) => device_property_data_size(object_id, addr.m_selector),
+    let resolved = resolve_property_object(object_id, addr.m_selector);
+    let size = match resolved {
+        Some(ObjectType::Plugin) => {
+            plugin_property_data_size(addr.m_selector, qualifier_data_size, qualifier_data)
+        }
+        Some(ObjectType::Device) => {
+            device_property_data_size(object_id, addr, qualifier_data_size, qualifier_data)
+        }
         Some(ObjectType::Stream) => stream_property_data_size(addr.m_selector),
+        Some(ObjectType::Control) => control_property_data_size(addr.m_selector),
         None => return K_AUDIO_HARDWARE_BAD_OBJECT_ERROR,
     };
 
@@ -466,12 +723,12 @@ unsafe extern "C" fn plugin_get_property_data_size(
 }
 
 unsafe extern "C" fn plugin_get_property_data(
-    _driver: *mut c_void,
+    _driver: AudioServerPlugInDriverRef,
     object_id: AudioObjectID,
     _client_process_id: i32,
     address: *const AudioObjectPropertyAddress,
-    _qualifier_data_size: UInt32,
-    _qualifier_data: *const c_void,
+    qualifier_data_size: UInt32,
+    qualifier_data: *const c_void,
     data_size: UInt32,
     out_data_size: *mut UInt32,
     data: *mut c_void,
@@ -481,19 +738,35 @@ unsafe extern "C" fn plugin_get_property_data(
     }
     // SAFETY: `address` is non-null, provided by the host.
     let addr = unsafe { &*address };
+    let resolved = resolve_property_object(object_id, addr.m_selector);
 
     // SAFETY: all pointer arguments have been validated above; callee contracts
     // are satisfied by the host-provided buffer.
+
     unsafe {
-        match classify_object(object_id) {
-            Some(ObjectType::Plugin) => {
-                plugin_get_property(addr.m_selector, data_size, out_data_size, data)
-            }
-            Some(ObjectType::Device) => {
-                device_get_property(object_id, addr, data_size, out_data_size, data)
-            }
+        match resolved {
+            Some(ObjectType::Plugin) => plugin_get_property(
+                addr.m_selector,
+                qualifier_data_size,
+                qualifier_data,
+                data_size,
+                out_data_size,
+                data,
+            ),
+            Some(ObjectType::Device) => device_get_property(
+                object_id,
+                addr,
+                qualifier_data_size,
+                qualifier_data,
+                data_size,
+                out_data_size,
+                data,
+            ),
             Some(ObjectType::Stream) => {
                 stream_get_property(object_id, addr, data_size, out_data_size, data)
+            }
+            Some(ObjectType::Control) => {
+                control_get_property(object_id, addr, data_size, out_data_size, data)
             }
             None => K_AUDIO_HARDWARE_BAD_OBJECT_ERROR,
         }
@@ -501,7 +774,7 @@ unsafe extern "C" fn plugin_get_property_data(
 }
 
 unsafe extern "C" fn plugin_set_property_data(
-    _driver: *mut c_void,
+    _driver: AudioServerPlugInDriverRef,
     object_id: AudioObjectID,
     _client_process_id: i32,
     address: *const AudioObjectPropertyAddress,
@@ -516,7 +789,9 @@ unsafe extern "C" fn plugin_set_property_data(
     // SAFETY: `address` is non-null, provided by the host.
     let addr = unsafe { &*address };
 
-    match classify_object(object_id) {
+    let resolved = resolve_property_object(object_id, addr.m_selector);
+
+    match resolved {
         Some(ObjectType::Plugin) => {
             if addr.m_selector == K_MARS_PROPERTY_DESIRED_STATE {
                 // SAFETY: `data` is non-null (checked above) and points to `data_size` bytes.
@@ -525,8 +800,169 @@ unsafe extern "C" fn plugin_set_property_data(
                 K_AUDIO_HARDWARE_UNKNOWN_PROPERTY_ERROR
             }
         }
-        _ => K_AUDIO_HARDWARE_UNSUPPORTED_OPERATION_ERROR,
+        Some(ObjectType::Device) => unsafe {
+            device_set_property(object_id, addr, data_size, data)
+        },
+        Some(ObjectType::Control) => unsafe {
+            control_set_property(object_id, addr, data_size, data)
+        },
+        Some(ObjectType::Stream) => K_AUDIO_HARDWARE_UNSUPPORTED_OPERATION_ERROR,
+        None => K_AUDIO_HARDWARE_BAD_OBJECT_ERROR,
     }
+}
+
+fn notify_properties_changed_for_object(
+    object_id: AudioObjectID,
+    addresses: &[AudioObjectPropertyAddress],
+) {
+    let host_guard = PLUGIN.host.lock();
+    let Some(host) = *host_guard else {
+        return;
+    };
+    // SAFETY: `host` is a valid AudioServerPlugInHostRef from coreaudiod and the
+    // address slice lives for the duration of the call.
+    unsafe {
+        ((*host).properties_changed)(
+            host,
+            object_id,
+            addresses.len() as UInt32,
+            addresses.as_ptr(),
+        );
+    }
+}
+
+fn notify_volume_changed(device_id: AudioObjectID, control_id: AudioObjectID, element: UInt32) {
+    let mut device_addresses =
+        Vec::with_capacity(if element == K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN {
+            2
+        } else {
+            4
+        });
+    device_addresses.push(AudioObjectPropertyAddress {
+        m_selector: K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR,
+        m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+        m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    });
+    device_addresses.push(AudioObjectPropertyAddress {
+        m_selector: K_AUDIO_DEVICE_PROPERTY_VOLUME_DECIBELS,
+        m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+        m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    });
+    if element != K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN {
+        device_addresses.push(AudioObjectPropertyAddress {
+            m_selector: K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+            m_element: element,
+        });
+        device_addresses.push(AudioObjectPropertyAddress {
+            m_selector: K_AUDIO_DEVICE_PROPERTY_VOLUME_DECIBELS,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+            m_element: element,
+        });
+    }
+    notify_properties_changed_for_object(device_id, &device_addresses);
+
+    let control_addresses = [
+        AudioObjectPropertyAddress {
+            m_selector: K_AUDIO_LEVEL_CONTROL_PROPERTY_SCALAR_VALUE,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        },
+        AudioObjectPropertyAddress {
+            m_selector: K_AUDIO_LEVEL_CONTROL_PROPERTY_DECIBEL_VALUE,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        },
+    ];
+    notify_properties_changed_for_object(control_id, &control_addresses);
+}
+
+fn set_device_volume_scalar(
+    object_id: AudioObjectID,
+    addr: &AudioObjectPropertyAddress,
+    new_scalar: Float32,
+) -> Result<(AudioObjectID, AudioObjectID), OSStatus> {
+    let mut reg = PLUGIN.object_registry.lock();
+    let Some(dev) = reg.find_device_by_object_mut(object_id) else {
+        return Err(K_AUDIO_HARDWARE_BAD_OBJECT_ERROR);
+    };
+    if !device_volume_address_matches(dev, addr) {
+        return Err(K_AUDIO_HARDWARE_UNKNOWN_PROPERTY_ERROR);
+    }
+    let Some(control_id) = dev.volume_control_id else {
+        return Err(K_AUDIO_HARDWARE_UNKNOWN_PROPERTY_ERROR);
+    };
+    dev.volume_scalar = clamp_volume_scalar(new_scalar);
+    Ok((dev.device_id, control_id))
+}
+
+fn set_control_volume_scalar(
+    object_id: AudioObjectID,
+    new_scalar: Float32,
+) -> Result<(AudioObjectID, AudioObjectID), OSStatus> {
+    let mut reg = PLUGIN.object_registry.lock();
+    let Some(dev) = reg.find_device_by_control_mut(object_id) else {
+        return Err(K_AUDIO_HARDWARE_BAD_OBJECT_ERROR);
+    };
+    let Some(control_id) = dev.volume_control_id else {
+        return Err(K_AUDIO_HARDWARE_UNKNOWN_PROPERTY_ERROR);
+    };
+    dev.volume_scalar = clamp_volume_scalar(new_scalar);
+    Ok((dev.device_id, control_id))
+}
+
+unsafe fn device_set_property(
+    object_id: AudioObjectID,
+    addr: &AudioObjectPropertyAddress,
+    data_size: UInt32,
+    data: *const c_void,
+) -> OSStatus {
+    if (data_size as usize) < size_of::<Float32>() {
+        return K_AUDIO_HARDWARE_ILLEGAL_OPERATION_ERROR;
+    }
+    // SAFETY: size checked above and caller guarantees readability for `data_size` bytes.
+    let input = unsafe { core::ptr::read_unaligned(data.cast::<Float32>()) };
+    let set_result = match addr.m_selector {
+        K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR => set_device_volume_scalar(object_id, addr, input),
+        K_AUDIO_DEVICE_PROPERTY_VOLUME_DECIBELS => {
+            set_device_volume_scalar(object_id, addr, volume_decibels_to_scalar(input))
+        }
+        _ => return K_AUDIO_HARDWARE_UNSUPPORTED_OPERATION_ERROR,
+    };
+
+    let (device_id, control_id) = match set_result {
+        Ok(ids) => ids,
+        Err(status) => return status,
+    };
+    notify_volume_changed(device_id, control_id, addr.m_element);
+    K_AUDIO_HARDWARE_NO_ERROR
+}
+
+unsafe fn control_set_property(
+    object_id: AudioObjectID,
+    addr: &AudioObjectPropertyAddress,
+    data_size: UInt32,
+    data: *const c_void,
+) -> OSStatus {
+    if (data_size as usize) < size_of::<Float32>() {
+        return K_AUDIO_HARDWARE_ILLEGAL_OPERATION_ERROR;
+    }
+    // SAFETY: size checked above and caller guarantees readability for `data_size` bytes.
+    let input = unsafe { core::ptr::read_unaligned(data.cast::<Float32>()) };
+    let set_result = match addr.m_selector {
+        K_AUDIO_LEVEL_CONTROL_PROPERTY_SCALAR_VALUE => set_control_volume_scalar(object_id, input),
+        K_AUDIO_LEVEL_CONTROL_PROPERTY_DECIBEL_VALUE => {
+            set_control_volume_scalar(object_id, volume_decibels_to_scalar(input))
+        }
+        _ => return K_AUDIO_HARDWARE_UNSUPPORTED_OPERATION_ERROR,
+    };
+
+    let (device_id, control_id) = match set_result {
+        Ok(ids) => ids,
+        Err(status) => return status,
+    };
+    notify_volume_changed(device_id, control_id, K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN);
+    K_AUDIO_HARDWARE_NO_ERROR
 }
 
 // ===========================================================================
@@ -534,8 +970,9 @@ unsafe extern "C" fn plugin_set_property_data(
 // ===========================================================================
 
 unsafe extern "C" fn plugin_start_io(
-    _driver: *mut c_void,
+    _driver: AudioServerPlugInDriverRef,
     device_object_id: AudioObjectID,
+    _client_id: UInt32,
 ) -> OSStatus {
     // Read device info, then drop the registry lock before acquiring DRIVER_STATE
     // to maintain consistent lock ordering (DRIVER_STATE → object_registry) and
@@ -579,8 +1016,9 @@ unsafe extern "C" fn plugin_start_io(
 }
 
 unsafe extern "C" fn plugin_stop_io(
-    _driver: *mut c_void,
+    _driver: AudioServerPlugInDriverRef,
     device_object_id: AudioObjectID,
+    _client_id: UInt32,
 ) -> OSStatus {
     let mut reg = PLUGIN.object_registry.lock();
     if let Some(dev) = reg.find_device_by_object_mut(device_object_id) {
@@ -591,8 +1029,9 @@ unsafe extern "C" fn plugin_stop_io(
 }
 
 unsafe extern "C" fn plugin_get_zero_time_stamp(
-    _driver: *mut c_void,
+    _driver: AudioServerPlugInDriverRef,
     device_object_id: AudioObjectID,
+    _client_id: UInt32,
     out_sample_time: *mut Float64,
     out_host_time: *mut u64,
     out_seed: *mut u64,
@@ -622,14 +1061,14 @@ unsafe extern "C" fn plugin_get_zero_time_stamp(
 }
 
 unsafe extern "C" fn plugin_will_do_io_operation(
-    _driver: *mut c_void,
+    _driver: AudioServerPlugInDriverRef,
     _device_object_id: AudioObjectID,
     _client_id: UInt32,
     operation_id: UInt32,
     will_do: *mut Boolean,
-    is_input: *mut Boolean,
+    will_do_in_place: *mut Boolean,
 ) -> OSStatus {
-    if will_do.is_null() || is_input.is_null() {
+    if will_do.is_null() || will_do_in_place.is_null() {
         return K_AUDIO_HARDWARE_ILLEGAL_OPERATION_ERROR;
     }
     // SAFETY: output pointers are non-null.
@@ -641,17 +1080,13 @@ unsafe extern "C" fn plugin_will_do_io_operation(
         } else {
             0
         };
-        *is_input = if operation_id == K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_READ_INPUT {
-            1
-        } else {
-            0
-        };
+        *will_do_in_place = 1;
     }
     K_AUDIO_HARDWARE_NO_ERROR
 }
 
 unsafe extern "C" fn plugin_begin_io_operation(
-    _driver: *mut c_void,
+    _driver: AudioServerPlugInDriverRef,
     _device_object_id: AudioObjectID,
     _client_id: UInt32,
     _operation_id: UInt32,
@@ -662,7 +1097,7 @@ unsafe extern "C" fn plugin_begin_io_operation(
 }
 
 unsafe extern "C" fn plugin_do_io_operation(
-    _driver: *mut c_void,
+    _driver: AudioServerPlugInDriverRef,
     device_object_id: AudioObjectID,
     _stream_object_id: AudioObjectID,
     _client_id: UInt32,
@@ -679,6 +1114,7 @@ unsafe extern "C" fn plugin_do_io_operation(
     let uid = dev.uid.clone();
     let channels = dev.channels as usize;
     let is_input = dev.kind.contains("input");
+    let volume_scalar = dev.volume_scalar;
     drop(reg);
 
     let direction = if is_input {
@@ -702,6 +1138,11 @@ unsafe extern "C" fn plugin_do_io_operation(
             let before = ring.header().ok();
             if operation_id == K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_WRITE_MIX {
                 // VOut: host wrote mixed audio into buffer -> push to SHM ring.
+                if !is_input && volume_scalar != 1.0 {
+                    for sample in buffer.iter_mut() {
+                        *sample *= volume_scalar;
+                    }
+                }
                 if ring.write_interleaved(buffer).is_err() {
                     overrun_delta = overrun_delta.saturating_add(1);
                     xrun_delta = xrun_delta.saturating_add(1);
@@ -769,7 +1210,7 @@ unsafe extern "C" fn plugin_do_io_operation(
 }
 
 unsafe extern "C" fn plugin_end_io_operation(
-    _driver: *mut c_void,
+    _driver: AudioServerPlugInDriverRef,
     _device_object_id: AudioObjectID,
     _client_id: UInt32,
     _operation_id: UInt32,
@@ -783,7 +1224,11 @@ unsafe extern "C" fn plugin_end_io_operation(
 // Property data — Plugin object
 // ===========================================================================
 
-fn plugin_property_data_size(selector: UInt32) -> Option<UInt32> {
+fn plugin_property_data_size(
+    selector: UInt32,
+    qualifier_data_size: UInt32,
+    qualifier_data: *const c_void,
+) -> Option<UInt32> {
     Some(match selector {
         K_AUDIO_OBJECT_PROPERTY_BASE_CLASS | K_AUDIO_OBJECT_PROPERTY_CLASS => {
             size_of::<UInt32>() as UInt32
@@ -792,7 +1237,20 @@ fn plugin_property_data_size(selector: UInt32) -> Option<UInt32> {
         K_AUDIO_PLUG_IN_PROPERTY_BUNDLE_ID | K_AUDIO_PLUG_IN_PROPERTY_RESOURCE_BUNDLE => {
             size_of::<*const c_void>() as UInt32 // CFStringRef
         }
-        K_AUDIO_OBJECT_PROPERTY_OWNED_OBJECTS | K_AUDIO_PLUG_IN_PROPERTY_DEVICE_LIST => {
+        K_AUDIO_OBJECT_PROPERTY_OWNED_OBJECTS => {
+            let count = if qualifier_allows_class(
+                qualifier_data_size,
+                qualifier_data,
+                K_AUDIO_DEVICE_CLASS_ID,
+            ) {
+                let reg = PLUGIN.object_registry.lock();
+                reg.devices.len()
+            } else {
+                0
+            };
+            (count * size_of::<AudioObjectID>()) as UInt32
+        }
+        K_AUDIO_PLUG_IN_PROPERTY_DEVICE_LIST => {
             let reg = PLUGIN.object_registry.lock();
             (reg.devices.len() * size_of::<AudioObjectID>()) as UInt32
         }
@@ -817,6 +1275,8 @@ fn plugin_property_data_size(selector: UInt32) -> Option<UInt32> {
 /// `out_data_size` must be a valid pointer.
 unsafe fn plugin_get_property(
     selector: UInt32,
+    qualifier_data_size: UInt32,
+    qualifier_data: *const c_void,
     data_size: UInt32,
     out_data_size: *mut UInt32,
     data: *mut c_void,
@@ -837,44 +1297,48 @@ unsafe fn plugin_get_property(
         K_AUDIO_PLUG_IN_PROPERTY_RESOURCE_BUNDLE => unsafe {
             write_cfstring("", data_size, out_data_size, data)
         },
-        K_AUDIO_OBJECT_PROPERTY_OWNED_OBJECTS | K_AUDIO_PLUG_IN_PROPERTY_DEVICE_LIST => {
+        K_AUDIO_OBJECT_PROPERTY_OWNED_OBJECTS => {
+            let ids = if qualifier_allows_class(
+                qualifier_data_size,
+                qualifier_data,
+                K_AUDIO_DEVICE_CLASS_ID,
+            ) {
+                let reg = PLUGIN.object_registry.lock();
+                reg.all_device_ids()
+            } else {
+                Vec::new()
+            };
+            write_audio_object_ids(&ids, data_size, out_data_size, data)
+        }
+        K_AUDIO_PLUG_IN_PROPERTY_DEVICE_LIST => {
             let reg = PLUGIN.object_registry.lock();
             let ids = reg.all_device_ids();
-            let byte_len = ids.len() * size_of::<AudioObjectID>();
-            if (data_size as usize) < byte_len {
-                return K_AUDIO_HARDWARE_ILLEGAL_OPERATION_ERROR;
-            }
-            // SAFETY: buffer bounds checked above, ids is a contiguous slice.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    ids.as_ptr(),
-                    data.cast::<AudioObjectID>(),
-                    ids.len(),
-                );
-                *out_data_size = byte_len as UInt32;
-            }
-            K_AUDIO_HARDWARE_NO_ERROR
+            write_audio_object_ids(&ids, data_size, out_data_size, data)
         }
         K_AUDIO_OBJECT_PROPERTY_CUSTOM_PROPERTY_INFO_LIST => {
             let infos = [
                 AudioServerPlugInCustomPropertyInfo {
                     m_selector: K_MARS_PROPERTY_DESIRED_STATE,
-                    m_property_data_type: K_AUDIO_SERVER_PLUG_IN_CUSTOM_PROPERTY_DATA_TYPE_CFDATA,
+                    m_property_data_type:
+                        K_AUDIO_SERVER_PLUG_IN_CUSTOM_PROPERTY_DATA_TYPE_CFPROPERTYLIST,
                     m_qualifier_data_type: K_AUDIO_SERVER_PLUG_IN_CUSTOM_PROPERTY_DATA_TYPE_NONE,
                 },
                 AudioServerPlugInCustomPropertyInfo {
                     m_selector: K_MARS_PROPERTY_APPLIED_STATE,
-                    m_property_data_type: K_AUDIO_SERVER_PLUG_IN_CUSTOM_PROPERTY_DATA_TYPE_CFDATA,
+                    m_property_data_type:
+                        K_AUDIO_SERVER_PLUG_IN_CUSTOM_PROPERTY_DATA_TYPE_CFPROPERTYLIST,
                     m_qualifier_data_type: K_AUDIO_SERVER_PLUG_IN_CUSTOM_PROPERTY_DATA_TYPE_NONE,
                 },
                 AudioServerPlugInCustomPropertyInfo {
                     m_selector: K_MARS_PROPERTY_RUNTIME_STATS,
-                    m_property_data_type: K_AUDIO_SERVER_PLUG_IN_CUSTOM_PROPERTY_DATA_TYPE_CFDATA,
+                    m_property_data_type:
+                        K_AUDIO_SERVER_PLUG_IN_CUSTOM_PROPERTY_DATA_TYPE_CFPROPERTYLIST,
                     m_qualifier_data_type: K_AUDIO_SERVER_PLUG_IN_CUSTOM_PROPERTY_DATA_TYPE_NONE,
                 },
                 AudioServerPlugInCustomPropertyInfo {
                     m_selector: K_MARS_PROPERTY_CONFIG_SUMMARY,
-                    m_property_data_type: K_AUDIO_SERVER_PLUG_IN_CUSTOM_PROPERTY_DATA_TYPE_CFDATA,
+                    m_property_data_type:
+                        K_AUDIO_SERVER_PLUG_IN_CUSTOM_PROPERTY_DATA_TYPE_CFPROPERTYLIST,
                     m_qualifier_data_type: K_AUDIO_SERVER_PLUG_IN_CUSTOM_PROPERTY_DATA_TYPE_NONE,
                 },
             ];
@@ -935,8 +1399,38 @@ unsafe fn plugin_get_property(
 // Property data — Device object
 // ===========================================================================
 
-fn device_property_data_size(object_id: AudioObjectID, selector: UInt32) -> Option<UInt32> {
-    Some(match selector {
+fn device_owned_object_ids(
+    dev: &DeviceObjectInfo,
+    qualifier_data_size: UInt32,
+    qualifier_data: *const c_void,
+) -> Vec<AudioObjectID> {
+    let mut ids = Vec::with_capacity(2);
+    if qualifier_allows_class(qualifier_data_size, qualifier_data, K_AUDIO_STREAM_CLASS_ID) {
+        ids.push(dev.stream_id);
+    }
+    if let Some(control_id) = dev.volume_control_id.filter(|_| {
+        qualifier_allows_class(
+            qualifier_data_size,
+            qualifier_data,
+            K_AUDIO_VOLUME_CONTROL_CLASS_ID,
+        )
+    }) {
+        ids.push(control_id);
+    }
+    ids
+}
+
+fn volume_control_name(dev: &DeviceObjectInfo) -> String {
+    format!("{} Volume", dev.name)
+}
+
+fn device_property_data_size(
+    object_id: AudioObjectID,
+    addr: &AudioObjectPropertyAddress,
+    qualifier_data_size: UInt32,
+    qualifier_data: *const c_void,
+) -> Option<UInt32> {
+    Some(match addr.m_selector {
         K_AUDIO_OBJECT_PROPERTY_BASE_CLASS | K_AUDIO_OBJECT_PROPERTY_CLASS => {
             size_of::<UInt32>() as UInt32
         }
@@ -961,9 +1455,57 @@ fn device_property_data_size(object_id: AudioObjectID, selector: UInt32) -> Opti
         K_AUDIO_DEVICE_PROPERTY_AVAILABLE_NOMINAL_SAMPLE_RATES => {
             size_of::<AudioValueRange>() as UInt32
         }
-        K_AUDIO_OBJECT_PROPERTY_OWNED_OBJECTS | K_AUDIO_DEVICE_PROPERTY_STREAMS => {
+        K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR
+        | K_AUDIO_DEVICE_PROPERTY_VOLUME_DECIBELS
+        | K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR_TO_DECIBELS
+        | K_AUDIO_DEVICE_PROPERTY_VOLUME_DECIBELS_TO_SCALAR => {
             let reg = PLUGIN.object_registry.lock();
-            if reg.find_device_by_object(object_id).is_some() {
+            let Some(dev) = reg.find_device_by_object(object_id) else {
+                return Some(0);
+            };
+            if device_volume_address_matches(dev, addr) {
+                size_of::<Float32>() as UInt32
+            } else {
+                0
+            }
+        }
+        K_AUDIO_DEVICE_PROPERTY_VOLUME_RANGE_DECIBELS => {
+            let reg = PLUGIN.object_registry.lock();
+            let Some(dev) = reg.find_device_by_object(object_id) else {
+                return Some(0);
+            };
+            if device_volume_address_matches(dev, addr) {
+                size_of::<AudioValueRange>() as UInt32
+            } else {
+                0
+            }
+        }
+        K_AUDIO_OBJECT_PROPERTY_OWNED_OBJECTS => {
+            let reg = PLUGIN.object_registry.lock();
+            let Some(dev) = reg.find_device_by_object(object_id) else {
+                return Some(0);
+            };
+            (device_owned_object_ids(dev, qualifier_data_size, qualifier_data).len()
+                * size_of::<AudioObjectID>()) as UInt32
+        }
+        K_AUDIO_DEVICE_PROPERTY_STREAMS => {
+            let reg = PLUGIN.object_registry.lock();
+            if let Some(dev) = reg.find_device_by_object(object_id) {
+                if device_scope_matches_stream(dev, addr.m_scope) {
+                    size_of::<AudioObjectID>() as UInt32
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        }
+        K_AUDIO_OBJECT_PROPERTY_CONTROL_LIST => {
+            let reg = PLUGIN.object_registry.lock();
+            let Some(dev) = reg.find_device_by_object(object_id) else {
+                return Some(0);
+            };
+            if dev.volume_control_id.is_some() {
                 size_of::<AudioObjectID>() as UInt32
             } else {
                 0
@@ -983,6 +1525,8 @@ fn device_property_data_size(object_id: AudioObjectID, selector: UInt32) -> Opti
 unsafe fn device_get_property(
     object_id: AudioObjectID,
     addr: &AudioObjectPropertyAddress,
+    qualifier_data_size: UInt32,
+    qualifier_data: *const c_void,
     data_size: UInt32,
     out_data_size: *mut UInt32,
     data: *mut c_void,
@@ -1008,7 +1552,7 @@ unsafe fn device_get_property(
             write_val::<UInt32>(K_AUDIO_DEVICE_CLASS_ID, data_size, out_data_size, data)
         },
         K_AUDIO_OBJECT_PROPERTY_OWNER => unsafe {
-            write_val::<AudioObjectID>(K_AUDIO_OBJECT_PLUGIN_OBJECT, data_size, out_data_size, data)
+            write_val::<AudioObjectID>(runtime_plugin_object_id(), data_size, out_data_size, data)
         },
         K_AUDIO_OBJECT_PROPERTY_NAME => unsafe {
             write_cfstring(&dev.name, data_size, out_data_size, data)
@@ -1072,9 +1616,87 @@ unsafe fn device_get_property(
             };
             unsafe { write_val::<AudioValueRange>(range, data_size, out_data_size, data) }
         }
-        K_AUDIO_OBJECT_PROPERTY_OWNED_OBJECTS | K_AUDIO_DEVICE_PROPERTY_STREAMS => unsafe {
-            write_val::<AudioObjectID>(stream_id, data_size, out_data_size, data)
-        },
+        K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR => {
+            if !device_volume_address_matches(&dev, addr) {
+                return K_AUDIO_HARDWARE_UNKNOWN_PROPERTY_ERROR;
+            }
+            unsafe { write_val::<Float32>(dev.volume_scalar, data_size, out_data_size, data) }
+        }
+        K_AUDIO_DEVICE_PROPERTY_VOLUME_DECIBELS => {
+            if !device_volume_address_matches(&dev, addr) {
+                return K_AUDIO_HARDWARE_UNKNOWN_PROPERTY_ERROR;
+            }
+            unsafe {
+                write_val::<Float32>(
+                    volume_scalar_to_decibels(dev.volume_scalar),
+                    data_size,
+                    out_data_size,
+                    data,
+                )
+            }
+        }
+        K_AUDIO_DEVICE_PROPERTY_VOLUME_RANGE_DECIBELS => {
+            if !device_volume_address_matches(&dev, addr) {
+                return K_AUDIO_HARDWARE_UNKNOWN_PROPERTY_ERROR;
+            }
+            let range = AudioValueRange {
+                m_minimum: VOLUME_MIN_DECIBELS as Float64,
+                m_maximum: VOLUME_MAX_DECIBELS as Float64,
+            };
+            unsafe { write_val::<AudioValueRange>(range, data_size, out_data_size, data) }
+        }
+        K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR_TO_DECIBELS => {
+            if !device_volume_address_matches(&dev, addr) {
+                return K_AUDIO_HARDWARE_UNKNOWN_PROPERTY_ERROR;
+            }
+            if (data_size as usize) < size_of::<Float32>() {
+                return K_AUDIO_HARDWARE_ILLEGAL_OPERATION_ERROR;
+            }
+            // SAFETY: buffer size checked above.
+            let input = unsafe { core::ptr::read_unaligned(data.cast::<Float32>()) };
+            unsafe {
+                write_val::<Float32>(
+                    volume_scalar_to_decibels(clamp_volume_scalar(input)),
+                    data_size,
+                    out_data_size,
+                    data,
+                )
+            }
+        }
+        K_AUDIO_DEVICE_PROPERTY_VOLUME_DECIBELS_TO_SCALAR => {
+            if !device_volume_address_matches(&dev, addr) {
+                return K_AUDIO_HARDWARE_UNKNOWN_PROPERTY_ERROR;
+            }
+            if (data_size as usize) < size_of::<Float32>() {
+                return K_AUDIO_HARDWARE_ILLEGAL_OPERATION_ERROR;
+            }
+            // SAFETY: buffer size checked above.
+            let input = unsafe { core::ptr::read_unaligned(data.cast::<Float32>()) };
+            unsafe {
+                write_val::<Float32>(
+                    volume_decibels_to_scalar(input),
+                    data_size,
+                    out_data_size,
+                    data,
+                )
+            }
+        }
+        K_AUDIO_OBJECT_PROPERTY_OWNED_OBJECTS => {
+            let ids = device_owned_object_ids(&dev, qualifier_data_size, qualifier_data);
+            write_audio_object_ids(&ids, data_size, out_data_size, data)
+        }
+        K_AUDIO_DEVICE_PROPERTY_STREAMS => {
+            let ids = if device_scope_matches_stream(&dev, addr.m_scope) {
+                vec![stream_id]
+            } else {
+                Vec::new()
+            };
+            write_audio_object_ids(&ids, data_size, out_data_size, data)
+        }
+        K_AUDIO_OBJECT_PROPERTY_CONTROL_LIST => {
+            let ids = dev.volume_control_id.into_iter().collect::<Vec<_>>();
+            write_audio_object_ids(&ids, data_size, out_data_size, data)
+        }
         K_AUDIO_DEVICE_PROPERTY_PREFERRED_CHANNELS_FOR_STEREO => {
             let channels: [UInt32; 2] = [1, 2];
             let byte_len = size_of_val(&channels);
@@ -1087,6 +1709,139 @@ unsafe fn device_get_property(
                 *out_data_size = byte_len as UInt32;
             }
             K_AUDIO_HARDWARE_NO_ERROR
+        }
+        _ => K_AUDIO_HARDWARE_UNKNOWN_PROPERTY_ERROR,
+    }
+}
+
+fn control_property_data_size(selector: UInt32) -> Option<UInt32> {
+    Some(match selector {
+        K_AUDIO_OBJECT_PROPERTY_BASE_CLASS
+        | K_AUDIO_OBJECT_PROPERTY_CLASS
+        | K_AUDIO_OBJECT_PROPERTY_OWNER
+        | K_AUDIO_CONTROL_PROPERTY_SCOPE
+        | K_AUDIO_CONTROL_PROPERTY_ELEMENT => size_of::<UInt32>() as UInt32,
+        K_AUDIO_OBJECT_PROPERTY_OWNED_OBJECTS => 0,
+        K_AUDIO_OBJECT_PROPERTY_NAME | K_AUDIO_OBJECT_PROPERTY_MANUFACTURER => {
+            size_of::<*const c_void>() as UInt32
+        }
+        K_AUDIO_LEVEL_CONTROL_PROPERTY_SCALAR_VALUE
+        | K_AUDIO_LEVEL_CONTROL_PROPERTY_DECIBEL_VALUE
+        | K_AUDIO_LEVEL_CONTROL_PROPERTY_CONVERT_SCALAR_TO_DECIBELS
+        | K_AUDIO_LEVEL_CONTROL_PROPERTY_CONVERT_DECIBELS_TO_SCALAR => {
+            size_of::<Float32>() as UInt32
+        }
+        K_AUDIO_LEVEL_CONTROL_PROPERTY_DECIBEL_RANGE => size_of::<AudioValueRange>() as UInt32,
+        _ => return None,
+    })
+}
+
+unsafe fn control_get_property(
+    object_id: AudioObjectID,
+    addr: &AudioObjectPropertyAddress,
+    data_size: UInt32,
+    out_data_size: *mut UInt32,
+    data: *mut c_void,
+) -> OSStatus {
+    let reg = PLUGIN.object_registry.lock();
+    let Some(dev) = reg.find_device_by_control(object_id) else {
+        return K_AUDIO_HARDWARE_BAD_OBJECT_ERROR;
+    };
+    let dev = dev.clone();
+    drop(reg);
+
+    match addr.m_selector {
+        K_AUDIO_OBJECT_PROPERTY_BASE_CLASS => unsafe {
+            write_val::<UInt32>(
+                K_AUDIO_LEVEL_CONTROL_CLASS_ID,
+                data_size,
+                out_data_size,
+                data,
+            )
+        },
+        K_AUDIO_OBJECT_PROPERTY_CLASS => unsafe {
+            write_val::<UInt32>(
+                K_AUDIO_VOLUME_CONTROL_CLASS_ID,
+                data_size,
+                out_data_size,
+                data,
+            )
+        },
+        K_AUDIO_OBJECT_PROPERTY_OWNER => unsafe {
+            write_val::<AudioObjectID>(dev.device_id, data_size, out_data_size, data)
+        },
+        K_AUDIO_OBJECT_PROPERTY_OWNED_OBJECTS => {
+            write_audio_object_ids(&[], data_size, out_data_size, data)
+        }
+        K_AUDIO_OBJECT_PROPERTY_NAME => unsafe {
+            write_cfstring(&volume_control_name(&dev), data_size, out_data_size, data)
+        },
+        K_AUDIO_OBJECT_PROPERTY_MANUFACTURER => unsafe {
+            write_cfstring("MARS", data_size, out_data_size, data)
+        },
+        K_AUDIO_CONTROL_PROPERTY_SCOPE => unsafe {
+            write_val::<UInt32>(
+                K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+                data_size,
+                out_data_size,
+                data,
+            )
+        },
+        K_AUDIO_CONTROL_PROPERTY_ELEMENT => unsafe {
+            write_val::<UInt32>(
+                K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+                data_size,
+                out_data_size,
+                data,
+            )
+        },
+        K_AUDIO_LEVEL_CONTROL_PROPERTY_SCALAR_VALUE => unsafe {
+            write_val::<Float32>(dev.volume_scalar, data_size, out_data_size, data)
+        },
+        K_AUDIO_LEVEL_CONTROL_PROPERTY_DECIBEL_VALUE => unsafe {
+            write_val::<Float32>(
+                volume_scalar_to_decibels(dev.volume_scalar),
+                data_size,
+                out_data_size,
+                data,
+            )
+        },
+        K_AUDIO_LEVEL_CONTROL_PROPERTY_DECIBEL_RANGE => {
+            let range = AudioValueRange {
+                m_minimum: VOLUME_MIN_DECIBELS as Float64,
+                m_maximum: VOLUME_MAX_DECIBELS as Float64,
+            };
+            unsafe { write_val::<AudioValueRange>(range, data_size, out_data_size, data) }
+        }
+        K_AUDIO_LEVEL_CONTROL_PROPERTY_CONVERT_SCALAR_TO_DECIBELS => {
+            if (data_size as usize) < size_of::<Float32>() {
+                return K_AUDIO_HARDWARE_ILLEGAL_OPERATION_ERROR;
+            }
+            // SAFETY: buffer size checked above.
+            let input = unsafe { core::ptr::read_unaligned(data.cast::<Float32>()) };
+            unsafe {
+                write_val::<Float32>(
+                    volume_scalar_to_decibels(clamp_volume_scalar(input)),
+                    data_size,
+                    out_data_size,
+                    data,
+                )
+            }
+        }
+        K_AUDIO_LEVEL_CONTROL_PROPERTY_CONVERT_DECIBELS_TO_SCALAR => {
+            if (data_size as usize) < size_of::<Float32>() {
+                return K_AUDIO_HARDWARE_ILLEGAL_OPERATION_ERROR;
+            }
+            // SAFETY: buffer size checked above.
+            let input = unsafe { core::ptr::read_unaligned(data.cast::<Float32>()) };
+            unsafe {
+                write_val::<Float32>(
+                    volume_decibels_to_scalar(input),
+                    data_size,
+                    out_data_size,
+                    data,
+                )
+            }
         }
         _ => K_AUDIO_HARDWARE_UNKNOWN_PROPERTY_ERROR,
     }
@@ -1245,26 +2000,41 @@ unsafe fn set_desired_state_from_raw(data: *const c_void, data_size: UInt32) -> 
         Err(_) => return K_AUDIO_HARDWARE_ILLEGAL_OPERATION_ERROR,
     };
 
+    let change_target_device_id = first_registered_device_id();
     let host_guard = PLUGIN.host.lock();
     if let Some(host) = *host_guard {
-        // SAFETY: `host` is the AudioServerPlugInHostRef provided by coreaudiod.
-        let status = unsafe {
-            ((*host).request_device_configuration_change)(
-                host,
-                K_AUDIO_OBJECT_PLUGIN_OBJECT,
-                generation,
-                core::ptr::null(),
-            )
+        let status = if let Some(device_id) = change_target_device_id {
+            // SAFETY: `host` is the AudioServerPlugInHostRef provided by coreaudiod.
+            unsafe {
+                ((*host).request_device_configuration_change)(
+                    host,
+                    device_id,
+                    generation,
+                    core::ptr::null(),
+                )
+            }
+        } else {
+            K_AUDIO_HARDWARE_NO_ERROR
         };
         drop(host_guard);
         if status != K_AUDIO_HARDWARE_NO_ERROR {
             return status;
         }
+        if change_target_device_id.is_none() {
+            if perform_device_configuration_change(generation).is_err() {
+                return K_AUDIO_HARDWARE_ILLEGAL_OPERATION_ERROR;
+            }
+            sync_object_registry();
+            notify_device_list_changed();
+        }
     } else {
         drop(host_guard);
         // No host — we're probably in test mode.  Perform directly.
-        let _ = perform_device_configuration_change(generation);
+        if perform_device_configuration_change(generation).is_err() {
+            return K_AUDIO_HARDWARE_ILLEGAL_OPERATION_ERROR;
+        }
         sync_object_registry();
+        notify_device_list_changed();
     }
 
     K_AUDIO_HARDWARE_NO_ERROR
@@ -1281,6 +2051,7 @@ fn sync_object_registry() {
         applied.devices.iter().map(|d| d.uid.as_str()).collect();
 
     let mut reg = PLUGIN.object_registry.lock();
+    let mut structure_changed_device_ids = Vec::new();
 
     // Remove devices no longer in applied state.
     let to_remove: Vec<String> = reg
@@ -1303,33 +2074,77 @@ fn sync_object_registry() {
         if !reg.devices.contains_key(&device.uid) {
             let device_id = reg.allocate_id();
             let stream_id = reg.allocate_id();
+            let volume_control_id = (!device.kind.contains("input")).then(|| reg.allocate_id());
             reg.devices.insert(
                 device.uid.clone(),
                 DeviceObjectInfo {
                     device_id,
                     stream_id,
+                    volume_control_id,
                     uid: device.uid.clone(),
                     name: device.name.clone(),
                     kind: device.kind.clone(),
                     channels: device.channels,
                     hidden: device.hidden,
+                    volume_scalar: 1.0,
                     io_running: false,
                     sample_time_frames: 0,
                     zero_ts_seed: 0,
                 },
             );
         } else if let Some(existing) = reg.devices.get_mut(&device.uid) {
+            let volume_supported = !device.kind.contains("input");
+            let needs_new_control = volume_supported && existing.volume_control_id.is_none();
+            let removed_control = !volume_supported && existing.volume_control_id.is_some();
             existing.name = device.name.clone();
             existing.kind = device.kind.clone();
             existing.channels = device.channels;
             existing.hidden = device.hidden;
+            if removed_control {
+                existing.volume_control_id = None;
+                existing.volume_scalar = 1.0;
+                structure_changed_device_ids.push(existing.device_id);
+            }
+            if needs_new_control {
+                structure_changed_device_ids.push(existing.device_id);
+            }
+        }
+        if reg.devices.contains_key(&device.uid) {
+            let volume_supported = !device.kind.contains("input");
+            let new_control_id = if volume_supported {
+                let needs_new_control = reg
+                    .devices
+                    .get(&device.uid)
+                    .is_some_and(|existing| existing.volume_control_id.is_none());
+                needs_new_control.then(|| reg.allocate_id())
+            } else {
+                None
+            };
+            if let Some(existing) = reg.devices.get_mut(&device.uid) {
+                if let Some(control_id) = new_control_id {
+                    existing.volume_control_id = Some(control_id);
+                }
+            }
         }
     }
+
+    drop(reg);
+    drop(state);
+
+    for device_id in structure_changed_device_ids {
+        notify_device_structure_changed(device_id);
+    }
+}
+
+fn first_registered_device_id() -> Option<AudioObjectID> {
+    let reg = PLUGIN.object_registry.lock();
+    reg.devices.values().map(|device| device.device_id).next()
 }
 
 fn notify_device_list_changed() {
     let host_guard = PLUGIN.host.lock();
     if let Some(host) = *host_guard {
+        let plugin_object_id = runtime_plugin_object_id();
         let addr = AudioObjectPropertyAddress {
             m_selector: K_AUDIO_PLUG_IN_PROPERTY_DEVICE_LIST,
             m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
@@ -1337,9 +2152,25 @@ fn notify_device_list_changed() {
         };
         // SAFETY: `host` is valid AudioServerPlugInHostRef from coreaudiod.
         unsafe {
-            ((*host).properties_changed)(host, K_AUDIO_OBJECT_PLUGIN_OBJECT, 1, &addr);
+            ((*host).properties_changed)(host, plugin_object_id, 1, &addr);
         }
     }
+}
+
+fn notify_device_structure_changed(device_id: AudioObjectID) {
+    let addresses = [
+        AudioObjectPropertyAddress {
+            m_selector: K_AUDIO_OBJECT_PROPERTY_OWNED_OBJECTS,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        },
+        AudioObjectPropertyAddress {
+            m_selector: K_AUDIO_OBJECT_PROPERTY_CONTROL_LIST,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        },
+    ];
+    notify_properties_changed_for_object(device_id, &addresses);
 }
 
 // ===========================================================================
@@ -1476,6 +2307,50 @@ mod tests {
 
     static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
+    fn insert_test_device(
+        uid: &str,
+        name: &str,
+        kind: &str,
+        channels: u16,
+    ) -> (AudioObjectID, AudioObjectID, Option<AudioObjectID>) {
+        let mut reg = PLUGIN.object_registry.lock();
+        let device_id = reg.allocate_id();
+        let stream_id = reg.allocate_id();
+        let volume_control_id = (!kind.contains("input")).then(|| reg.allocate_id());
+        reg.devices.insert(
+            uid.to_string(),
+            DeviceObjectInfo {
+                device_id,
+                stream_id,
+                volume_control_id,
+                uid: uid.to_string(),
+                name: name.to_string(),
+                kind: kind.to_string(),
+                channels,
+                hidden: false,
+                volume_scalar: 1.0,
+                io_running: false,
+                sample_time_frames: 0,
+                zero_ts_seed: 0,
+            },
+        );
+        (device_id, stream_id, volume_control_id)
+    }
+
+    fn remove_test_device(uid: &str) {
+        let mut reg = PLUGIN.object_registry.lock();
+        reg.devices.remove(uid);
+        let _ = global_registry().remove(&stream_name(StreamDirection::Vout, uid));
+        let _ = global_registry().remove(&stream_name(StreamDirection::Vin, uid));
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 1.0e-5,
+            "expected {expected}, got {actual}"
+        );
+    }
+
     #[test]
     fn factory_returns_nonnull() {
         // SAFETY: test-only, no host.
@@ -1484,11 +2359,66 @@ mod tests {
     }
 
     #[test]
+    fn query_interface_accepts_audio_server_plugin_driver_iid() {
+        let mut interface = core::ptr::null_mut();
+        let hr = unsafe {
+            plugin_query_interface(
+                core::ptr::null_mut(),
+                IID_AUDIO_SERVER_PLUGIN_DRIVER,
+                &mut interface,
+            )
+        };
+        assert_eq!(hr, S_OK);
+        assert!(!interface.is_null());
+    }
+
+    #[test]
+    fn factory_object_supports_query_interface_via_interface_struct() {
+        let obj = unsafe { MarsAudioServerPlugInFactory(core::ptr::null(), core::ptr::null()) };
+        assert!(!obj.is_null());
+
+        let driver = obj as AudioServerPlugInDriverRef;
+        let interface_struct = unsafe { *driver };
+        assert!(!interface_struct.is_null());
+
+        let mut interface = core::ptr::null_mut();
+        let hr = unsafe {
+            ((*interface_struct).query_interface)(
+                obj,
+                IID_AUDIO_SERVER_PLUGIN_DRIVER,
+                &mut interface,
+            )
+        };
+
+        assert_eq!(hr, S_OK);
+        assert_eq!(interface, obj);
+    }
+
+    #[test]
     fn classify_plugin_object() {
         assert_eq!(
             classify_object(K_AUDIO_OBJECT_PLUGIN_OBJECT),
             Some(ObjectType::Plugin)
         );
+    }
+
+    #[test]
+    fn plugin_property_queries_learn_runtime_plugin_object_id() {
+        let _guard = TEST_LOCK.lock();
+        PLUGIN.plugin_object_id.store(0, Ordering::Relaxed);
+
+        let address = AudioObjectPropertyAddress {
+            m_selector: K_MARS_PROPERTY_CONFIG_SUMMARY,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        let has_property = unsafe { plugin_has_property(core::ptr::null_mut(), 49, 0, &address) };
+
+        assert_eq!(has_property, 1);
+        assert_eq!(PLUGIN.plugin_object_id.load(Ordering::Relaxed), 49);
+
+        PLUGIN.plugin_object_id.store(0, Ordering::Relaxed);
     }
 
     #[test]
@@ -1504,27 +2434,7 @@ mod tests {
     fn device_is_running_property_reflects_io_state() {
         let _guard = TEST_LOCK.lock();
         let uid = "test.running.uid".to_string();
-        let device_id = {
-            let mut reg = PLUGIN.object_registry.lock();
-            let device_id = reg.allocate_id();
-            let stream_id = reg.allocate_id();
-            reg.devices.insert(
-                uid.clone(),
-                DeviceObjectInfo {
-                    device_id,
-                    stream_id,
-                    uid: uid.clone(),
-                    name: "Test Device".to_string(),
-                    kind: "virtual_output".to_string(),
-                    channels: 2,
-                    hidden: false,
-                    io_running: false,
-                    sample_time_frames: 0,
-                    zero_ts_seed: 0,
-                },
-            );
-            device_id
-        };
+        let (device_id, _, _) = insert_test_device(&uid, "Test Device", "virtual_output", 2);
 
         let address = AudioObjectPropertyAddress {
             m_selector: K_AUDIO_DEVICE_PROPERTY_IS_RUNNING,
@@ -1539,6 +2449,8 @@ mod tests {
             device_get_property(
                 device_id,
                 &address,
+                0,
+                core::ptr::null(),
                 std::mem::size_of::<UInt32>() as UInt32,
                 &mut out_size,
                 (&mut running_value as *mut UInt32).cast::<c_void>(),
@@ -1564,6 +2476,8 @@ mod tests {
             device_get_property(
                 device_id,
                 &address,
+                0,
+                core::ptr::null(),
                 std::mem::size_of::<UInt32>() as UInt32,
                 &mut out_size,
                 (&mut running_value as *mut UInt32).cast::<c_void>(),
@@ -1573,38 +2487,358 @@ mod tests {
         assert_eq!(out_size, std::mem::size_of::<UInt32>() as UInt32);
         assert_eq!(running_value, 1);
 
-        let mut reg = PLUGIN.object_registry.lock();
-        reg.devices.remove(&uid);
+        remove_test_device(&uid);
+    }
+
+    #[test]
+    fn device_owned_objects_include_volume_controls_for_output_devices() {
+        let _guard = TEST_LOCK.lock();
+        let uid = "test.owned-controls.uid".to_string();
+        let (device_id, stream_id, volume_control_id) =
+            insert_test_device(&uid, "Test Device", "virtual_output", 2);
+        let volume_control_id = volume_control_id.expect("output devices expose a volume control");
+
+        let address = AudioObjectPropertyAddress {
+            m_selector: K_AUDIO_OBJECT_PROPERTY_OWNED_OBJECTS,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+        let control_class = K_AUDIO_CONTROL_CLASS_ID;
+        let stream_class = K_AUDIO_STREAM_CLASS_ID;
+
+        let control_size = device_property_data_size(
+            device_id,
+            &address,
+            std::mem::size_of_val(&control_class) as UInt32,
+            (&control_class as *const UInt32).cast::<c_void>(),
+        );
+        assert_eq!(
+            control_size,
+            Some(std::mem::size_of::<AudioObjectID>() as UInt32)
+        );
+
+        let stream_size = device_property_data_size(
+            device_id,
+            &address,
+            std::mem::size_of_val(&stream_class) as UInt32,
+            (&stream_class as *const UInt32).cast::<c_void>(),
+        );
+        assert_eq!(
+            stream_size,
+            Some(std::mem::size_of::<AudioObjectID>() as UInt32)
+        );
+
+        let mut out_size = 0_u32;
+        let mut owned_object = 0_u32;
+        let status = unsafe {
+            device_get_property(
+                device_id,
+                &address,
+                std::mem::size_of_val(&control_class) as UInt32,
+                (&control_class as *const UInt32).cast::<c_void>(),
+                std::mem::size_of::<AudioObjectID>() as UInt32,
+                &mut out_size,
+                (&mut owned_object as *mut UInt32).cast::<c_void>(),
+            )
+        };
+        assert_eq!(status, K_AUDIO_HARDWARE_NO_ERROR);
+        assert_eq!(out_size, std::mem::size_of::<AudioObjectID>() as UInt32);
+        assert_eq!(owned_object, volume_control_id);
+
+        let mut stream_out_size = 0_u32;
+        let mut stream_object = 0_u32;
+        let status = unsafe {
+            device_get_property(
+                device_id,
+                &address,
+                std::mem::size_of_val(&stream_class) as UInt32,
+                (&stream_class as *const UInt32).cast::<c_void>(),
+                std::mem::size_of::<AudioObjectID>() as UInt32,
+                &mut stream_out_size,
+                (&mut stream_object as *mut UInt32).cast::<c_void>(),
+            )
+        };
+        assert_eq!(status, K_AUDIO_HARDWARE_NO_ERROR);
+        assert_eq!(
+            stream_out_size,
+            std::mem::size_of::<AudioObjectID>() as UInt32
+        );
+        assert_eq!(stream_object, stream_id);
+
+        let mut control_list_out_size = 0_u32;
+        let mut listed_control = 0_u32;
+        let control_list_address = AudioObjectPropertyAddress {
+            m_selector: K_AUDIO_OBJECT_PROPERTY_CONTROL_LIST,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+        let status = unsafe {
+            device_get_property(
+                device_id,
+                &control_list_address,
+                0,
+                core::ptr::null(),
+                std::mem::size_of::<AudioObjectID>() as UInt32,
+                &mut control_list_out_size,
+                (&mut listed_control as *mut UInt32).cast::<c_void>(),
+            )
+        };
+        assert_eq!(status, K_AUDIO_HARDWARE_NO_ERROR);
+        assert_eq!(
+            control_list_out_size,
+            std::mem::size_of::<AudioObjectID>() as UInt32
+        );
+        assert_eq!(listed_control, volume_control_id);
+
+        remove_test_device(&uid);
+    }
+
+    #[test]
+    fn device_streams_respect_scope() {
+        let _guard = TEST_LOCK.lock();
+        let uid = "test.stream-scope.uid".to_string();
+        let (device_id, stream_id, _) =
+            insert_test_device(&uid, "Test Input Device", "virtual_input", 2);
+
+        let input_address = AudioObjectPropertyAddress {
+            m_selector: K_AUDIO_DEVICE_PROPERTY_STREAMS,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_INPUT,
+            m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+        let output_address = AudioObjectPropertyAddress {
+            m_selector: K_AUDIO_DEVICE_PROPERTY_STREAMS,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+            m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        assert_eq!(
+            device_property_data_size(device_id, &input_address, 0, core::ptr::null()),
+            Some(std::mem::size_of::<AudioObjectID>() as UInt32)
+        );
+        assert_eq!(
+            device_property_data_size(device_id, &output_address, 0, core::ptr::null()),
+            Some(0)
+        );
+
+        let mut out_size = 0_u32;
+        let mut input_stream = 0_u32;
+        let status = unsafe {
+            device_get_property(
+                device_id,
+                &input_address,
+                0,
+                core::ptr::null(),
+                std::mem::size_of::<AudioObjectID>() as UInt32,
+                &mut out_size,
+                (&mut input_stream as *mut UInt32).cast::<c_void>(),
+            )
+        };
+        assert_eq!(status, K_AUDIO_HARDWARE_NO_ERROR);
+        assert_eq!(out_size, std::mem::size_of::<AudioObjectID>() as UInt32);
+        assert_eq!(input_stream, stream_id);
+
+        let mut output_out_size = u32::MAX;
+        let mut output_stream = 99_u32;
+        let status = unsafe {
+            device_get_property(
+                device_id,
+                &output_address,
+                0,
+                core::ptr::null(),
+                std::mem::size_of::<AudioObjectID>() as UInt32,
+                &mut output_out_size,
+                (&mut output_stream as *mut UInt32).cast::<c_void>(),
+            )
+        };
+        assert_eq!(status, K_AUDIO_HARDWARE_NO_ERROR);
+        assert_eq!(output_out_size, 0);
+
+        remove_test_device(&uid);
+    }
+
+    #[test]
+    fn control_and_device_volume_properties_share_state() {
+        let _guard = TEST_LOCK.lock();
+        let uid = "test.volume.shared-state.uid".to_string();
+        let (device_id, _, volume_control_id) =
+            insert_test_device(&uid, "Volume Device", "virtual_output", 2);
+        let control_id = volume_control_id.expect("output devices expose a volume control");
+
+        let control_scalar_address = AudioObjectPropertyAddress {
+            m_selector: K_AUDIO_LEVEL_CONTROL_PROPERTY_SCALAR_VALUE,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+        let control_db_address = AudioObjectPropertyAddress {
+            m_selector: K_AUDIO_LEVEL_CONTROL_PROPERTY_DECIBEL_VALUE,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+        let device_scalar_address = AudioObjectPropertyAddress {
+            m_selector: K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+            m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+        let device_db_address = AudioObjectPropertyAddress {
+            m_selector: K_AUDIO_DEVICE_PROPERTY_VOLUME_DECIBELS,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+            m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        let new_scalar = 0.25_f32;
+        let status = unsafe {
+            control_set_property(
+                control_id,
+                &control_scalar_address,
+                std::mem::size_of::<Float32>() as UInt32,
+                (&new_scalar as *const Float32).cast::<c_void>(),
+            )
+        };
+        assert_eq!(status, K_AUDIO_HARDWARE_NO_ERROR);
+
+        let mut out_size = 0_u32;
+        let mut scalar_value = -1.0_f32;
+        let status = unsafe {
+            device_get_property(
+                device_id,
+                &device_scalar_address,
+                0,
+                core::ptr::null(),
+                std::mem::size_of::<Float32>() as UInt32,
+                &mut out_size,
+                (&mut scalar_value as *mut Float32).cast::<c_void>(),
+            )
+        };
+        assert_eq!(status, K_AUDIO_HARDWARE_NO_ERROR);
+        assert_eq!(out_size, std::mem::size_of::<Float32>() as UInt32);
+        assert_close(scalar_value, new_scalar);
+
+        let mut db_value = 0.0_f32;
+        let status = unsafe {
+            control_get_property(
+                control_id,
+                &control_db_address,
+                std::mem::size_of::<Float32>() as UInt32,
+                &mut out_size,
+                (&mut db_value as *mut Float32).cast::<c_void>(),
+            )
+        };
+        assert_eq!(status, K_AUDIO_HARDWARE_NO_ERROR);
+        assert_close(db_value, volume_scalar_to_decibels(new_scalar));
+
+        let new_db = -12.0_f32;
+        let status = unsafe {
+            device_set_property(
+                device_id,
+                &device_db_address,
+                std::mem::size_of::<Float32>() as UInt32,
+                (&new_db as *const Float32).cast::<c_void>(),
+            )
+        };
+        assert_eq!(status, K_AUDIO_HARDWARE_NO_ERROR);
+
+        let mut control_scalar_value = -1.0_f32;
+        let status = unsafe {
+            control_get_property(
+                control_id,
+                &control_scalar_address,
+                std::mem::size_of::<Float32>() as UInt32,
+                &mut out_size,
+                (&mut control_scalar_value as *mut Float32).cast::<c_void>(),
+            )
+        };
+        assert_eq!(status, K_AUDIO_HARDWARE_NO_ERROR);
+        assert_close(control_scalar_value, volume_decibels_to_scalar(new_db));
+
+        let mut device_db_value = 1.0_f32;
+        let status = unsafe {
+            device_get_property(
+                device_id,
+                &device_db_address,
+                0,
+                core::ptr::null(),
+                std::mem::size_of::<Float32>() as UInt32,
+                &mut out_size,
+                (&mut device_db_value as *mut Float32).cast::<c_void>(),
+            )
+        };
+        assert_eq!(status, K_AUDIO_HARDWARE_NO_ERROR);
+        assert_close(device_db_value, new_db);
+
+        remove_test_device(&uid);
+    }
+
+    #[test]
+    fn write_mix_applies_device_volume_before_writing_ring() {
+        let _guard = TEST_LOCK.lock();
+        let uid = "test.vmix.uid".to_string();
+        let (device_id, _, volume_control_id) =
+            insert_test_device(&uid, "Scaled Output", "virtual_output", 2);
+        let control_id = volume_control_id.expect("output devices expose a volume control");
+        let control_scalar_address = AudioObjectPropertyAddress {
+            m_selector: K_AUDIO_LEVEL_CONTROL_PROPERTY_SCALAR_VALUE,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        let new_scalar = 0.5_f32;
+        let status = unsafe {
+            control_set_property(
+                control_id,
+                &control_scalar_address,
+                std::mem::size_of::<Float32>() as UInt32,
+                (&new_scalar as *const Float32).cast::<c_void>(),
+            )
+        };
+        assert_eq!(status, K_AUDIO_HARDWARE_NO_ERROR);
+
+        let start_status = unsafe { plugin_start_io(core::ptr::null_mut(), device_id, 1) };
+        assert_eq!(start_status, K_AUDIO_HARDWARE_NO_ERROR);
+
+        let mut io_buffer = [1.0_f32, -0.5_f32, 0.25_f32, -0.25_f32];
+        let io_status = unsafe {
+            plugin_do_io_operation(
+                core::ptr::null_mut(),
+                device_id,
+                0,
+                0,
+                K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_WRITE_MIX,
+                2,
+                core::ptr::null(),
+                io_buffer.as_mut_ptr().cast::<c_void>(),
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(io_status, K_AUDIO_HARDWARE_NO_ERROR);
+        assert_eq!(io_buffer, [0.5_f32, -0.25_f32, 0.125_f32, -0.125_f32]);
+
+        {
+            let ring_name = stream_name(StreamDirection::Vout, &uid);
+            let ring_handle = global_registry()
+                .open(&ring_name)
+                .expect("plugin_start_io creates the VOut ring");
+            let mut ring = ring_handle
+                .try_lock()
+                .expect("ring lock should be available");
+            let mut written = [0.0_f32; 4];
+            ring.read_interleaved(&mut written)
+                .expect("written audio should be readable");
+            assert_eq!(written, io_buffer);
+        }
+
+        let stop_status = unsafe { plugin_stop_io(core::ptr::null_mut(), device_id, 1) };
+        assert_eq!(stop_status, K_AUDIO_HARDWARE_NO_ERROR);
+        remove_test_device(&uid);
     }
 
     #[test]
     fn zero_timestamp_tracks_monotonic_sample_time_and_seed() {
         let _guard = TEST_LOCK.lock();
         let uid = "test.zero-ts.uid".to_string();
-        let device_id = {
-            let mut reg = PLUGIN.object_registry.lock();
-            let device_id = reg.allocate_id();
-            let stream_id = reg.allocate_id();
-            reg.devices.insert(
-                uid.clone(),
-                DeviceObjectInfo {
-                    device_id,
-                    stream_id,
-                    uid: uid.clone(),
-                    name: "Zero TS Device".to_string(),
-                    kind: "virtual_output".to_string(),
-                    channels: 2,
-                    hidden: false,
-                    io_running: false,
-                    sample_time_frames: 0,
-                    zero_ts_seed: 0,
-                },
-            );
-            device_id
-        };
+        let (device_id, _, _) = insert_test_device(&uid, "Zero TS Device", "virtual_output", 2);
 
         // SAFETY: test passes valid object id and ignores driver pointer.
-        let start_status = unsafe { plugin_start_io(core::ptr::null_mut(), device_id) };
+        let start_status = unsafe { plugin_start_io(core::ptr::null_mut(), device_id, 1) };
         assert_eq!(start_status, K_AUDIO_HARDWARE_NO_ERROR);
 
         let mut io_buffer = [0.0_f32; 4];
@@ -1632,6 +2866,7 @@ mod tests {
             plugin_get_zero_time_stamp(
                 core::ptr::null_mut(),
                 device_id,
+                1,
                 &mut sample_time,
                 &mut host_time,
                 &mut seed_after_start,
@@ -1643,7 +2878,7 @@ mod tests {
         assert!(seed_after_start >= 1);
 
         // SAFETY: test passes valid object id and ignores driver pointer.
-        let stop_status = unsafe { plugin_stop_io(core::ptr::null_mut(), device_id) };
+        let stop_status = unsafe { plugin_stop_io(core::ptr::null_mut(), device_id, 1) };
         assert_eq!(stop_status, K_AUDIO_HARDWARE_NO_ERROR);
 
         let mut sample_time_after_stop = -1.0_f64;
@@ -1654,6 +2889,7 @@ mod tests {
             plugin_get_zero_time_stamp(
                 core::ptr::null_mut(),
                 device_id,
+                1,
                 &mut sample_time_after_stop,
                 &mut host_time_after_stop,
                 &mut seed_after_stop,
@@ -1663,9 +2899,6 @@ mod tests {
         assert_eq!(sample_time_after_stop, sample_time);
         assert!(seed_after_stop > seed_after_start);
 
-        let mut reg = PLUGIN.object_registry.lock();
-        reg.devices.remove(&uid);
-        let _ = global_registry().remove(&stream_name(StreamDirection::Vout, &uid));
-        let _ = global_registry().remove(&stream_name(StreamDirection::Vin, &uid));
+        remove_test_device(&uid);
     }
 }

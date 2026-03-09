@@ -2,16 +2,18 @@
 //! CoreAudio device discovery and external device matching.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::f32::consts::PI;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
+use mars_shm::{RingSpec, StreamDirection as RingStreamDirection, global_registry, stream_name};
 use mars_types::{
     DeviceInventory, ExternalDeviceInfo, ExternalRuntimeStatus, NodeKind, Profile,
     ResolvedExternalDevice,
@@ -26,14 +28,99 @@ pub enum CoreAudioError {
     Host(String),
     #[error("failed to enumerate devices: {0}")]
     Enumerate(String),
+    #[error("no default {direction} device is available")]
+    DefaultDeviceUnavailable { direction: &'static str },
     #[error("device not found for uid '{uid}'")]
     DeviceNotFound { uid: String },
+    #[error(
+        "no supported {direction} stream config for uid '{uid}' at {sample_rate} Hz using preferred channels {preferred:?}"
+    )]
+    UnsupportedChannelCount {
+        uid: String,
+        direction: &'static str,
+        sample_rate: u32,
+        preferred: Vec<u16>,
+    },
+    #[error("no supported {direction} stream config for uid '{uid}' at {sample_rate} Hz")]
+    UnsupportedStreamConfig {
+        uid: String,
+        direction: &'static str,
+        sample_rate: u32,
+    },
     #[error("failed to build input stream for uid '{uid}': {reason}")]
     BuildInputStream { uid: String, reason: String },
     #[error("failed to build output stream for uid '{uid}': {reason}")]
     BuildOutputStream { uid: String, reason: String },
     #[error("failed to start stream for uid '{uid}': {reason}")]
     StartStream { uid: String, reason: String },
+    #[error("loopback probe timed out after {timeout_ms} ms")]
+    ProbeTimeout { timeout_ms: u64 },
+    #[error("loopback probe did not find a reliable correlation peak (score={score:.3})")]
+    ProbeCorrelationLow { score: f32 },
+    #[error("loopback probe failed: {reason}")]
+    Probe { reason: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamDirection {
+    Input,
+    Output,
+}
+
+impl StreamDirection {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Output => "output",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LoopbackProbeRequest {
+    pub output_uid: String,
+    pub input_uid: String,
+    pub sample_rate: u32,
+    pub output_channels: u16,
+    pub input_channels: u16,
+    pub timeout: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoopbackProbeResult {
+    pub latency_frames: i64,
+    pub latency_ms: f64,
+    pub correlation_score: f32,
+    pub output_signal_frames: usize,
+    pub captured_frames: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct VinRingLoopbackProbeRequest {
+    pub output_uid: String,
+    pub vin_uid: String,
+    pub sample_rate: u32,
+    pub output_channels: u16,
+    pub vin_channels: u16,
+    pub buffer_frames: u32,
+    pub timeout: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct VinRingMonitorRequest {
+    pub vin_uid: String,
+    pub sample_rate: u32,
+    pub vin_channels: u16,
+    pub buffer_frames: u32,
+    pub timeout: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VinRingMonitorResult {
+    pub captured_frames: usize,
+    pub peak: f32,
+    pub rms: f32,
 }
 
 #[derive(Debug, Default)]
@@ -87,6 +174,478 @@ pub fn list_device_inventory() -> Result<DeviceInventory, CoreAudioError> {
     }
 
     Ok(DeviceInventory { inputs, outputs })
+}
+
+pub fn default_device_info(
+    direction: StreamDirection,
+) -> Result<ExternalDeviceInfo, CoreAudioError> {
+    let host = cpal::default_host();
+    let device = match direction {
+        StreamDirection::Input => host.default_input_device(),
+        StreamDirection::Output => host.default_output_device(),
+    }
+    .ok_or(CoreAudioError::DefaultDeviceUnavailable {
+        direction: direction.as_str(),
+    })?;
+    device_info_from_device(&device, direction, 0)
+}
+
+pub fn resolve_channel_count(
+    uid: &str,
+    direction: StreamDirection,
+    sample_rate: u32,
+    preferred: &[u16],
+) -> Result<u16, CoreAudioError> {
+    let host = cpal::default_host();
+    let device = find_device_by_uid(&host, uid)?;
+
+    for &channels in preferred {
+        let supported = match direction {
+            StreamDirection::Input => {
+                select_input_stream_config(&device, channels, sample_rate).is_ok()
+            }
+            StreamDirection::Output => {
+                select_output_stream_config(&device, channels, sample_rate).is_ok()
+            }
+        };
+        if supported {
+            return Ok(channels);
+        }
+    }
+
+    Err(CoreAudioError::UnsupportedChannelCount {
+        uid: uid.to_string(),
+        direction: direction.as_str(),
+        sample_rate,
+        preferred: preferred.to_vec(),
+    })
+}
+
+pub fn supported_channel_counts(
+    uid: &str,
+    direction: StreamDirection,
+    sample_rate: u32,
+) -> Result<Vec<u16>, CoreAudioError> {
+    let host = cpal::default_host();
+    let device = find_device_by_uid(&host, uid)?;
+    let mut counts = BTreeSet::new();
+
+    match direction {
+        StreamDirection::Input => {
+            let configs = device
+                .supported_input_configs()
+                .map_err(|error| CoreAudioError::Enumerate(error.to_string()))?;
+            for config in configs {
+                if sample_rate >= config.min_sample_rate()
+                    && sample_rate <= config.max_sample_rate()
+                {
+                    counts.insert(config.channels());
+                }
+            }
+        }
+        StreamDirection::Output => {
+            let configs = device
+                .supported_output_configs()
+                .map_err(|error| CoreAudioError::Enumerate(error.to_string()))?;
+            for config in configs {
+                if sample_rate >= config.min_sample_rate()
+                    && sample_rate <= config.max_sample_rate()
+                {
+                    counts.insert(config.channels());
+                }
+            }
+        }
+    }
+
+    if counts.is_empty() {
+        return Err(CoreAudioError::UnsupportedStreamConfig {
+            uid: uid.to_string(),
+            direction: direction.as_str(),
+            sample_rate,
+        });
+    }
+
+    Ok(counts.into_iter().collect())
+}
+
+pub fn measure_loopback_latency(
+    request: &LoopbackProbeRequest,
+) -> Result<LoopbackProbeResult, CoreAudioError> {
+    const STARTUP_SETTLE: Duration = Duration::from_millis(75);
+    const MIN_CORRELATION_SCORE: f32 = 0.2;
+
+    if request.sample_rate == 0 {
+        return Err(CoreAudioError::Probe {
+            reason: "sample_rate must be > 0".to_string(),
+        });
+    }
+    if request.output_channels == 0 || request.input_channels == 0 {
+        return Err(CoreAudioError::Probe {
+            reason: "input/output channels must be > 0".to_string(),
+        });
+    }
+
+    let host = cpal::default_host();
+    let output_device = find_device_by_uid(&host, &request.output_uid)?;
+    let input_device = find_device_by_uid(&host, &request.input_uid)?;
+    let (output_config, output_format) =
+        select_output_stream_config(&output_device, request.output_channels, request.sample_rate)
+            .map_err(|reason| CoreAudioError::BuildOutputStream {
+            uid: request.output_uid.clone(),
+            reason,
+        })?;
+    let (input_config, input_format) =
+        select_input_stream_config(&input_device, request.input_channels, request.sample_rate)
+            .map_err(|reason| CoreAudioError::BuildInputStream {
+                uid: request.input_uid.clone(),
+                reason,
+            })?;
+
+    let pre_roll_frames = ((request.sample_rate as f32) * 0.05) as usize;
+    let probe_frames = ((request.sample_rate as f32) * 0.15) as usize;
+    let post_roll_frames = ((request.sample_rate as f32) * 1.0) as usize;
+    let probe = build_probe_signal(probe_frames.max(512));
+    let output_mono = build_output_timeline(&probe, pre_roll_frames, post_roll_frames);
+    let output_signal_frames = output_mono.len();
+    let output_interleaved = interleave_mono_signal(&output_mono, request.output_channels as usize);
+    let target_capture_frames = output_signal_frames + (request.sample_rate as usize / 2);
+    let max_capture_samples = target_capture_frames * request.input_channels as usize;
+
+    let playback_state = Arc::new(ProbePlaybackState {
+        samples: output_interleaved,
+        cursor: AtomicUsize::new(0),
+        finished: AtomicBool::new(false),
+    });
+    let capture = Arc::new(Mutex::new(Vec::<f32>::with_capacity(max_capture_samples)));
+    let callback_error = Arc::new(Mutex::new(None::<String>));
+
+    let input_capture = capture.clone();
+    let input_errors = callback_error.clone();
+    let input_stream = build_input_stream_for_format(
+        &input_device,
+        input_format,
+        &input_config,
+        move |samples| {
+            let mut guard = input_capture.lock();
+            let remaining = max_capture_samples.saturating_sub(guard.len());
+            if remaining == 0 {
+                return;
+            }
+            let limit = remaining.min(samples.len());
+            guard.extend_from_slice(&samples[..limit]);
+        },
+        move |error| {
+            let mut guard = input_errors.lock();
+            *guard = Some(format!("input stream error: {error}"));
+        },
+    )
+    .map_err(|reason| CoreAudioError::BuildInputStream {
+        uid: request.input_uid.clone(),
+        reason,
+    })?;
+
+    let output_state = playback_state.clone();
+    let output_errors = callback_error.clone();
+    let output_stream = build_output_stream_for_format(
+        &output_device,
+        output_format,
+        &output_config,
+        move |out| {
+            let cursor = output_state.cursor.load(Ordering::Relaxed);
+            let remaining = output_state.samples.len().saturating_sub(cursor);
+            let copy_len = remaining.min(out.len());
+            if copy_len > 0 {
+                out[..copy_len].copy_from_slice(&output_state.samples[cursor..cursor + copy_len]);
+                output_state
+                    .cursor
+                    .store(cursor.saturating_add(copy_len), Ordering::Relaxed);
+            }
+            if copy_len < out.len() {
+                out[copy_len..].fill(0.0);
+                output_state.finished.store(true, Ordering::Relaxed);
+            } else if cursor.saturating_add(copy_len) >= output_state.samples.len() {
+                output_state.finished.store(true, Ordering::Relaxed);
+            }
+        },
+        move |error| {
+            let mut guard = output_errors.lock();
+            *guard = Some(format!("output stream error: {error}"));
+        },
+    )
+    .map_err(|reason| CoreAudioError::BuildOutputStream {
+        uid: request.output_uid.clone(),
+        reason,
+    })?;
+
+    input_stream
+        .play()
+        .map_err(|error| CoreAudioError::StartStream {
+            uid: request.input_uid.clone(),
+            reason: error.to_string(),
+        })?;
+    std::thread::sleep(STARTUP_SETTLE);
+    output_stream
+        .play()
+        .map_err(|error| CoreAudioError::StartStream {
+            uid: request.output_uid.clone(),
+            reason: error.to_string(),
+        })?;
+
+    let deadline = Instant::now() + request.timeout;
+    loop {
+        if let Some(reason) = callback_error.lock().clone() {
+            return Err(CoreAudioError::Probe { reason });
+        }
+
+        let captured_samples = capture.lock().len();
+        if playback_state.finished.load(Ordering::Relaxed)
+            && captured_samples >= max_capture_samples
+        {
+            break;
+        }
+
+        if Instant::now() >= deadline {
+            return Err(CoreAudioError::ProbeTimeout {
+                timeout_ms: request.timeout.as_millis() as u64,
+            });
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    drop(output_stream);
+    drop(input_stream);
+
+    if let Some(reason) = callback_error.lock().clone() {
+        return Err(CoreAudioError::Probe { reason });
+    }
+
+    let captured = capture.lock().clone();
+    let captured_mono = collapse_to_mono(&captured, request.input_channels as usize);
+    let (peak_index, correlation_score) = estimate_latency_frames(&captured_mono, &probe)?;
+    if correlation_score < MIN_CORRELATION_SCORE {
+        return Err(CoreAudioError::ProbeCorrelationLow {
+            score: correlation_score,
+        });
+    }
+    let latency_frames = peak_index as i64 - pre_roll_frames as i64;
+    let latency_ms = latency_frames as f64 * 1000.0 / request.sample_rate as f64;
+    Ok(LoopbackProbeResult {
+        latency_frames,
+        latency_ms,
+        correlation_score,
+        output_signal_frames,
+        captured_frames: captured_mono.len(),
+    })
+}
+
+pub fn measure_vin_ring_loopback_latency(
+    request: &VinRingLoopbackProbeRequest,
+) -> Result<LoopbackProbeResult, CoreAudioError> {
+    const STARTUP_SETTLE: Duration = Duration::from_millis(100);
+    const MIN_CORRELATION_SCORE: f32 = 0.1;
+
+    if request.sample_rate == 0 || request.output_channels == 0 || request.vin_channels == 0 {
+        return Err(CoreAudioError::Probe {
+            reason: "sample_rate and channel counts must be > 0".to_string(),
+        });
+    }
+    if request.buffer_frames == 0 {
+        return Err(CoreAudioError::Probe {
+            reason: "buffer_frames must be > 0".to_string(),
+        });
+    }
+
+    let probe_frames = ((request.sample_rate as f32) * 0.15) as usize;
+    let post_roll_frames = ((request.sample_rate as f32) * 1.0) as usize;
+    let probe = build_probe_signal(probe_frames.max(512));
+    // The ring-based probe measures stream-frame latency inside MARS, not wall-clock
+    // delay before the daemon starts consuming the ring. Using a synthetic pre-roll
+    // or subtracting startup settle time biases the estimate negative because those
+    // idle periods are not guaranteed to appear in the captured vin stream.
+    let output_mono = build_output_timeline(&probe, 0, post_roll_frames);
+    let output_signal_frames = output_mono.len();
+    let output_interleaved = interleave_mono_signal(&output_mono, request.output_channels as usize);
+    let target_capture_frames = output_signal_frames + (request.sample_rate as usize / 2);
+    let max_capture_samples = target_capture_frames * request.vin_channels as usize;
+
+    let vout_ring_spec = RingSpec {
+        sample_rate: request.sample_rate,
+        channels: request.output_channels,
+        capacity_frames: request.buffer_frames.saturating_mul(8),
+    };
+    let vout_ring_name = stream_name(RingStreamDirection::Vout, &request.output_uid);
+    let vout_ring = global_registry()
+        .create_or_open(&vout_ring_name, vout_ring_spec)
+        .map_err(|error| CoreAudioError::Probe {
+            reason: format!("failed to open vout ring '{vout_ring_name}': {error}"),
+        })?;
+    drain_ring(&vout_ring, request.output_channels as usize)?;
+
+    let vin_ring_spec = RingSpec {
+        sample_rate: request.sample_rate,
+        channels: request.vin_channels,
+        capacity_frames: request.buffer_frames.saturating_mul(8),
+    };
+    let vin_ring_name = stream_name(RingStreamDirection::Vin, &request.vin_uid);
+    let vin_ring = global_registry()
+        .create_or_open(&vin_ring_name, vin_ring_spec)
+        .map_err(|error| CoreAudioError::Probe {
+            reason: format!("failed to open vin ring '{vin_ring_name}': {error}"),
+        })?;
+    drain_ring(&vin_ring, request.vin_channels as usize)?;
+
+    let deadline = Instant::now() + request.timeout;
+    let chunk_frames = request.buffer_frames as usize;
+    let output_channels = request.output_channels as usize;
+    let mut output_cursor = 0usize;
+    let mut captured = Vec::<f32>::with_capacity(max_capture_samples);
+    std::thread::sleep(STARTUP_SETTLE);
+    while Instant::now() < deadline {
+        let mut made_progress = false;
+        if output_cursor < output_interleaved.len() {
+            let writable_frames = {
+                let ring = vout_ring.lock();
+                let header = ring.header().map_err(|error| CoreAudioError::Probe {
+                    reason: format!("failed to inspect vout ring: {error}"),
+                })?;
+                let used_frames = header.write_idx.saturating_sub(header.read_idx) as usize;
+                (header.capacity_frames as usize).saturating_sub(used_frames)
+            };
+            if writable_frames > 0 {
+                let remaining_frames = (output_interleaved.len() - output_cursor) / output_channels;
+                let frames_to_write = writable_frames.min(remaining_frames).min(chunk_frames);
+                let end = output_cursor + frames_to_write * output_channels;
+                let written_frames = vout_ring
+                    .lock()
+                    .write_interleaved(&output_interleaved[output_cursor..end])
+                    .map_err(|error| CoreAudioError::Probe {
+                        reason: format!("failed to write vout ring: {error}"),
+                    })?;
+                if written_frames > 0 {
+                    output_cursor = output_cursor
+                        .saturating_add(written_frames.saturating_mul(output_channels));
+                    made_progress = true;
+                }
+            }
+        }
+
+        let captured_before = captured.len();
+        read_ring_samples(
+            &vin_ring,
+            request.vin_channels as usize,
+            max_capture_samples,
+            &mut captured,
+        )?;
+        made_progress |= captured.len() > captured_before;
+
+        if output_cursor >= output_interleaved.len() && captured.len() >= max_capture_samples {
+            break;
+        }
+
+        if !made_progress {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    if captured.len() < max_capture_samples {
+        read_ring_samples(
+            &vin_ring,
+            request.vin_channels as usize,
+            max_capture_samples,
+            &mut captured,
+        )?;
+    }
+    if captured.len() < probe.len() * request.vin_channels as usize {
+        return Err(CoreAudioError::ProbeTimeout {
+            timeout_ms: request.timeout.as_millis() as u64,
+        });
+    }
+
+    let captured_mono = collapse_to_mono(&captured, request.vin_channels as usize);
+    let (peak_index, correlation_score) = estimate_latency_frames(&captured_mono, &probe)?;
+    if correlation_score < MIN_CORRELATION_SCORE {
+        return Err(CoreAudioError::ProbeCorrelationLow {
+            score: correlation_score,
+        });
+    }
+    let latency_frames = peak_index as i64;
+    let latency_ms = latency_frames as f64 * 1000.0 / request.sample_rate as f64;
+    Ok(LoopbackProbeResult {
+        latency_frames,
+        latency_ms,
+        correlation_score,
+        output_signal_frames,
+        captured_frames: captured_mono.len(),
+    })
+}
+
+pub fn monitor_vin_ring_signal(
+    request: &VinRingMonitorRequest,
+) -> Result<VinRingMonitorResult, CoreAudioError> {
+    if request.sample_rate == 0 || request.vin_channels == 0 {
+        return Err(CoreAudioError::Probe {
+            reason: "sample_rate and vin_channels must be > 0".to_string(),
+        });
+    }
+    if request.buffer_frames == 0 {
+        return Err(CoreAudioError::Probe {
+            reason: "buffer_frames must be > 0".to_string(),
+        });
+    }
+
+    let vin_ring_spec = RingSpec {
+        sample_rate: request.sample_rate,
+        channels: request.vin_channels,
+        capacity_frames: request.buffer_frames.saturating_mul(8),
+    };
+    let vin_ring_name = stream_name(RingStreamDirection::Vin, &request.vin_uid);
+    let vin_ring = global_registry()
+        .create_or_open(&vin_ring_name, vin_ring_spec)
+        .map_err(|error| CoreAudioError::Probe {
+            reason: format!("failed to open vin ring '{vin_ring_name}': {error}"),
+        })?;
+    drain_ring(&vin_ring, request.vin_channels as usize)?;
+
+    let deadline = Instant::now() + request.timeout;
+    let mut captured = Vec::<f32>::new();
+    let max_capture_samples = request.sample_rate as usize
+        * request.timeout.as_secs().max(1) as usize
+        * request.vin_channels as usize
+        * 2;
+    while Instant::now() < deadline {
+        read_ring_samples(
+            &vin_ring,
+            request.vin_channels as usize,
+            max_capture_samples,
+            &mut captured,
+        )?;
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    read_ring_samples(
+        &vin_ring,
+        request.vin_channels as usize,
+        max_capture_samples,
+        &mut captured,
+    )?;
+
+    let captured_mono = collapse_to_mono(&captured, request.vin_channels as usize);
+    let mut peak = 0.0_f32;
+    let mut sum_squares = 0.0_f64;
+    for sample in &captured_mono {
+        peak = peak.max(sample.abs());
+        let sample = *sample as f64;
+        sum_squares += sample * sample;
+    }
+    let rms = if captured_mono.is_empty() {
+        0.0
+    } else {
+        (sum_squares / captured_mono.len() as f64).sqrt() as f32
+    };
+    Ok(VinRingMonitorResult {
+        captured_frames: captured_mono.len(),
+        peak,
+        rms,
+    })
 }
 
 /// Best-effort microphone permission probe.
@@ -272,6 +831,204 @@ fn collect_input_details(configs: cpal::SupportedInputConfigs) -> (u16, Vec<u32>
         if max_channels == 0 { 1 } else { max_channels },
         sample_rates.into_iter().collect(),
     )
+}
+
+fn device_info_from_device(
+    device: &cpal::Device,
+    direction: StreamDirection,
+    index: usize,
+) -> Result<ExternalDeviceInfo, CoreAudioError> {
+    let name = device
+        .description()
+        .map(|description| description.name().to_string())
+        .unwrap_or_else(|_| format!("Unknown Device {index}"));
+    let uid = device.id().map_err(|error| {
+        CoreAudioError::Enumerate(format!("failed to get stable id for '{name}': {error}"))
+    })?;
+    let uid = uid.to_string();
+    let (channels, sample_rates) = match direction {
+        StreamDirection::Input => {
+            let configs = device
+                .supported_input_configs()
+                .map_err(|error| CoreAudioError::Enumerate(error.to_string()))?;
+            collect_input_details(configs)
+        }
+        StreamDirection::Output => {
+            let configs = device
+                .supported_output_configs()
+                .map_err(|error| CoreAudioError::Enumerate(error.to_string()))?;
+            collect_output_details(configs)
+        }
+    };
+    Ok(ExternalDeviceInfo {
+        uid,
+        name,
+        manufacturer: None,
+        transport: None,
+        channels,
+        sample_rates,
+    })
+}
+
+#[derive(Debug)]
+struct ProbePlaybackState {
+    samples: Vec<f32>,
+    cursor: AtomicUsize,
+    finished: AtomicBool,
+}
+
+fn build_probe_signal(frames: usize) -> Vec<f32> {
+    let start_hz = 450.0_f32;
+    let end_hz = 6_500.0_f32;
+    let chirp_start = frames.saturating_sub(1).min(64);
+    let chirp_frames = frames.saturating_sub(chirp_start).max(1);
+    let denom = chirp_frames.saturating_sub(1).max(1) as f32;
+    let mut out = vec![0.0_f32; frames];
+    if let Some(first) = out.first_mut() {
+        *first = 0.95;
+    }
+    for index in 0..chirp_frames {
+        let t = index as f32 / denom;
+        let phase = 2.0 * PI * (start_hz * t + ((end_hz - start_hz) * 0.5 * t * t));
+        let window = 0.5 - 0.5 * (2.0 * PI * t).cos();
+        out[chirp_start + index] += 0.8 * window * phase.sin();
+    }
+    out
+}
+
+fn build_output_timeline(
+    probe: &[f32],
+    pre_roll_frames: usize,
+    post_roll_frames: usize,
+) -> Vec<f32> {
+    let mut out = Vec::with_capacity(pre_roll_frames + probe.len() + post_roll_frames);
+    out.resize(pre_roll_frames, 0.0);
+    out.extend_from_slice(probe);
+    out.resize(out.len() + post_roll_frames, 0.0);
+    out
+}
+
+fn interleave_mono_signal(signal: &[f32], channels: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(signal.len() * channels.max(1));
+    for &sample in signal {
+        for _ in 0..channels.max(1) {
+            out.push(sample);
+        }
+    }
+    out
+}
+
+fn collapse_to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
+    if channels <= 1 {
+        return samples.to_vec();
+    }
+
+    let frames = samples.len() / channels;
+    let mut out = Vec::with_capacity(frames);
+    for frame in 0..frames {
+        let mut sum = 0.0_f32;
+        for channel in 0..channels {
+            sum += samples[frame * channels + channel];
+        }
+        out.push(sum / channels as f32);
+    }
+    out
+}
+
+fn estimate_latency_frames(
+    captured: &[f32],
+    probe: &[f32],
+) -> Result<(usize, f32), CoreAudioError> {
+    if captured.len() < probe.len() {
+        return Err(CoreAudioError::Probe {
+            reason: format!(
+                "captured stream too short for correlation (captured_frames={}, probe_frames={})",
+                captured.len(),
+                probe.len()
+            ),
+        });
+    }
+
+    let probe_energy = probe
+        .iter()
+        .map(|sample| {
+            let value = *sample as f64;
+            value * value
+        })
+        .sum::<f64>();
+    if probe_energy <= f64::EPSILON {
+        return Err(CoreAudioError::Probe {
+            reason: "probe signal energy is zero".to_string(),
+        });
+    }
+
+    let mut best_index = 0usize;
+    let mut best_score = 0.0_f32;
+    for start in 0..=captured.len() - probe.len() {
+        let mut dot = 0.0_f64;
+        let mut window_energy = 0.0_f64;
+        for (sample, probe_sample) in captured[start..start + probe.len()]
+            .iter()
+            .zip(probe.iter())
+        {
+            let sample = *sample as f64;
+            let probe_sample = *probe_sample as f64;
+            dot += sample * probe_sample;
+            window_energy += sample * sample;
+        }
+
+        if window_energy <= f64::EPSILON {
+            continue;
+        }
+
+        let score = (dot / (probe_energy.sqrt() * window_energy.sqrt())) as f32;
+        let magnitude = score.abs();
+        if magnitude > best_score {
+            best_score = magnitude;
+            best_index = start;
+        }
+    }
+
+    Ok((best_index, best_score))
+}
+
+fn drain_ring(ring: &mars_shm::SharedRingHandle, channels: usize) -> Result<(), CoreAudioError> {
+    let mut scratch = vec![0.0_f32; channels.max(1) * 512];
+    loop {
+        let read_frames = ring
+            .lock()
+            .read_interleaved(&mut scratch)
+            .map_err(|error| CoreAudioError::Probe {
+                reason: format!("failed to drain vin ring: {error}"),
+            })?;
+        if read_frames == 0 {
+            return Ok(());
+        }
+    }
+}
+
+fn read_ring_samples(
+    ring: &mars_shm::SharedRingHandle,
+    channels: usize,
+    max_capture_samples: usize,
+    captured: &mut Vec<f32>,
+) -> Result<(), CoreAudioError> {
+    let remaining = max_capture_samples.saturating_sub(captured.len());
+    if remaining == 0 {
+        return Ok(());
+    }
+
+    let frame_capacity = (remaining / channels.max(1)).max(1);
+    let mut scratch = vec![0.0_f32; frame_capacity * channels.max(1)];
+    let read_frames = ring
+        .lock()
+        .read_interleaved(&mut scratch)
+        .map_err(|error| CoreAudioError::Probe {
+            reason: format!("failed to read vin ring: {error}"),
+        })?;
+    let samples = read_frames.saturating_mul(channels.max(1));
+    captured.extend_from_slice(&scratch[..samples.min(remaining)]);
+    Ok(())
 }
 
 const EXTERNAL_QUEUE_PERIODS: usize = 16;
@@ -1261,7 +2018,7 @@ fn pop_samples(
 mod tests {
     use mars_types::{DeviceMatch, ExternalDeviceInfo, TransportType};
 
-    use super::find_match;
+    use super::{build_probe_signal, estimate_latency_frames, find_match};
 
     fn candidate(
         uid: &str,
@@ -1357,5 +2114,29 @@ mod tests {
         let matched = find_match(&criteria, &candidates).expect("match expected");
         assert_eq!(matched.device.uid, "known");
         assert!(!matched.used_unknown_metadata);
+    }
+
+    #[test]
+    fn latency_estimator_finds_expected_offset() {
+        let probe = build_probe_signal(512);
+        let mut captured = vec![0.0_f32; 321];
+        captured.extend_from_slice(&probe);
+        captured.resize(captured.len() + 200, 0.0);
+
+        let (offset, score) = estimate_latency_frames(&captured, &probe).expect("estimate");
+        assert_eq!(offset, 321);
+        assert!(score > 0.99, "score={score}");
+    }
+
+    #[test]
+    fn latency_estimator_handles_polarity_inversion() {
+        let probe = build_probe_signal(512);
+        let mut captured = vec![0.0_f32; 177];
+        captured.extend(probe.iter().map(|sample| -*sample));
+        captured.resize(captured.len() + 120, 0.0);
+
+        let (offset, score) = estimate_latency_frames(&captured, &probe).expect("estimate");
+        assert_eq!(offset, 177);
+        assert!(score > 0.99, "score={score}");
     }
 }

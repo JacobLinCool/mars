@@ -17,5 +17,8 @@ target/
 #.idea/
 
 bundles/mars.driver/Contents/_CodeSignature
+bundles/mars.driver/Contents/CodeResources
 bundles/mars.driver/Contents/MacOS/mars_hal
 .DS_Store
+sudo.secret
+notary.secret

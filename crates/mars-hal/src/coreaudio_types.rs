@@ -11,11 +11,15 @@ use std::ffi::c_void;
 pub type OSStatus = i32;
 pub type AudioObjectID = u32;
 pub type UInt32 = u32;
+pub type UInt8 = u8;
+pub type Float32 = f32;
 pub type Float64 = f64;
-pub type Boolean = u32;
+pub type Boolean = u8;
 pub type HRESULT = i32;
 pub type ULONG = u32;
-pub type REFIID = *const c_void;
+pub type CFStringRef = *const c_void;
+pub type CFPropertyListRef = *const c_void;
+pub type CFDictionaryRef = *const c_void;
 
 // ---------------------------------------------------------------------------
 // OSStatus constants
@@ -52,6 +56,9 @@ pub const K_AUDIO_OBJECT_CLASS_ID: UInt32 = fourcc(b"aobj");
 pub const K_AUDIO_PLUG_IN_CLASS_ID: UInt32 = fourcc(b"aplg");
 pub const K_AUDIO_DEVICE_CLASS_ID: UInt32 = fourcc(b"adev");
 pub const K_AUDIO_STREAM_CLASS_ID: UInt32 = fourcc(b"astr");
+pub const K_AUDIO_CONTROL_CLASS_ID: UInt32 = fourcc(b"actl");
+pub const K_AUDIO_LEVEL_CONTROL_CLASS_ID: UInt32 = fourcc(b"levl");
+pub const K_AUDIO_VOLUME_CONTROL_CLASS_ID: UInt32 = fourcc(b"vlme");
 pub const K_AUDIO_TRANSPORT_TYPE_VIRTUAL: UInt32 = fourcc(b"virt");
 
 // ---------------------------------------------------------------------------
@@ -78,9 +85,17 @@ pub const K_AUDIO_OBJECT_PROPERTY_BASE_CLASS: UInt32 = fourcc(b"bcls");
 pub const K_AUDIO_OBJECT_PROPERTY_CLASS: UInt32 = fourcc(b"clas");
 pub const K_AUDIO_OBJECT_PROPERTY_OWNER: UInt32 = fourcc(b"stdw");
 pub const K_AUDIO_OBJECT_PROPERTY_OWNED_OBJECTS: UInt32 = fourcc(b"ownd");
+pub const K_AUDIO_OBJECT_PROPERTY_CONTROL_LIST: UInt32 = fourcc(b"ctrl");
 pub const K_AUDIO_OBJECT_PROPERTY_NAME: UInt32 = fourcc(b"lnam");
 pub const K_AUDIO_OBJECT_PROPERTY_MANUFACTURER: UInt32 = fourcc(b"lmak");
-pub const K_AUDIO_OBJECT_PROPERTY_CUSTOM_PROPERTY_INFO_LIST: UInt32 = fourcc(b"cpil");
+pub const K_AUDIO_OBJECT_PROPERTY_CUSTOM_PROPERTY_INFO_LIST: UInt32 = fourcc(b"cust");
+pub const K_AUDIO_CONTROL_PROPERTY_SCOPE: UInt32 = fourcc(b"cscp");
+pub const K_AUDIO_CONTROL_PROPERTY_ELEMENT: UInt32 = fourcc(b"celm");
+pub const K_AUDIO_LEVEL_CONTROL_PROPERTY_SCALAR_VALUE: UInt32 = fourcc(b"lcsv");
+pub const K_AUDIO_LEVEL_CONTROL_PROPERTY_DECIBEL_VALUE: UInt32 = fourcc(b"lcdv");
+pub const K_AUDIO_LEVEL_CONTROL_PROPERTY_DECIBEL_RANGE: UInt32 = fourcc(b"lcdr");
+pub const K_AUDIO_LEVEL_CONTROL_PROPERTY_CONVERT_SCALAR_TO_DECIBELS: UInt32 = fourcc(b"lcsd");
+pub const K_AUDIO_LEVEL_CONTROL_PROPERTY_CONVERT_DECIBELS_TO_SCALAR: UInt32 = fourcc(b"lcds");
 
 pub const K_AUDIO_PLUG_IN_PROPERTY_BUNDLE_ID: UInt32 = fourcc(b"piid");
 pub const K_AUDIO_PLUG_IN_PROPERTY_DEVICE_LIST: UInt32 = fourcc(b"dev#");
@@ -107,6 +122,11 @@ pub const K_AUDIO_DEVICE_PROPERTY_CLOCK_DOMAIN: UInt32 = fourcc(b"clkd");
 pub const K_AUDIO_DEVICE_PROPERTY_IS_ALIVE: UInt32 = fourcc(b"livn");
 pub const K_AUDIO_DEVICE_PROPERTY_IS_RUNNING: UInt32 = fourcc(b"goin");
 pub const K_AUDIO_DEVICE_PROPERTY_PREFERRED_CHANNELS_FOR_STEREO: UInt32 = fourcc(b"dch2");
+pub const K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR: UInt32 = fourcc(b"volm");
+pub const K_AUDIO_DEVICE_PROPERTY_VOLUME_DECIBELS: UInt32 = fourcc(b"vold");
+pub const K_AUDIO_DEVICE_PROPERTY_VOLUME_RANGE_DECIBELS: UInt32 = fourcc(b"vdb#");
+pub const K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR_TO_DECIBELS: UInt32 = fourcc(b"v2db");
+pub const K_AUDIO_DEVICE_PROPERTY_VOLUME_DECIBELS_TO_SCALAR: UInt32 = fourcc(b"db2v");
 
 // ---------------------------------------------------------------------------
 // Standard property selectors — Stream
@@ -116,9 +136,9 @@ pub const K_AUDIO_STREAM_PROPERTY_DIRECTION: UInt32 = fourcc(b"sdir");
 pub const K_AUDIO_STREAM_PROPERTY_TERMINAL_TYPE: UInt32 = fourcc(b"term");
 pub const K_AUDIO_STREAM_PROPERTY_START_CHANNEL: UInt32 = fourcc(b"schn");
 pub const K_AUDIO_STREAM_PROPERTY_VIRTUAL_FORMAT: UInt32 = fourcc(b"sfmt");
-pub const K_AUDIO_STREAM_PROPERTY_PHYSICAL_FORMAT: UInt32 = fourcc(b"pfmt");
+pub const K_AUDIO_STREAM_PROPERTY_PHYSICAL_FORMAT: UInt32 = fourcc(b"pft ");
 pub const K_AUDIO_STREAM_PROPERTY_AVAILABLE_VIRTUAL_FORMATS: UInt32 = fourcc(b"sfma");
-pub const K_AUDIO_STREAM_PROPERTY_AVAILABLE_PHYSICAL_FORMATS: UInt32 = fourcc(b"pfma");
+pub const K_AUDIO_STREAM_PROPERTY_AVAILABLE_PHYSICAL_FORMATS: UInt32 = fourcc(b"pfta");
 pub const K_AUDIO_STREAM_PROPERTY_LATENCY: UInt32 = fourcc(b"ltnc");
 pub const K_AUDIO_STREAM_PROPERTY_IS_ACTIVE: UInt32 = fourcc(b"sact");
 
@@ -148,15 +168,16 @@ pub const K_OUTPUT_TERMINAL: UInt32 = 0x0301;
 // ---------------------------------------------------------------------------
 
 pub const K_MARS_PROPERTY_DESIRED_STATE: UInt32 = fourcc(b"mdst");
-pub const K_MARS_PROPERTY_APPLIED_STATE: UInt32 = fourcc(b"mast");
+// Avoid collision with CoreAudio's deprecated `kAudioHardwarePropertyProcessIsMaster` (`'mast'`).
+pub const K_MARS_PROPERTY_APPLIED_STATE: UInt32 = fourcc(b"mpas");
 pub const K_MARS_PROPERTY_RUNTIME_STATS: UInt32 = fourcc(b"mrts");
 pub const K_MARS_PROPERTY_CONFIG_SUMMARY: UInt32 = fourcc(b"mcfg");
 
 // ---------------------------------------------------------------------------
-// Custom property qualifier type (CoreFoundation type IDs for CFData)
+// Custom property data types (see AudioServerPlugIn.h)
 // ---------------------------------------------------------------------------
 
-pub const K_AUDIO_SERVER_PLUG_IN_CUSTOM_PROPERTY_DATA_TYPE_CFDATA: UInt32 = fourcc(b"cfdt");
+pub const K_AUDIO_SERVER_PLUG_IN_CUSTOM_PROPERTY_DATA_TYPE_CFPROPERTYLIST: UInt32 = fourcc(b"plst");
 pub const K_AUDIO_SERVER_PLUG_IN_CUSTOM_PROPERTY_DATA_TYPE_NONE: UInt32 = 0;
 
 // ---------------------------------------------------------------------------
@@ -272,7 +293,27 @@ pub type AudioServerPlugInHostRef = *const AudioServerPlugInHostInterface;
 #[derive(Debug)]
 #[repr(C)]
 pub struct AudioServerPlugInHostInterface {
-    pub _reserved: *const c_void,
+    pub properties_changed: unsafe extern "C" fn(
+        host: AudioServerPlugInHostRef,
+        object_id: AudioObjectID,
+        number_addresses: UInt32,
+        addresses: *const AudioObjectPropertyAddress,
+    ) -> OSStatus,
+
+    pub copy_from_storage: unsafe extern "C" fn(
+        host: AudioServerPlugInHostRef,
+        key: CFStringRef,
+        data: *mut CFPropertyListRef,
+    ) -> OSStatus,
+
+    pub write_to_storage: unsafe extern "C" fn(
+        host: AudioServerPlugInHostRef,
+        key: CFStringRef,
+        data: CFPropertyListRef,
+    ) -> OSStatus,
+
+    pub delete_from_storage:
+        unsafe extern "C" fn(host: AudioServerPlugInHostRef, key: CFStringRef) -> OSStatus,
 
     pub request_device_configuration_change: unsafe extern "C" fn(
         host: AudioServerPlugInHostRef,
@@ -280,39 +321,93 @@ pub struct AudioServerPlugInHostInterface {
         change_action: u64,
         change_info: *const c_void,
     ) -> OSStatus,
-
-    pub properties_changed: unsafe extern "C" fn(
-        host: AudioServerPlugInHostRef,
-        object_id: AudioObjectID,
-        number_addresses: UInt32,
-        addresses: *const AudioObjectPropertyAddress,
-    ) -> OSStatus,
 }
 
 // ---------------------------------------------------------------------------
 // IUnknown / AudioServerPlugInDriver UUIDs
 // ---------------------------------------------------------------------------
 
-/// IUnknown UUID: 00000000-0000-0000-C000-000000000046
-pub static IID_IUNKNOWN: [u8; 16] = [
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
-];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct CFUUIDBytes {
+    pub byte0: UInt8,
+    pub byte1: UInt8,
+    pub byte2: UInt8,
+    pub byte3: UInt8,
+    pub byte4: UInt8,
+    pub byte5: UInt8,
+    pub byte6: UInt8,
+    pub byte7: UInt8,
+    pub byte8: UInt8,
+    pub byte9: UInt8,
+    pub byte10: UInt8,
+    pub byte11: UInt8,
+    pub byte12: UInt8,
+    pub byte13: UInt8,
+    pub byte14: UInt8,
+    pub byte15: UInt8,
+}
 
-/// AudioServerPlugInDriverInterface UUID: 443ABAB8-E7B3-491A-B985-BEB9187030DB
-pub static IID_AUDIO_SERVER_PLUGIN_DRIVER: [u8; 16] = [
-    0x44, 0x3A, 0xBA, 0xB8, 0xE7, 0xB3, 0x49, 0x1A, 0xB9, 0x85, 0xBE, 0xB9, 0x18, 0x70, 0x30, 0xDB,
-];
+pub type REFIID = CFUUIDBytes;
+
+/// IUnknown UUID: 00000000-0000-0000-C000-000000000046
+pub const IID_IUNKNOWN: CFUUIDBytes = CFUUIDBytes {
+    byte0: 0x00,
+    byte1: 0x00,
+    byte2: 0x00,
+    byte3: 0x00,
+    byte4: 0x00,
+    byte5: 0x00,
+    byte6: 0x00,
+    byte7: 0x00,
+    byte8: 0xC0,
+    byte9: 0x00,
+    byte10: 0x00,
+    byte11: 0x00,
+    byte12: 0x00,
+    byte13: 0x00,
+    byte14: 0x00,
+    byte15: 0x46,
+};
+
+/// AudioServerPlugInDriverInterface UUID in CoreFoundation `CFUUIDBytes` order.
+///
+/// On macOS, `REFIID` is `CFUUIDBytes` passed by value, not a pointer to a COM
+/// GUID. The byte order must therefore exactly match the bytes from
+/// `CFUUIDGetConstantUUIDWithBytes`.
+pub const IID_AUDIO_SERVER_PLUGIN_DRIVER: CFUUIDBytes = CFUUIDBytes {
+    byte0: 0xEE,
+    byte1: 0xA5,
+    byte2: 0x77,
+    byte3: 0x3D,
+    byte4: 0xCC,
+    byte5: 0x43,
+    byte6: 0x49,
+    byte7: 0xF1,
+    byte8: 0x8E,
+    byte9: 0x00,
+    byte10: 0x8F,
+    byte11: 0x96,
+    byte12: 0xE7,
+    byte13: 0xD2,
+    byte14: 0x3B,
+    byte15: 0x17,
+};
 
 // ---------------------------------------------------------------------------
 // AudioServerPlugInDriverInterface — COM vtable
 // ---------------------------------------------------------------------------
 
-/// COM vtable matching Apple's AudioServerPlugIn.h `AudioServerPlugInDriverInterface`.
-/// 24 function pointers in the exact order the host expects.
+/// COM interface matching Apple's AudioServerPlugIn.h `AudioServerPlugInDriverInterface`.
+///
+/// The leading `_reserved` slot is part of the IUnknown ABI. Omitting it shifts
+/// every function pointer by one word and causes the host to dispatch to the
+/// wrong entrypoints during `QueryInterface`.
 #[repr(C)]
 #[allow(missing_debug_implementations)]
-pub struct AudioServerPlugInDriverVTable {
-    // COM / IUnknown
+pub struct AudioServerPlugInDriverInterface {
+    pub _reserved: *mut c_void,
+
     pub query_interface: unsafe extern "C" fn(
         driver: *mut c_void,
         iid: REFIID,
@@ -322,36 +417,40 @@ pub struct AudioServerPlugInDriverVTable {
     pub release: unsafe extern "C" fn(driver: *mut c_void) -> ULONG,
 
     // Lifecycle
-    pub initialize:
-        unsafe extern "C" fn(driver: *mut c_void, host: AudioServerPlugInHostRef) -> OSStatus,
+    pub initialize: unsafe extern "C" fn(
+        driver: AudioServerPlugInDriverRef,
+        host: AudioServerPlugInHostRef,
+    ) -> OSStatus,
     pub create_device: unsafe extern "C" fn(
-        driver: *mut c_void,
-        description: *const c_void,
+        driver: AudioServerPlugInDriverRef,
+        description: CFDictionaryRef,
         client_info: *const AudioServerPlugInClientInfo,
         device_object_id: *mut AudioObjectID,
     ) -> OSStatus,
-    pub destroy_device:
-        unsafe extern "C" fn(driver: *mut c_void, device_object_id: AudioObjectID) -> OSStatus,
+    pub destroy_device: unsafe extern "C" fn(
+        driver: AudioServerPlugInDriverRef,
+        device_object_id: AudioObjectID,
+    ) -> OSStatus,
     pub add_device_client: unsafe extern "C" fn(
-        driver: *mut c_void,
+        driver: AudioServerPlugInDriverRef,
         device_object_id: AudioObjectID,
         client_info: *const AudioServerPlugInClientInfo,
     ) -> OSStatus,
     pub remove_device_client: unsafe extern "C" fn(
-        driver: *mut c_void,
+        driver: AudioServerPlugInDriverRef,
         device_object_id: AudioObjectID,
         client_info: *const AudioServerPlugInClientInfo,
     ) -> OSStatus,
 
     // Configuration change
     pub perform_device_configuration_change: unsafe extern "C" fn(
-        driver: *mut c_void,
+        driver: AudioServerPlugInDriverRef,
         device_object_id: AudioObjectID,
         change_action: u64,
         change_info: *const c_void,
     ) -> OSStatus,
     pub abort_device_configuration_change: unsafe extern "C" fn(
-        driver: *mut c_void,
+        driver: AudioServerPlugInDriverRef,
         device_object_id: AudioObjectID,
         change_action: u64,
         change_info: *const c_void,
@@ -359,20 +458,20 @@ pub struct AudioServerPlugInDriverVTable {
 
     // Property operations
     pub has_property: unsafe extern "C" fn(
-        driver: *mut c_void,
+        driver: AudioServerPlugInDriverRef,
         object_id: AudioObjectID,
         client_process_id: i32,
         address: *const AudioObjectPropertyAddress,
     ) -> Boolean,
     pub is_property_settable: unsafe extern "C" fn(
-        driver: *mut c_void,
+        driver: AudioServerPlugInDriverRef,
         object_id: AudioObjectID,
         client_process_id: i32,
         address: *const AudioObjectPropertyAddress,
         is_settable: *mut Boolean,
     ) -> OSStatus,
     pub get_property_data_size: unsafe extern "C" fn(
-        driver: *mut c_void,
+        driver: AudioServerPlugInDriverRef,
         object_id: AudioObjectID,
         client_process_id: i32,
         address: *const AudioObjectPropertyAddress,
@@ -381,7 +480,7 @@ pub struct AudioServerPlugInDriverVTable {
         data_size: *mut UInt32,
     ) -> OSStatus,
     pub get_property_data: unsafe extern "C" fn(
-        driver: *mut c_void,
+        driver: AudioServerPlugInDriverRef,
         object_id: AudioObjectID,
         client_process_id: i32,
         address: *const AudioObjectPropertyAddress,
@@ -392,7 +491,7 @@ pub struct AudioServerPlugInDriverVTable {
         data: *mut c_void,
     ) -> OSStatus,
     pub set_property_data: unsafe extern "C" fn(
-        driver: *mut c_void,
+        driver: AudioServerPlugInDriverRef,
         object_id: AudioObjectID,
         client_process_id: i32,
         address: *const AudioObjectPropertyAddress,
@@ -403,27 +502,34 @@ pub struct AudioServerPlugInDriverVTable {
     ) -> OSStatus,
 
     // IO operations
-    pub start_io:
-        unsafe extern "C" fn(driver: *mut c_void, device_object_id: AudioObjectID) -> OSStatus,
-    pub stop_io:
-        unsafe extern "C" fn(driver: *mut c_void, device_object_id: AudioObjectID) -> OSStatus,
-    pub get_zero_time_stamp: unsafe extern "C" fn(
-        driver: *mut c_void,
+    pub start_io: unsafe extern "C" fn(
+        driver: AudioServerPlugInDriverRef,
         device_object_id: AudioObjectID,
+        client_id: UInt32,
+    ) -> OSStatus,
+    pub stop_io: unsafe extern "C" fn(
+        driver: AudioServerPlugInDriverRef,
+        device_object_id: AudioObjectID,
+        client_id: UInt32,
+    ) -> OSStatus,
+    pub get_zero_time_stamp: unsafe extern "C" fn(
+        driver: AudioServerPlugInDriverRef,
+        device_object_id: AudioObjectID,
+        client_id: UInt32,
         out_sample_time: *mut Float64,
         out_host_time: *mut u64,
         out_seed: *mut u64,
     ) -> OSStatus,
     pub will_do_io_operation: unsafe extern "C" fn(
-        driver: *mut c_void,
+        driver: AudioServerPlugInDriverRef,
         device_object_id: AudioObjectID,
         client_id: UInt32,
         operation_id: UInt32,
         will_do: *mut Boolean,
-        is_input: *mut Boolean,
+        will_do_in_place: *mut Boolean,
     ) -> OSStatus,
     pub begin_io_operation: unsafe extern "C" fn(
-        driver: *mut c_void,
+        driver: AudioServerPlugInDriverRef,
         device_object_id: AudioObjectID,
         client_id: UInt32,
         operation_id: UInt32,
@@ -431,7 +537,7 @@ pub struct AudioServerPlugInDriverVTable {
         io_cycle_info: *const AudioServerPlugInIOCycleInfo,
     ) -> OSStatus,
     pub do_io_operation: unsafe extern "C" fn(
-        driver: *mut c_void,
+        driver: AudioServerPlugInDriverRef,
         device_object_id: AudioObjectID,
         stream_object_id: AudioObjectID,
         client_id: UInt32,
@@ -442,7 +548,7 @@ pub struct AudioServerPlugInDriverVTable {
         io_secondary_buffer: *mut c_void,
     ) -> OSStatus,
     pub end_io_operation: unsafe extern "C" fn(
-        driver: *mut c_void,
+        driver: AudioServerPlugInDriverRef,
         device_object_id: AudioObjectID,
         client_id: UInt32,
         operation_id: UInt32,
@@ -452,15 +558,14 @@ pub struct AudioServerPlugInDriverVTable {
 }
 
 // These are raw C-level pointers and do not need Send/Sync semantics enforced
-// by Rust.  The vtable is always referenced through a `*const` obtained from a
-// `static` and lives for the entire lifetime of the process.  This is the same
-// pattern as the COM vtable pattern in every CoreAudio plugin.
-unsafe impl Send for AudioServerPlugInDriverVTable {}
-unsafe impl Sync for AudioServerPlugInDriverVTable {}
+// by Rust. The interface is always referenced through a `*const` obtained from
+// a `static` and lives for the entire lifetime of the process.
+unsafe impl Send for AudioServerPlugInDriverInterface {}
+unsafe impl Sync for AudioServerPlugInDriverInterface {}
 
 /// Plugin driver reference — COM double-indirection pointer.
-/// Points to a `*const AudioServerPlugInDriverVTable`.
-pub type AudioServerPlugInDriverRef = *mut *const AudioServerPlugInDriverVTable;
+/// Points to a `*const AudioServerPlugInDriverInterface`.
+pub type AudioServerPlugInDriverRef = *mut *const AudioServerPlugInDriverInterface;
 
 // IO operation IDs
 pub const K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_WRITE_MIX: UInt32 = fourcc(b"wmix");
@@ -480,9 +585,14 @@ mod tests {
     #[test]
     fn fourcc_values() {
         assert_eq!(K_MARS_PROPERTY_DESIRED_STATE, fourcc(b"mdst"));
-        assert_eq!(K_MARS_PROPERTY_APPLIED_STATE, fourcc(b"mast"));
+        assert_eq!(K_MARS_PROPERTY_APPLIED_STATE, fourcc(b"mpas"));
         assert_eq!(K_MARS_PROPERTY_RUNTIME_STATS, fourcc(b"mrts"));
         assert_eq!(K_MARS_PROPERTY_CONFIG_SUMMARY, fourcc(b"mcfg"));
+        assert_eq!(K_AUDIO_STREAM_PROPERTY_PHYSICAL_FORMAT, fourcc(b"pft "));
+        assert_eq!(
+            K_AUDIO_STREAM_PROPERTY_AVAILABLE_PHYSICAL_FORMATS,
+            fourcc(b"pfta")
+        );
     }
 
     #[test]
@@ -497,5 +607,37 @@ mod tests {
     fn asbd_layout() {
         // Apple defines AudioStreamBasicDescription as 40 bytes on 64-bit.
         assert_eq!(mem::size_of::<AudioStreamBasicDescription>(), 40);
+    }
+
+    #[test]
+    fn boolean_matches_mactypes() {
+        assert_eq!(mem::size_of::<Boolean>(), 1);
+    }
+
+    #[test]
+    fn driver_interface_iunknown_layout() {
+        assert_eq!(
+            mem::offset_of!(AudioServerPlugInDriverInterface, query_interface),
+            mem::size_of::<*mut c_void>()
+        );
+        assert_eq!(
+            mem::offset_of!(AudioServerPlugInDriverInterface, add_ref),
+            2 * mem::size_of::<*mut c_void>()
+        );
+    }
+
+    #[test]
+    fn host_interface_method_order_matches_header() {
+        assert_eq!(
+            mem::offset_of!(AudioServerPlugInHostInterface, properties_changed),
+            0
+        );
+        assert_eq!(
+            mem::offset_of!(
+                AudioServerPlugInHostInterface,
+                request_device_configuration_change
+            ),
+            4 * mem::size_of::<*mut c_void>()
+        );
     }
 }

@@ -17,10 +17,12 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 dirs.workspace = true
+mars-coreaudio = { path = "../mars-coreaudio" }
 mars-ipc = { path = "../mars-ipc" }
 mars-profile = { path = "../mars-profile" }
 mars-types = { path = "../mars-types" }
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 cpal.workspace = true
+mars-shm = { path = "../mars-shm" }
 mars-types = { path = "../mars-types" }
 parking_lot.workspace = true
 regex.workspace = true

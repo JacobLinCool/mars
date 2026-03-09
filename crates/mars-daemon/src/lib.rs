@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -650,7 +652,12 @@ impl MarsDaemon {
             .as_value()
             .unwrap_or(48_000);
         let channels = effective_profile.audio.channels.as_value().unwrap_or(2);
-        let warnings = plan.warnings.clone();
+        let mut warnings = plan.warnings.clone();
+        if driver_stub_active() {
+            warnings.push(
+                "mars.driver is not loaded by coreaudiod; apply completed in stub mode (virtual devices will not appear in system audio list)".to_string(),
+            );
+        }
         Self::ensure_within_deadline(deadline, "driver-compatibility")?;
         if let Err(error) = ensure_driver_compatibility_for_apply() {
             return Err(ApiError::new(error, ExitCode::DriverUnavailable));
@@ -1035,6 +1042,11 @@ impl MarsDaemon {
                 "driver/daemon version mismatch: driver={:?}, daemon={}",
                 driver_version, daemon_version
             ));
+        }
+        if driver_stub_active() {
+            notes.push(
+                "driver stub mode active: profile apply can proceed but virtual devices will not be registered in system audio".to_string(),
+            );
         }
         if driver.pending_change {
             notes.push("driver has a pending configuration change".to_string());
@@ -1510,9 +1522,13 @@ fn render_restart_required(previous: &Profile, next: &Profile) -> bool {
 }
 
 fn read_driver_version() -> Option<String> {
-    mars_hal_client::get_applied_state()
-        .ok()
-        .map(|state| state.driver_version)
+    if let Ok(state) = mars_hal_client::get_applied_state() {
+        return Some(state.driver_version);
+    }
+    if driver_stub_active() {
+        return Some(env!("CARGO_PKG_VERSION").to_string());
+    }
+    None
 }
 
 fn parse_major(version: &str) -> Option<u64> {
@@ -1520,23 +1536,51 @@ fn parse_major(version: &str) -> Option<u64> {
 }
 
 fn ensure_driver_compatibility_for_apply() -> Result<(), String> {
-    let installed = Path::new("/Library/Audio/Plug-Ins/HAL/mars.driver").exists();
-    let loaded = if installed {
-        mars_hal_client::is_driver_loaded()
-    } else {
-        false
-    };
+    ensure_driver_available()?;
+
     let daemon_version = env!("CARGO_PKG_VERSION");
     let driver_version = read_driver_version();
 
-    if is_driver_compatible(installed, loaded, driver_version.as_deref(), daemon_version) {
+    if is_driver_compatible(true, true, driver_version.as_deref(), daemon_version) {
         Ok(())
+    } else if driver_version.is_none() {
+        Err(format!(
+            "unable to read mars.driver version from CoreAudio; reinstall with ./scripts/install.sh and reload coreaudiod (daemon={daemon_version})"
+        ))
     } else {
         Err(format!(
-            "incompatible driver version: driver={:?}, daemon={}",
-            driver_version, daemon_version
+            "incompatible driver version: driver={}, daemon={}",
+            driver_version.unwrap_or_default(),
+            daemon_version
         ))
     }
+}
+
+fn driver_stub_mode_enabled() -> bool {
+    if let Ok(raw) = std::env::var("MARS_ALLOW_STUB_DRIVER") {
+        let value = raw.trim();
+        return value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("yes");
+    }
+
+    sip_disabled()
+}
+
+fn sip_disabled() -> bool {
+    static SIP_DISABLED: OnceLock<bool> = OnceLock::new();
+    *SIP_DISABLED.get_or_init(|| {
+        let Ok(output) = Command::new("/usr/bin/csrutil").arg("status").output() else {
+            return false;
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+        stdout.contains("status: disabled")
+    })
+}
+
+fn driver_stub_active() -> bool {
+    let installed = Path::new("/Library/Audio/Plug-Ins/HAL/mars.driver").exists();
+    installed && driver_stub_mode_enabled() && !mars_hal_client::is_driver_loaded()
 }
 
 fn feedback_risk_notes(graph: Option<&RoutingGraph>, devices: &[DeviceDescriptor]) -> Vec<String> {
@@ -1674,6 +1718,9 @@ fn empty_hal_desired_state() -> HalDesiredState {
 }
 
 fn apply_hal_desired_state(desired: &HalDesiredState) -> Result<(), String> {
+    if driver_stub_active() {
+        return Ok(());
+    }
     mars_hal_client::set_desired_state(desired).map_err(|e| format!("driver client error: {e}"))
 }
 
@@ -1879,6 +1926,12 @@ fn ensure_driver_available() -> Result<(), String> {
     }
 
     if !mars_hal_client::is_driver_loaded() {
+        if driver_stub_mode_enabled() {
+            warn!(
+                "mars.driver bundle exists but plugin is not loaded by coreaudiod; continuing in stub mode (virtual devices will not appear in system audio list)"
+            );
+            return Ok(());
+        }
         return Err("mars.driver bundle exists but plugin is not loaded by coreaudiod; try: sudo killall -9 coreaudiod".to_string());
     }
 
