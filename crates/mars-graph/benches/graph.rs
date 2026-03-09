@@ -2,7 +2,22 @@
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use mars_graph::build_routing_graph;
-use mars_types::{Bus, MixConfig, MixMode, Pipe, Profile, VirtualInputDevice, VirtualOutputDevice};
+use mars_types::{
+    Bus, MixConfig, MixMode, Profile, Route, RouteMatrix, VirtualInputDevice, VirtualOutputDevice,
+};
+
+fn identity_matrix(channels: u16) -> RouteMatrix {
+    let channels = channels as usize;
+    let mut coefficients = vec![vec![0.0; channels]; channels];
+    for (index, row) in coefficients.iter_mut().enumerate() {
+        row[index] = 1.0;
+    }
+    RouteMatrix {
+        rows: channels as u16,
+        cols: channels as u16,
+        coefficients,
+    }
+}
 
 fn small_profile() -> Profile {
     let mut p = Profile::default();
@@ -20,10 +35,13 @@ fn small_profile() -> Profile {
         uid: None,
         mix: None,
     });
-    p.pipes.push(Pipe {
+    p.routes.push(Route {
+        id: "r-app-mix".into(),
         from: "app".into(),
         to: "mix".into(),
         enabled: true,
+        matrix: identity_matrix(2),
+        chain: None,
         gain_db: 0.0,
         mute: false,
         pan: 0.0,
@@ -71,37 +89,49 @@ fn medium_profile() -> Profile {
         uid: None,
         mix: None,
     });
-    p.pipes.push(Pipe {
+    p.routes.push(Route {
+        id: "r-app1-bus1".into(),
         from: "app1".into(),
         to: "bus1".into(),
         enabled: true,
+        matrix: identity_matrix(2),
+        chain: None,
         gain_db: -6.0,
         mute: false,
         pan: 0.0,
         delay_ms: 0.0,
     });
-    p.pipes.push(Pipe {
+    p.routes.push(Route {
+        id: "r-app2-bus1".into(),
         from: "app2".into(),
         to: "bus1".into(),
         enabled: true,
+        matrix: identity_matrix(2),
+        chain: None,
         gain_db: -3.0,
         mute: false,
         pan: 0.0,
         delay_ms: 0.0,
     });
-    p.pipes.push(Pipe {
+    p.routes.push(Route {
+        id: "r-bus1-mix1".into(),
         from: "bus1".into(),
         to: "mix1".into(),
         enabled: true,
+        matrix: identity_matrix(2),
+        chain: None,
         gain_db: 0.0,
         mute: false,
         pan: 0.0,
         delay_ms: 0.0,
     });
-    p.pipes.push(Pipe {
+    p.routes.push(Route {
+        id: "r-bus1-mix2".into(),
         from: "bus1".into(),
         to: "mix2".into(),
         enabled: true,
+        matrix: identity_matrix(2),
+        chain: None,
         gain_db: 0.0,
         mute: false,
         pan: 0.0,
@@ -143,10 +173,13 @@ fn large_profile() -> Profile {
     }
     // app -> bus
     for i in 0..5 {
-        p.pipes.push(Pipe {
+        p.routes.push(Route {
+            id: format!("r-app{i}-bus{i}"),
             from: format!("app{i}"),
             to: format!("bus{i}"),
             enabled: true,
+            matrix: identity_matrix(2),
+            chain: None,
             gain_db: -6.0,
             mute: false,
             pan: 0.0,
@@ -156,10 +189,13 @@ fn large_profile() -> Profile {
     // cross connections: app -> other buses
     for i in 0..5 {
         let target = (i + 1) % 5;
-        p.pipes.push(Pipe {
+        p.routes.push(Route {
+            id: format!("r-app{i}-bus{target}"),
             from: format!("app{i}"),
             to: format!("bus{target}"),
             enabled: true,
+            matrix: identity_matrix(2),
+            chain: None,
             gain_db: -12.0,
             mute: false,
             pan: 0.0,
@@ -168,10 +204,13 @@ fn large_profile() -> Profile {
     }
     // bus -> mix
     for i in 0..5 {
-        p.pipes.push(Pipe {
+        p.routes.push(Route {
+            id: format!("r-bus{i}-mix{i}"),
             from: format!("bus{i}"),
             to: format!("mix{i}"),
             enabled: true,
+            matrix: identity_matrix(2),
+            chain: None,
             gain_db: 0.0,
             mute: false,
             pan: 0.0,
