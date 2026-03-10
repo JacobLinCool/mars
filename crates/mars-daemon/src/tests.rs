@@ -5,16 +5,22 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use mars_coreaudio::{ExternalEndpointHealth, ExternalInputEndpointSnapshot};
 use mars_engine::{Engine, EngineSnapshot};
 use mars_graph::build_routing_graph;
 use mars_ipc::{DaemonRequest, DaemonResponse, IpcClient, LogRequest};
 use mars_shm::{RingSpec, StreamDirection, global_registry, stream_name};
 use mars_types::{
-    AutoOrU32, DeviceDescriptor, FileSink, FileSinkFormat, NodeKind, Pipe, Profile,
-    VirtualInputDevice, VirtualOutputDevice,
+    AutoOrU32, CaptureRuntimeHealth, CaptureRuntimeKind, CaptureRuntimeStatus,
+    CaptureRuntimeTapStatus, DeviceDescriptor, FileSink, FileSinkFormat, NodeKind, Pipe,
+    ProcessTap, ProcessTapSelector, Profile, SystemTap, SystemTapMode, VirtualInputDevice,
+    VirtualOutputDevice,
 };
 
-use super::{MarsDaemon, diff_profiles, is_driver_compatible};
+use super::{
+    MarsDaemon, collect_devices, diff_profiles, enrich_capture_runtime_with_external_inputs,
+    is_driver_compatible,
+};
 
 fn temp_log_path(case: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -272,6 +278,86 @@ fn status_reports_sink_runtime_health_and_write_stats() {
 
     daemon.stop_render_runtime();
     let _ = fs::remove_file(sink_path);
+}
+
+#[test]
+fn collect_devices_includes_capture_tap_external_inputs() {
+    let mut profile = Profile::default();
+    profile.captures.process_taps.push(ProcessTap {
+        id: "tap-app".to_string(),
+        selector: ProcessTapSelector::Pid { pid: 3333 },
+        channels: Some(2),
+    });
+    profile.captures.system_taps.push(SystemTap {
+        id: "tap-system".to_string(),
+        mode: SystemTapMode::AllOutput,
+        channels: Some(2),
+    });
+
+    let devices = collect_devices(&profile, &[]);
+    assert!(
+        devices
+            .iter()
+            .any(|device| device.id == "tap-app" && device.kind == NodeKind::ExternalInput)
+    );
+    assert!(
+        devices
+            .iter()
+            .any(|device| device.id == "tap-system" && device.kind == NodeKind::ExternalInput)
+    );
+}
+
+#[test]
+fn capture_runtime_status_merges_live_external_input_metrics() {
+    let status = CaptureRuntimeStatus {
+        supported: true,
+        discovered_processes: 1,
+        active_taps: 1,
+        failed_taps: 0,
+        taps: vec![CaptureRuntimeTapStatus {
+            id: "tap-app".to_string(),
+            kind: CaptureRuntimeKind::ProcessTap,
+            health: CaptureRuntimeHealth::Healthy,
+            selector: "pid:3333".to_string(),
+            tap_id: Some(42),
+            aggregate_uid: Some("agg.tap-app".to_string()),
+            aggregate_device_id: Some(77),
+            matched_processes: 1,
+            ingested_frames: 0,
+            underrun_count: 0,
+            overrun_count: 0,
+            xrun_count: 0,
+            restart_attempts: 0,
+            error_ring: Vec::new(),
+            last_error: None,
+        }],
+        errors: Vec::new(),
+    };
+
+    let merged = enrich_capture_runtime_with_external_inputs(
+        status,
+        &[ExternalInputEndpointSnapshot {
+            node_id: "tap-app".to_string(),
+            uid: "agg.tap-app".to_string(),
+            health: ExternalEndpointHealth::Degraded,
+            ingested_frames: 1024,
+            underrun_count: 3,
+            overrun_count: 1,
+            xrun_count: 4,
+            restart_attempts: 2,
+            error_ring: vec!["reconnect failed".to_string()],
+        }],
+    );
+
+    assert_eq!(merged.taps.len(), 1);
+    let tap = &merged.taps[0];
+    assert_eq!(tap.health, CaptureRuntimeHealth::Degraded);
+    assert_eq!(tap.ingested_frames, 1024);
+    assert_eq!(tap.underrun_count, 3);
+    assert_eq!(tap.overrun_count, 1);
+    assert_eq!(tap.xrun_count, 4);
+    assert_eq!(tap.restart_attempts, 2);
+    assert_eq!(tap.last_error.as_deref(), Some("reconnect failed"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

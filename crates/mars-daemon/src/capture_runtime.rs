@@ -138,7 +138,7 @@ impl CaptureRuntime {
             let request = ProcessTapRequest {
                 process_object_ids,
                 tap_name: format!("mars process tap {}", tap.id),
-                aggregate_uid: aggregate_uid(&tap.id),
+                aggregate_uid: capture_aggregate_uid(&tap.id),
                 aggregate_name: aggregate_name(&tap.id),
                 mono: tap.channels == Some(1),
                 private_tap: true,
@@ -167,9 +167,11 @@ impl CaptureRuntime {
                 health: CaptureRuntimeHealth::Healthy,
                 selector: selector_string(&tap.selector),
                 tap_id: Some(handle.tap_id),
+                aggregate_uid: Some(handle.aggregate_uid.clone()),
                 aggregate_device_id: Some(handle.aggregate_device_id),
                 matched_processes: matched.len(),
                 last_error: None,
+                ..CaptureRuntimeTapStatus::default()
             });
         }
 
@@ -180,7 +182,7 @@ impl CaptureRuntime {
                     SystemTapMode::AllOutput => SystemTapTarget::AllOutput,
                 },
                 tap_name: format!("mars system tap {}", tap.id),
-                aggregate_uid: aggregate_uid(&tap.id),
+                aggregate_uid: capture_aggregate_uid(&tap.id),
                 aggregate_name: aggregate_name(&tap.id),
                 mono: tap.channels == Some(1),
                 private_tap: true,
@@ -207,9 +209,11 @@ impl CaptureRuntime {
                 health: CaptureRuntimeHealth::Healthy,
                 selector: format!("system:{}", mode_string(tap.mode)),
                 tap_id: Some(handle.tap_id),
+                aggregate_uid: Some(handle.aggregate_uid.clone()),
                 aggregate_device_id: Some(handle.aggregate_device_id),
                 matched_processes: 0,
                 last_error: None,
+                ..CaptureRuntimeTapStatus::default()
             });
         }
 
@@ -305,7 +309,7 @@ fn mode_string(mode: SystemTapMode) -> &'static str {
     }
 }
 
-fn aggregate_uid(tap_id: &str) -> String {
+pub(crate) fn capture_aggregate_uid(tap_id: &str) -> String {
     format!("mars.capture.aggregate.{}.{}", std::process::id(), tap_id)
 }
 
@@ -494,5 +498,98 @@ mod tests {
             .map(|item| (item.pid, item.process_object_id))
             .collect::<Vec<_>>();
         assert_eq!(ordered, vec![(1000, 11), (1000, 22), (2000, 90)]);
+    }
+
+    #[test]
+    fn process_churn_soak_start_stop_keeps_create_destroy_balanced() {
+        #[derive(Debug, Default)]
+        struct ChurnBackend {
+            processes: Mutex<Vec<AudioProcessInfo>>,
+            next_id: Mutex<u32>,
+            created: Mutex<u64>,
+            destroyed: Mutex<u64>,
+        }
+
+        impl TapBackend for ChurnBackend {
+            fn capability(&self) -> Result<TapCapability, String> {
+                Ok(TapCapability {
+                    supported: true,
+                    reason: None,
+                })
+            }
+
+            fn list_processes(&self) -> Result<Vec<AudioProcessInfo>, String> {
+                Ok(self.processes.lock().expect("lock").clone())
+            }
+
+            fn create_process_tap(&self, request: &ProcessTapRequest) -> Result<TapHandle, String> {
+                let mut next = self.next_id.lock().expect("lock");
+                *next += 1;
+                *self.created.lock().expect("lock") += 1;
+                Ok(TapHandle {
+                    tap_id: *next,
+                    tap_uid: format!("tap.process.{}", request.tap_name),
+                    aggregate_device_id: 10_000 + *next,
+                    aggregate_uid: request.aggregate_uid.clone(),
+                })
+            }
+
+            fn create_system_tap(&self, request: &SystemTapRequest) -> Result<TapHandle, String> {
+                let mut next = self.next_id.lock().expect("lock");
+                *next += 1;
+                *self.created.lock().expect("lock") += 1;
+                Ok(TapHandle {
+                    tap_id: *next,
+                    tap_uid: format!("tap.system.{}", request.tap_name),
+                    aggregate_device_id: 20_000 + *next,
+                    aggregate_uid: request.aggregate_uid.clone(),
+                })
+            }
+
+            fn destroy_tap(&self, _handle: &TapHandle) -> Result<(), String> {
+                *self.destroyed.lock().expect("lock") += 1;
+                Ok(())
+            }
+        }
+
+        let backend = Arc::new(ChurnBackend {
+            processes: Mutex::new(Vec::new()),
+            next_id: Mutex::new(100),
+            created: Mutex::new(0),
+            destroyed: Mutex::new(0),
+        });
+
+        let mut profile = Profile::default();
+        profile.captures.process_taps.push(ProcessTap {
+            id: "app".to_string(),
+            selector: ProcessTapSelector::BundleId {
+                bundle_id: "com.example.player".to_string(),
+            },
+            channels: Some(2),
+        });
+        profile.captures.system_taps.push(SystemTap {
+            id: "system".to_string(),
+            mode: mars_types::SystemTapMode::AllOutput,
+            channels: Some(2),
+        });
+
+        for iteration in 0..128_u32 {
+            *backend.processes.lock().expect("lock") = vec![AudioProcessInfo {
+                process_object_id: 10 + iteration,
+                pid: 10_000 + iteration as i32,
+                bundle_id: "com.example.player".to_string(),
+                is_running: true,
+                is_running_input: false,
+                is_running_output: true,
+            }];
+
+            let runtime = CaptureRuntime::start_with_backend(&profile, backend.clone())
+                .expect("runtime start");
+            runtime.stop();
+        }
+
+        let created = *backend.created.lock().expect("lock");
+        let destroyed = *backend.destroyed.lock().expect("lock");
+        assert_eq!(created, destroyed);
     }
 }

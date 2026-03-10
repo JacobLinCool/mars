@@ -57,6 +57,48 @@
       "regression_threshold": 0.15
     },
     {
+      "benchmark_id": "daemon/capture_render/latency/128f",
+      "platform": "macos-15",
+      "metric": "median_ns",
+      "budget_value": 1329.451611326847,
+      "regression_threshold": 0.1
+    },
+    {
+      "benchmark_id": "daemon/capture_render/latency/128f",
+      "platform": "macos-15",
+      "metric": "p95_ns",
+      "budget_value": 1368.1514240384615,
+      "regression_threshold": 0.15
+    },
+    {
+      "benchmark_id": "daemon/capture_render/latency/256f",
+      "platform": "macos-15",
+      "metric": "median_ns",
+      "budget_value": 2292.2028288288284,
+      "regression_threshold": 0.1
+    },
+    {
+      "benchmark_id": "daemon/capture_render/latency/256f",
+      "platform": "macos-15",
+      "metric": "p95_ns",
+      "budget_value": 2377.382181196581,
+      "regression_threshold": 0.15
+    },
+    {
+      "benchmark_id": "daemon/capture_render/xrun/fault25pct/256f",
+      "platform": "macos-15",
+      "metric": "median_ns",
+      "budget_value": 2132.3914467030745,
+      "regression_threshold": 0.1
+    },
+    {
+      "benchmark_id": "daemon/capture_render/xrun/fault25pct/256f",
+      "platform": "macos-15",
+      "metric": "p95_ns",
+      "budget_value": 2215.5324838187703,
+      "regression_threshold": 0.15
+    },
+    {
       "benchmark_id": "daemon/ipc/logs_tail",
       "platform": "macos-15",
       "metric": "median_ns",

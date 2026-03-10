@@ -54,3 +54,7 @@ harness = false
 [[bench]]
 name = "capture_runtime"
 harness = false
+
+[[bench]]
+name = "capture_render"
+harness = false
