@@ -179,6 +179,9 @@ cargo bench -p mars-engine --bench engine -- engine/render_multisource_multioutp
 cargo bench -p mars-daemon --bench daemon_ipc_shm
 ```
 
+Benchmark gate policy, CI job mapping, and local reproduction commands:
+`docs/performance-gates.md`.
+
 ## Getting Started
 
 See the full setup and first-run guide: `docs/getting-started.md`.

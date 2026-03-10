@@ -24,6 +24,13 @@ cat > "$BUDGETS_PATH" <<'JSON'
       "metric": "median_ns",
       "budget_value": 100.0,
       "regression_threshold": 0.10
+    },
+    {
+      "benchmark_id": "other/metric",
+      "platform": "macos-15",
+      "metric": "median_ns",
+      "budget_value": 100.0,
+      "regression_threshold": 0.10
     }
   ]
 }
@@ -57,11 +64,25 @@ cat > "$METRICS_NAN" <<'JSON'
 }
 JSON
 
-python3 scripts/bench/verify.py --budgets-dir "$BUDGETS_DIR" --metrics "$METRICS_OK" --platform macos-15 >/dev/null
+python3 scripts/bench/verify.py \
+  --budgets-dir "$BUDGETS_DIR" \
+  --metrics "$METRICS_OK" \
+  --platform macos-15 \
+  --benchmark-prefix "sanity/" >/dev/null
 
-if python3 scripts/bench/verify.py --budgets-dir "$BUDGETS_DIR" --metrics "$METRICS_NAN" --platform macos-15 >/dev/null 2>&1; then
+if python3 scripts/bench/verify.py --budgets-dir "$BUDGETS_DIR" --metrics "$METRICS_OK" --platform macos-15 >/dev/null 2>&1; then
+  echo "expected missing metric failure when no benchmark-prefix is provided" >&2
+  exit 1
+fi
+
+if python3 scripts/bench/verify.py --budgets-dir "$BUDGETS_DIR" --metrics "$METRICS_OK" --platform macos-15 --benchmark-prefix "missing/" >/dev/null 2>&1; then
+  echo "expected unknown benchmark-prefix to fail verification" >&2
+  exit 1
+fi
+
+if python3 scripts/bench/verify.py --budgets-dir "$BUDGETS_DIR" --metrics "$METRICS_NAN" --platform macos-15 --benchmark-prefix "sanity/" >/dev/null 2>&1; then
   echo "expected non-finite metrics to fail verification" >&2
   exit 1
 fi
 
-echo "non-finite metric guardrail test passed"
+echo "benchmark verification guardrail test passed"
