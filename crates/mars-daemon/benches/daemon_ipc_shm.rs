@@ -12,9 +12,11 @@ use mars_daemon::MarsDaemon;
 use mars_ipc::{DaemonRequest, DaemonResponse, IpcClient, LogRequest};
 use mars_shm::{RingSpec, StreamDirection, global_registry, stream_name};
 use mars_types::{
-    CaptureRuntimeHealth, CaptureRuntimeKind, CaptureRuntimeStatus, CaptureRuntimeTapStatus,
-    DaemonStatus, DeviceDescriptor, DriverStatusSummary, ExternalRuntimeStatus, NodeKind,
-    RuntimeCounters, SinkRuntimeHealth, SinkRuntimeKind, SinkRuntimeSinkStatus, SinkRuntimeStatus,
+    AuPluginApi, CaptureRuntimeHealth, CaptureRuntimeKind, CaptureRuntimeStatus,
+    CaptureRuntimeTapStatus, DaemonStatus, DeviceDescriptor, DriverStatusSummary,
+    ExternalRuntimeStatus, NodeKind, PluginHostHealth, PluginHostInstanceStatus,
+    PluginHostRuntimeStatus, RuntimeCounters, SinkRuntimeHealth, SinkRuntimeKind,
+    SinkRuntimeSinkStatus, SinkRuntimeStatus,
 };
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
@@ -233,6 +235,25 @@ fn sample_status_payload() -> DaemonStatus {
                     last_error: None,
                 },
             ],
+        },
+        plugin_runtime: PluginHostRuntimeStatus {
+            active_instances: 1,
+            failed_instances: 0,
+            timeout_count: 0,
+            error_count: 0,
+            restart_count: 0,
+            instances: vec![PluginHostInstanceStatus {
+                id: "au-main".to_string(),
+                api: AuPluginApi::Auv2,
+                health: PluginHostHealth::Healthy,
+                loaded: true,
+                host_pid: Some(1234),
+                process_calls: 2048,
+                timeout_count: 0,
+                error_count: 0,
+                restart_count: 0,
+                last_error: None,
+            }],
         },
         updated_at: Utc::now(),
     }

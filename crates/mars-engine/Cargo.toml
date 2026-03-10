@@ -26,3 +26,7 @@ stats_alloc = "0.1.10"
 [[bench]]
 name = "engine"
 harness = false
+
+[[bench]]
+name = "plugin_host"
+harness = false

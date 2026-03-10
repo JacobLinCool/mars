@@ -1,14 +1,20 @@
 #![forbid(unsafe_code)]
 //! Realtime-safe-ish audio graph rendering engine.
 
+mod au_host;
+
 use std::collections::{BTreeMap, HashMap};
 use std::f32::consts::{FRAC_PI_4, PI};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
+use au_host::{AuProcessRequest, AuSubmitError, AuWorker, AuWorkerSettings};
 use mars_graph::RoutingGraph;
-use mars_types::{MixMode, ProcessorKind, ProcessorRuntimeStats, RuntimeCounters};
+use mars_types::{
+    AuPluginConfig, MixMode, PluginHostHealth, PluginHostInstanceStatus, PluginHostRuntimeStatus,
+    ProcessorKind, ProcessorRuntimeStats, RuntimeCounters,
+};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::Value;
@@ -100,6 +106,9 @@ trait ProcessorBlock: Send + Sync + std::fmt::Debug {
     );
     fn reset(&self);
     fn stats(&self) -> ProcessorRuntimeStats;
+    fn plugin_status(&self) -> Option<PluginHostInstanceStatus> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -115,14 +124,6 @@ struct ProcessorCounters {
     process_calls: AtomicU64,
     reset_calls: AtomicU64,
     last_generation: AtomicU64,
-}
-
-#[derive(Debug)]
-struct PassthroughProcessorBlock {
-    id: String,
-    _kind: ProcessorKind,
-    prepared: AtomicBool,
-    counters: ProcessorCounters,
 }
 
 #[derive(Debug)]
@@ -159,6 +160,23 @@ struct TimeShiftProcessorBlock {
     state: Mutex<TimeShiftProcessorState>,
     prepared: AtomicBool,
     counters: ProcessorCounters,
+}
+
+#[derive(Debug)]
+struct AuProcessorBlock {
+    id: String,
+    config: AuPluginConfig,
+    state: Mutex<AuProcessorState>,
+    prepared: AtomicBool,
+    counters: ProcessorCounters,
+}
+
+#[derive(Debug, Default)]
+struct AuProcessorState {
+    worker: Option<AuWorker>,
+    channels: usize,
+    sample_rate_hz: u32,
+    max_frames: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -493,6 +511,16 @@ impl TimeShiftConfig {
     }
 }
 
+fn au_config_from_json(config_json: &str) -> AuPluginConfig {
+    let value =
+        serde_json::from_str::<Value>(config_json).expect("compiled config must be valid JSON");
+    if value.is_null() {
+        return AuPluginConfig::default();
+    }
+    serde_json::from_value::<AuPluginConfig>(value)
+        .expect("compiled au config must match validated shape")
+}
+
 fn peaking_coefficients(
     sample_rate_hz: u32,
     freq_hz: f32,
@@ -575,9 +603,9 @@ impl ProcessorSchedule {
                         compiled.id.clone(),
                         TimeShiftConfig::from_config_json(&compiled.config_json),
                     )),
-                    _ => Arc::new(PassthroughProcessorBlock::new(
+                    ProcessorKind::Au => Arc::new(AuProcessorBlock::new(
                         compiled.id.clone(),
-                        compiled.kind,
+                        au_config_from_json(&compiled.config_json),
                     )),
                 };
                 processor.prepare(context);
@@ -618,6 +646,28 @@ impl ProcessorSchedule {
         }
         merged
     }
+
+    fn plugin_runtime_status(&self) -> PluginHostRuntimeStatus {
+        let mut runtime = PluginHostRuntimeStatus::default();
+        for chain in self.route_chains.values() {
+            for processor in &chain.processors {
+                let Some(status) = processor.plugin_status() else {
+                    continue;
+                };
+                runtime.timeout_count = runtime.timeout_count.saturating_add(status.timeout_count);
+                runtime.error_count = runtime.error_count.saturating_add(status.error_count);
+                runtime.restart_count = runtime.restart_count.saturating_add(status.restart_count);
+                if status.loaded && status.health != PluginHostHealth::Failed {
+                    runtime.active_instances = runtime.active_instances.saturating_add(1);
+                }
+                if status.health == PluginHostHealth::Failed {
+                    runtime.failed_instances = runtime.failed_instances.saturating_add(1);
+                }
+                runtime.instances.push(status);
+            }
+        }
+        runtime
+    }
 }
 
 impl Drop for ProcessorSchedule {
@@ -646,63 +696,6 @@ impl ProcessorRouteChain {
     fn reset(&self) {
         for processor in &self.processors {
             processor.reset();
-        }
-    }
-}
-
-impl PassthroughProcessorBlock {
-    fn new(id: String, kind: ProcessorKind) -> Self {
-        Self {
-            id,
-            _kind: kind,
-            prepared: AtomicBool::new(false),
-            counters: ProcessorCounters::default(),
-        }
-    }
-}
-
-impl ProcessorBlock for PassthroughProcessorBlock {
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn prepare(&self, context: ProcessorPrepareContext) {
-        let _ = (context.channels, context.sample_rate, context.max_frames);
-        self.prepared.store(true, Ordering::Relaxed);
-        self.counters.prepare_calls.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn process(
-        &self,
-        _samples: &mut [f32],
-        _channels: usize,
-        _frames: usize,
-        control: Option<&ProcessorControl>,
-        bypass: bool,
-    ) {
-        if bypass || !self.prepared.load(Ordering::Relaxed) {
-            return;
-        }
-        if let Some(control) = control {
-            self.counters
-                .last_generation
-                .store(control.generation, Ordering::Relaxed);
-        }
-        self.counters.process_calls.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn reset(&self) {
-        if self.prepared.swap(false, Ordering::Relaxed) {
-            self.counters.reset_calls.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    fn stats(&self) -> ProcessorRuntimeStats {
-        ProcessorRuntimeStats {
-            prepare_calls: self.counters.prepare_calls.load(Ordering::Relaxed),
-            process_calls: self.counters.process_calls.load(Ordering::Relaxed),
-            reset_calls: self.counters.reset_calls.load(Ordering::Relaxed),
-            last_generation: self.counters.last_generation.load(Ordering::Relaxed),
         }
     }
 }
@@ -1132,6 +1125,134 @@ impl ProcessorBlock for TimeShiftProcessorBlock {
     }
 }
 
+impl AuProcessorBlock {
+    fn new(id: String, config: AuPluginConfig) -> Self {
+        Self {
+            id,
+            config,
+            state: Mutex::new(AuProcessorState::default()),
+            prepared: AtomicBool::new(false),
+            counters: ProcessorCounters::default(),
+        }
+    }
+}
+
+impl ProcessorBlock for AuProcessorBlock {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn prepare(&self, context: ProcessorPrepareContext) {
+        let mut state = self.state.lock();
+        if let Some(worker) = state.worker.as_mut() {
+            worker.stop();
+        }
+        state.channels = context.channels.max(1);
+        state.sample_rate_hz = context.sample_rate.max(1);
+        state.max_frames = context.max_frames.max(1);
+        state.worker = Some(AuWorker::start(AuWorkerSettings {
+            processor_id: self.id.clone(),
+            config: self.config.clone(),
+            sample_rate: state.sample_rate_hz,
+            channels: state.channels,
+            max_frames: state.max_frames,
+        }));
+        self.prepared.store(true, Ordering::Relaxed);
+        self.counters.prepare_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn process(
+        &self,
+        samples: &mut [f32],
+        channels: usize,
+        frames: usize,
+        control: Option<&ProcessorControl>,
+        bypass: bool,
+    ) {
+        if !self.prepared.load(Ordering::Relaxed) || channels == 0 || frames == 0 {
+            return;
+        }
+        if let Some(control) = control {
+            self.counters
+                .last_generation
+                .store(control.generation, Ordering::Relaxed);
+        }
+
+        if bypass {
+            self.counters.process_calls.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        let state = self.state.lock();
+        if let Some(worker) = state.worker.as_ref() {
+            let request_samples = samples.to_vec();
+            if let Some(processed) = worker.drain_latest_result() {
+                if processed.len() == samples.len() {
+                    samples.copy_from_slice(&processed);
+                }
+            }
+            let request = AuProcessRequest {
+                frames,
+                channels,
+                samples: request_samples,
+            };
+            let _ = match worker.try_submit(request) {
+                Ok(()) => Ok(()),
+                Err(AuSubmitError::Full) | Err(AuSubmitError::Disconnected) => Err(()),
+            };
+        }
+        self.counters.process_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn reset(&self) {
+        if self.prepared.swap(false, Ordering::Relaxed) {
+            let mut state = self.state.lock();
+            if let Some(worker) = state.worker.as_mut() {
+                worker.stop();
+            }
+            state.worker = None;
+            state.channels = 0;
+            state.sample_rate_hz = 0;
+            state.max_frames = 0;
+            self.counters.reset_calls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn stats(&self) -> ProcessorRuntimeStats {
+        ProcessorRuntimeStats {
+            prepare_calls: self.counters.prepare_calls.load(Ordering::Relaxed),
+            process_calls: self.counters.process_calls.load(Ordering::Relaxed),
+            reset_calls: self.counters.reset_calls.load(Ordering::Relaxed),
+            last_generation: self.counters.last_generation.load(Ordering::Relaxed),
+        }
+    }
+
+    fn plugin_status(&self) -> Option<PluginHostInstanceStatus> {
+        let state = self.state.lock();
+        let status = if let Some(worker) = state.worker.as_ref() {
+            worker.status_snapshot()
+        } else {
+            PluginHostInstanceStatus {
+                id: self.id.clone(),
+                api: self.config.api,
+                health: if self.prepared.load(Ordering::Relaxed) {
+                    PluginHostHealth::Failed
+                } else {
+                    PluginHostHealth::Degraded
+                },
+                loaded: false,
+                host_pid: None,
+                process_calls: 0,
+                timeout_count: 0,
+                error_count: 0,
+                restart_count: 0,
+                last_error: None,
+            }
+        };
+        Some(status)
+    }
+}
+
 impl Engine {
     #[must_use]
     pub fn new(snapshot: EngineSnapshot) -> Self {
@@ -1176,6 +1297,11 @@ impl Engine {
     #[must_use]
     pub fn processor_runtime_stats(&self) -> BTreeMap<String, ProcessorRuntimeStats> {
         self.processor_schedule.load().stats()
+    }
+
+    #[must_use]
+    pub fn plugin_runtime_status(&self) -> PluginHostRuntimeStatus {
+        self.processor_schedule.load().plugin_runtime_status()
     }
 
     pub fn render_cycle(
@@ -1511,6 +1637,10 @@ fn prepare_node_buffers(
 mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::f32::consts::{FRAC_1_SQRT_2, PI};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use mars_graph::build_routing_graph;
     use mars_types::{
@@ -1751,6 +1881,157 @@ mod tests {
             graph,
             sample_rate,
             buffer_frames,
+        })
+    }
+
+    fn unique_temp_path(tag: &str, ext: &str) -> PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("mars-au-{tag}-{ts}-{}.{}", std::process::id(), ext))
+    }
+
+    fn write_mock_plugin_host_script(crash_after_process: u64, gain: f32) -> PathBuf {
+        let script_path = unique_temp_path("mock-plugin-host", "py");
+        let script = format!(
+            r#"#!/usr/bin/env python3
+import json
+import os
+import socket
+import sys
+
+CRASH_AFTER = {crash_after_process}
+GAIN = {gain}
+PROCESS_COUNT = 0
+
+def send(conn, obj):
+    conn.sendall((json.dumps(obj) + "\n").encode("utf-8"))
+
+def parse_socket(argv):
+    for i, arg in enumerate(argv):
+        if arg == "--socket" and i + 1 < len(argv):
+            return argv[i + 1]
+    raise RuntimeError("missing --socket")
+
+def main():
+    socket_path = parse_socket(sys.argv[1:])
+    if os.path.exists(socket_path):
+        os.remove(socket_path)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(socket_path)
+    listener.listen(1)
+    conn, _ = listener.accept()
+    instances = {{}}
+    buffer = b""
+    global PROCESS_COUNT
+    while True:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        buffer += chunk
+        while b"\n" in buffer:
+            line, buffer = buffer.split(b"\n", 1)
+            if not line:
+                continue
+            request = json.loads(line.decode("utf-8"))
+            kind = request["kind"]
+            if kind == "handshake":
+                send(conn, {{"kind": "handshake", "protocol_version": 1}})
+            elif kind == "load":
+                instances[request["instance_id"]] = {{"prepared": False}}
+                send(conn, {{"kind": "ack"}})
+            elif kind == "prepare":
+                instance = instances.get(request["instance_id"])
+                if instance is None:
+                    send(conn, {{"kind": "error", "message": "missing instance"}})
+                else:
+                    instance["prepared"] = True
+                    send(conn, {{"kind": "ack"}})
+            elif kind == "process":
+                PROCESS_COUNT += 1
+                if CRASH_AFTER > 0 and PROCESS_COUNT >= CRASH_AFTER:
+                    os._exit(77)
+                processed = [float(sample) * GAIN for sample in request["samples"]]
+                send(conn, {{"kind": "processed", "samples": processed}})
+            elif kind == "reset":
+                send(conn, {{"kind": "ack"}})
+            elif kind == "unload":
+                instances.pop(request["instance_id"], None)
+                send(conn, {{"kind": "ack"}})
+            elif kind == "shutdown":
+                send(conn, {{"kind": "ack"}})
+                conn.close()
+                listener.close()
+                if os.path.exists(socket_path):
+                    os.remove(socket_path)
+                return
+            else:
+                send(conn, {{"kind": "error", "message": "unknown kind"}})
+
+if __name__ == "__main__":
+    main()
+"#
+        );
+        fs::write(&script_path, script).expect("write mock plugin host script");
+        script_path
+    }
+
+    fn au_engine(processor_id: &str, script_path: &PathBuf) -> Engine {
+        let mut profile = Profile::default();
+        profile.virtual_devices.outputs.push(VirtualOutputDevice {
+            id: "src".to_string(),
+            name: "Src".to_string(),
+            channels: Some(2),
+            uid: None,
+            hidden: false,
+        });
+        profile.virtual_devices.inputs.push(VirtualInputDevice {
+            id: "sink".to_string(),
+            name: "Sink".to_string(),
+            channels: Some(2),
+            uid: None,
+            mix: None,
+        });
+        profile.processors.push(ProcessorDefinition {
+            id: processor_id.to_string(),
+            kind: ProcessorKind::Au,
+            config: json!({
+                "api": "auv2",
+                "component_type": "aufx",
+                "component_subtype": "gain",
+                "component_manufacturer": "appl",
+                "process_timeout_ms": 25,
+                "max_frames": 2048,
+                "host_command": "python3",
+                "host_args": [script_path.to_string_lossy().to_string()],
+            }),
+        });
+        profile.processor_chains.push(ProcessorChain {
+            id: "chain-au".to_string(),
+            processors: vec![processor_id.to_string()],
+        });
+        profile.routes.push(Route {
+            id: "route-au".to_string(),
+            from: "src".to_string(),
+            to: "sink".to_string(),
+            enabled: true,
+            matrix: RouteMatrix {
+                rows: 2,
+                cols: 2,
+                coefficients: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            },
+            chain: Some("chain-au".to_string()),
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+        let graph = build_routing_graph(&profile).expect("build graph");
+        Engine::new(EngineSnapshot {
+            graph,
+            sample_rate: 48_000,
+            buffer_frames: 256,
         })
     }
 
@@ -2096,6 +2377,100 @@ mod tests {
         let out4 = engine.render_cycle(frames, &silence).expect("cycle4");
         assert!(out3.sinks["sink"].iter().all(|sample| sample.abs() < 1e-9));
         assert!(out4.sinks["sink"].iter().all(|sample| sample.abs() < 1e-9));
+    }
+
+    #[test]
+    fn au_processor_applies_processed_samples_from_host() {
+        let script_path = write_mock_plugin_host_script(0, 0.5);
+        let engine = au_engine("au-main", &script_path);
+
+        let mut sources = HashMap::new();
+        sources.insert("src".to_string(), vec![0.8; 256 * 2]);
+        let mut observed = None;
+        for _ in 0..64 {
+            let output = engine.render_cycle(256, &sources).expect("render");
+            let sink = output.sinks.get("sink").expect("sink");
+            let mean = sink.iter().copied().sum::<f32>() / sink.len() as f32;
+            if mean < 0.7 {
+                observed = Some(mean);
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        let mean = observed.expect("plugin host did not return processed frames in time");
+        assert!(
+            mean > 0.3,
+            "processed mean should stay above silence floor, got {mean}"
+        );
+
+        let _ = fs::remove_file(script_path);
+    }
+
+    #[test]
+    fn au_processor_reload_rebinds_new_instance() {
+        let script_path = write_mock_plugin_host_script(0, 1.0);
+        let engine = au_engine("au-a", &script_path);
+
+        let mut sources = HashMap::new();
+        sources.insert("src".to_string(), vec![0.25; 256 * 2]);
+        for _ in 0..16 {
+            engine.render_cycle(256, &sources).expect("render");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let before = engine.plugin_runtime_status();
+        assert_eq!(before.instances.len(), 1);
+
+        let replacement = au_engine("au-b", &script_path);
+        engine.swap_snapshot(EngineSnapshot {
+            graph: replacement.snapshot.load().graph.clone(),
+            sample_rate: 48_000,
+            buffer_frames: 256,
+        });
+
+        for _ in 0..16 {
+            engine.render_cycle(256, &sources).expect("render");
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        let after = engine.plugin_runtime_status();
+        assert_eq!(after.instances.len(), 1);
+        assert_eq!(after.instances[0].id, "au-b");
+        assert!(after.instances[0].process_calls > 0);
+
+        let _ = fs::remove_file(script_path);
+    }
+
+    #[test]
+    fn au_processor_recovers_after_host_crash() {
+        let script_path = write_mock_plugin_host_script(1, 1.0);
+        let engine = au_engine("au-crash", &script_path);
+
+        let mut sources = HashMap::new();
+        sources.insert("src".to_string(), vec![0.1; 256 * 2]);
+        let mut observed_fault = false;
+        for _ in 0..80 {
+            engine.render_cycle(256, &sources).expect("render");
+            thread::sleep(Duration::from_millis(5));
+            let runtime = engine.plugin_runtime_status();
+            if runtime.restart_count > 0 || runtime.error_count > 0 {
+                observed_fault = true;
+                break;
+            }
+        }
+
+        let status = engine.plugin_runtime_status();
+        assert_eq!(status.instances.len(), 1);
+        assert!(
+            observed_fault,
+            "expected plugin host crash to produce restart or error counters: {status:?}"
+        );
+        assert!(
+            status.instances[0].process_calls > 0,
+            "expected AU processor to continue processing after crash recovery"
+        );
+
+        let _ = fs::remove_file(script_path);
     }
 
     #[test]

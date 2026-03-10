@@ -11,11 +11,12 @@ use mars_graph::build_routing_graph;
 use mars_ipc::{DaemonRequest, DaemonResponse, IpcClient, LogRequest};
 use mars_shm::{RingSpec, StreamDirection, global_registry, stream_name};
 use mars_types::{
-    AutoOrU32, CaptureRuntimeHealth, CaptureRuntimeKind, CaptureRuntimeStatus,
+    AuPluginApi, AutoOrU32, CaptureRuntimeHealth, CaptureRuntimeKind, CaptureRuntimeStatus,
     CaptureRuntimeTapStatus, DeviceDescriptor, FileSink, FileSinkFormat, NodeKind, Pipe,
-    ProcessTap, ProcessTapSelector, ProcessorChain, ProcessorDefinition, ProcessorKind, Profile,
-    Route, RouteMatrix, SinkRuntimeHealth, SinkRuntimeKind, SinkRuntimeSinkStatus,
-    SinkRuntimeStatus, SystemTap, SystemTapMode, VirtualInputDevice, VirtualOutputDevice,
+    PluginHostHealth, PluginHostInstanceStatus, PluginHostRuntimeStatus, ProcessTap,
+    ProcessTapSelector, ProcessorChain, ProcessorDefinition, ProcessorKind, Profile, Route,
+    RouteMatrix, SinkRuntimeHealth, SinkRuntimeKind, SinkRuntimeSinkStatus, SinkRuntimeStatus,
+    SystemTap, SystemTapMode, VirtualInputDevice, VirtualOutputDevice,
 };
 
 use super::{
@@ -383,6 +384,60 @@ fn doctor_report_includes_sink_runtime_health_summary() {
             .notes
             .iter()
             .any(|note| note.contains("sink runtime health"))
+    );
+}
+
+#[test]
+fn doctor_report_includes_plugin_runtime_health_summary() {
+    let daemon = MarsDaemon::new(temp_log_path("doctor-plugin-health"));
+    {
+        let mut state = daemon.state.lock();
+        state.plugin_runtime = PluginHostRuntimeStatus {
+            active_instances: 1,
+            failed_instances: 1,
+            timeout_count: 2,
+            error_count: 3,
+            restart_count: 4,
+            instances: vec![
+                PluginHostInstanceStatus {
+                    id: "au-main".to_string(),
+                    api: AuPluginApi::Auv2,
+                    health: PluginHostHealth::Healthy,
+                    loaded: true,
+                    host_pid: Some(101),
+                    process_calls: 50,
+                    timeout_count: 0,
+                    error_count: 0,
+                    restart_count: 0,
+                    last_error: None,
+                },
+                PluginHostInstanceStatus {
+                    id: "au-failed".to_string(),
+                    api: AuPluginApi::Auv3,
+                    health: PluginHostHealth::Failed,
+                    loaded: false,
+                    host_pid: None,
+                    process_calls: 12,
+                    timeout_count: 2,
+                    error_count: 3,
+                    restart_count: 4,
+                    last_error: Some("plugin host crashed".to_string()),
+                },
+            ],
+        };
+    }
+
+    let report = daemon.doctor_report_internal();
+    assert_eq!(report.plugin_active, 1);
+    assert_eq!(report.plugin_failed, 1);
+    assert_eq!(report.plugin_timeouts, 2);
+    assert_eq!(report.plugin_errors, 3);
+    assert_eq!(report.plugin_restarts, 4);
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("plugin runtime health"))
     );
 }
 
