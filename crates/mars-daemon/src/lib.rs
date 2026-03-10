@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! marsd daemon implementation.
 
+pub mod capture_runtime;
 pub mod sink_runtime;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -16,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use async_trait::async_trait;
+use capture_runtime::{CaptureRuntime, probe_capture_capability};
 use chrono::Utc;
 use mars_coreaudio::{
     CoreAudioError, ExternalEndpointConfig, ExternalIoRuntime, detect_microphone_permission,
@@ -32,9 +34,9 @@ use mars_ipc::{
 use mars_profile::{ValidatedProfile, load_profile, validate_only};
 use mars_shm::{RingSpec, StreamDirection, global_registry, stream_name};
 use mars_types::{
-    ApplyPlan, ApplyRequest, ApplyResult, DaemonStatus, DeviceDescriptor, DriverStatusSummary,
-    ExitCode, ExternalRuntimeStatus, MANAGED_UID_PREFIX, NodeKind, PlanChange, PlanChangeKind,
-    PlanRequest, Profile, RuntimeCounters, SinkRuntimeStatus,
+    ApplyPlan, ApplyRequest, ApplyResult, CaptureRuntimeStatus, DaemonStatus, DeviceDescriptor,
+    DriverStatusSummary, ExitCode, ExternalRuntimeStatus, MANAGED_UID_PREFIX, NodeKind, PlanChange,
+    PlanChangeKind, PlanRequest, Profile, RuntimeCounters, SinkRuntimeStatus,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -45,6 +47,7 @@ use tracing::{debug, info, warn};
 pub struct MarsDaemon {
     state: Mutex<DaemonState>,
     render_runtime: Mutex<Option<RenderRuntime>>,
+    capture_runtime: Mutex<Option<CaptureRuntime>>,
     log_path: PathBuf,
 }
 
@@ -57,6 +60,7 @@ struct DaemonState {
     devices: Vec<DeviceDescriptor>,
     counters: RuntimeCounters,
     external_runtime: ExternalRuntimeStatus,
+    capture_runtime: CaptureRuntimeStatus,
     sink_runtime: SinkRuntimeStatus,
 }
 
@@ -456,6 +460,7 @@ impl MarsDaemon {
         Self {
             state: Mutex::new(DaemonState::default()),
             render_runtime: Mutex::new(None),
+            capture_runtime: Mutex::new(None),
             log_path,
         }
     }
@@ -466,6 +471,12 @@ impl MarsDaemon {
 
     fn stop_render_runtime(&self) {
         if let Some(runtime) = self.render_runtime.lock().take() {
+            runtime.stop();
+        }
+    }
+
+    fn stop_capture_runtime(&self) {
+        if let Some(runtime) = self.capture_runtime.lock().take() {
             runtime.stop();
         }
     }
@@ -503,6 +514,31 @@ impl MarsDaemon {
         Ok(())
     }
 
+    fn sync_capture_runtime(&self) -> Result<(), String> {
+        let profile = self.state.lock().current_profile.clone();
+        let mut runtime = self.capture_runtime.lock();
+
+        match profile {
+            Some(profile) => {
+                if let Some(existing) = runtime.take() {
+                    existing.stop();
+                }
+
+                let capture_runtime = CaptureRuntime::start(&profile)?;
+                self.state.lock().capture_runtime = capture_runtime.status();
+                *runtime = Some(capture_runtime);
+            }
+            None => {
+                if let Some(existing) = runtime.take() {
+                    existing.stop();
+                }
+                self.state.lock().capture_runtime = CaptureRuntimeStatus::default();
+            }
+        }
+
+        Ok(())
+    }
+
     fn apply_deadline(timeout_ms: u64) -> Option<Instant> {
         if timeout_ms == 0 {
             None
@@ -531,6 +567,7 @@ impl MarsDaemon {
         exit_code: ExitCode,
     ) -> ApiError {
         self.stop_render_runtime();
+        self.stop_capture_runtime();
 
         let mut rollback_issues = Vec::new();
         if let Err(error) = restore_driver_state_snapshot(driver_snapshot) {
@@ -544,6 +581,9 @@ impl MarsDaemon {
 
         if let Err(error) = self.sync_render_runtime() {
             rollback_issues.push(format!("render runtime rollback failed: {error}"));
+        }
+        if let Err(error) = self.sync_capture_runtime() {
+            rollback_issues.push(format!("capture runtime rollback failed: {error}"));
         }
 
         let stage_error = stage_error.into();
@@ -705,6 +745,7 @@ impl MarsDaemon {
         let devices = collect_devices(&effective_profile, &resolution.resolved);
 
         self.stop_render_runtime();
+        self.stop_capture_runtime();
 
         Self::ensure_within_deadline(deadline, "driver-stage").map_err(|timeout_error| {
             self.rollback_apply(
@@ -766,8 +807,18 @@ impl MarsDaemon {
         state.engine = Some(engine);
         state.devices = devices;
         state.external_runtime = ExternalRuntimeStatus::default();
+        state.capture_runtime = CaptureRuntimeStatus::default();
         state.sink_runtime = SinkRuntimeStatus::default();
         drop(state);
+
+        if let Err(error) = self.sync_capture_runtime() {
+            return Err(self.rollback_apply(
+                previous_state.clone(),
+                &driver_snapshot,
+                error,
+                ExitCode::ApplyFailed,
+            ));
+        }
 
         if let Err(error) = self.sync_render_runtime() {
             return Err(self.rollback_apply(
@@ -830,6 +881,14 @@ impl MarsDaemon {
         {
             self.state.lock().sink_runtime = sink_status;
         }
+        if let Some(capture_status) = self
+            .capture_runtime
+            .lock()
+            .as_ref()
+            .map(CaptureRuntime::status)
+        {
+            self.state.lock().capture_runtime = capture_status;
+        }
 
         info!("apply transaction committed");
 
@@ -843,6 +902,7 @@ impl MarsDaemon {
 
     fn clear_internal(&self, keep_devices: bool) -> Result<ApplyResult, ApiError> {
         self.stop_render_runtime();
+        self.stop_capture_runtime();
         let mut state = self.state.lock();
         let previous = state.clone();
 
@@ -851,6 +911,7 @@ impl MarsDaemon {
         state.current_profile_path = None;
         state.graph = None;
         state.external_runtime = ExternalRuntimeStatus::default();
+        state.capture_runtime = CaptureRuntimeStatus::default();
         state.sink_runtime = SinkRuntimeStatus::default();
 
         if !keep_devices {
@@ -898,6 +959,7 @@ impl MarsDaemon {
             devices,
             mut counters,
             mut external_runtime,
+            mut capture_runtime,
             mut sink_runtime,
         ) = {
             let state = self.state.lock();
@@ -913,6 +975,7 @@ impl MarsDaemon {
                 state.devices.clone(),
                 state.counters.clone(),
                 state.external_runtime.clone(),
+                state.capture_runtime.clone(),
                 state.sink_runtime.clone(),
             )
         };
@@ -954,6 +1017,9 @@ impl MarsDaemon {
                 sink_runtime = runtime.status();
             }
         }
+        if let Some(runtime) = self.capture_runtime.lock().as_ref() {
+            capture_runtime = runtime.status();
+        }
 
         DaemonStatus {
             running,
@@ -965,6 +1031,7 @@ impl MarsDaemon {
             counters,
             driver,
             external_runtime,
+            capture_runtime,
             sink_runtime,
             updated_at: Utc::now(),
         }
@@ -1080,6 +1147,12 @@ impl MarsDaemon {
             (false, "unknown".to_string())
         };
 
+        let capture_capability = probe_capture_capability();
+        let capture_tap_supported = capture_capability
+            .as_ref()
+            .map(|capability| capability.supported)
+            .unwrap_or(false);
+
         let mut notes = Vec::new();
         if !driver_installed {
             notes.push("driver not found at /Library/Audio/Plug-Ins/HAL/mars.driver".to_string());
@@ -1106,8 +1179,27 @@ impl MarsDaemon {
         if driver.pending_change {
             notes.push("driver has a pending configuration change".to_string());
         }
+        match capture_capability {
+            Ok(capability) => {
+                if !capability.supported {
+                    notes.push(capability.reason.unwrap_or_else(|| {
+                        "CoreAudio tap APIs are unavailable for process/system capture".to_string()
+                    }));
+                }
+            }
+            Err(error) => {
+                notes.push(format!("failed to probe capture tap capability: {error}"));
+            }
+        }
 
         let state = self.state.lock();
+        let capture_active_taps = state.capture_runtime.active_taps;
+        let capture_failed_taps = state.capture_runtime.failed_taps;
+        if capture_failed_taps > 0 {
+            for error in &state.capture_runtime.errors {
+                notes.push(format!("capture runtime error: {error}"));
+            }
+        }
         notes.extend(feedback_risk_notes(state.graph.as_ref(), &state.devices));
         drop(state);
 
@@ -1120,6 +1212,9 @@ impl MarsDaemon {
             daemon_version,
             mic_permission_source,
             driver,
+            capture_tap_supported,
+            capture_active_taps,
+            capture_failed_taps,
             notes,
         }
     }

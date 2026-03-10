@@ -1,0 +1,24 @@
+[package]
+name = "mars-audio-tap"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[lib]
+name = "mars_audio_tap"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
+[build-dependencies]
+cc = "1.2"

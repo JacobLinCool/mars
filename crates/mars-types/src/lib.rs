@@ -628,6 +628,56 @@ pub struct ExternalRuntimeStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum CaptureRuntimeHealth {
+    #[default]
+    Healthy,
+    Degraded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureRuntimeKind {
+    #[default]
+    ProcessTap,
+    SystemTap,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+pub struct CaptureRuntimeTapStatus {
+    pub id: String,
+    pub kind: CaptureRuntimeKind,
+    pub health: CaptureRuntimeHealth,
+    #[serde(default)]
+    pub selector: String,
+    #[serde(default)]
+    pub tap_id: Option<u32>,
+    #[serde(default)]
+    pub aggregate_device_id: Option<u32>,
+    #[serde(default)]
+    pub matched_processes: usize,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+pub struct CaptureRuntimeStatus {
+    #[serde(default)]
+    pub supported: bool,
+    #[serde(default)]
+    pub discovered_processes: usize,
+    #[serde(default)]
+    pub active_taps: usize,
+    #[serde(default)]
+    pub failed_taps: usize,
+    #[serde(default)]
+    pub taps: Vec<CaptureRuntimeTapStatus>,
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum SinkRuntimeHealth {
     #[default]
     Healthy,
@@ -703,6 +753,8 @@ pub struct DaemonStatus {
     #[serde(default)]
     pub external_runtime: ExternalRuntimeStatus,
     #[serde(default)]
+    pub capture_runtime: CaptureRuntimeStatus,
+    #[serde(default)]
     pub sink_runtime: SinkRuntimeStatus,
     pub updated_at: DateTime<Utc>,
 }
@@ -721,6 +773,12 @@ pub struct DoctorReport {
     pub mic_permission_source: String,
     #[serde(default)]
     pub driver: DriverStatusSummary,
+    #[serde(default)]
+    pub capture_tap_supported: bool,
+    #[serde(default)]
+    pub capture_active_taps: usize,
+    #[serde(default)]
+    pub capture_failed_taps: usize,
     #[serde(default)]
     pub notes: Vec<String>,
 }
