@@ -21,6 +21,7 @@ chrono.workspace = true
 clap.workspace = true
 dirs.workspace = true
 mars-coreaudio = { path = "../mars-coreaudio" }
+mars-audio-tap = { path = "../mars-audio-tap" }
 mars-engine = { path = "../mars-engine" }
 mars-graph = { path = "../mars-graph" }
 mars-hal = { path = "../mars-hal" }
@@ -48,4 +49,8 @@ harness = false
 
 [[bench]]
 name = "sink_runtime"
+harness = false
+
+[[bench]]
+name = "capture_runtime"
 harness = false

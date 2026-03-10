@@ -373,12 +373,14 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let current_profile = result.current_profile.clone();
             print_output(cli.json, &result, || {
                 format!(
-                    "running={} profile={} pipes={} driver_gen={} driver_pending={}",
+                    "running={} profile={} pipes={} driver_gen={} driver_pending={} capture_active={} capture_failed={}",
                     result.running,
                     current_profile.unwrap_or_else(|| "<none>".to_string()),
                     result.graph_pipe_count,
                     result.driver.generation,
-                    result.driver.pending_change
+                    result.driver.pending_change,
+                    result.capture_runtime.active_taps,
+                    result.capture_runtime.failed_taps
                 )
             })?;
             Ok(ExitCode::Success)
@@ -482,7 +484,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
 
             print_output(cli.json, &result, || {
                 format!(
-                    "driver_installed={} daemon_reachable={} mic_permission={} mic_source={} driver_version={} daemon_version={} driver_gen={} driver_pending={}",
+                    "driver_installed={} daemon_reachable={} mic_permission={} mic_source={} driver_version={} daemon_version={} driver_gen={} driver_pending={} capture_supported={} capture_active={} capture_failed={}",
                     result.driver_installed,
                     result.daemon_reachable,
                     result.microphone_permission_ok,
@@ -490,7 +492,10 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     result.driver_version.as_deref().unwrap_or("<unknown>"),
                     result.daemon_version,
                     result.driver.generation,
-                    result.driver.pending_change
+                    result.driver.pending_change,
+                    result.capture_tap_supported,
+                    result.capture_active_taps,
+                    result.capture_failed_taps
                 )
             })?;
 

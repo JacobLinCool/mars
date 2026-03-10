@@ -769,6 +769,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mars-audio-tap"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "mars-cli"
 version = "0.1.0"
 dependencies = [
@@ -807,6 +817,7 @@ dependencies = [
  "clap",
  "criterion",
  "dirs",
+ "mars-audio-tap",
  "mars-coreaudio",
  "mars-engine",
  "mars-graph",

@@ -11,6 +11,7 @@ members = [
   "crates/mars-cli",
   "crates/mars-hal",
   "crates/mars-hal-client",
+  "crates/mars-audio-tap",
 ]
 resolver = "2"
 
