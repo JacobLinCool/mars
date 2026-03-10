@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 //! marsd daemon implementation.
 
+pub mod sink_runtime;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -32,10 +34,11 @@ use mars_shm::{RingSpec, StreamDirection, global_registry, stream_name};
 use mars_types::{
     ApplyPlan, ApplyRequest, ApplyResult, DaemonStatus, DeviceDescriptor, DriverStatusSummary,
     ExitCode, ExternalRuntimeStatus, MANAGED_UID_PREFIX, NodeKind, PlanChange, PlanChangeKind,
-    PlanRequest, Profile, RuntimeCounters,
+    PlanRequest, Profile, RuntimeCounters, SinkRuntimeStatus,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use sink_runtime::{SinkBinding, SinkBindingKind, SinkRuntime, SinkRuntimeSubmitter};
 use tracing::{debug, info, warn};
 
 #[derive(Debug)]
@@ -54,6 +57,7 @@ struct DaemonState {
     devices: Vec<DeviceDescriptor>,
     counters: RuntimeCounters,
     external_runtime: ExternalRuntimeStatus,
+    sink_runtime: SinkRuntimeStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +103,7 @@ struct RenderRuntimeConfig {
     vin_sinks: Vec<RenderEndpoint>,
     external_inputs: Vec<RenderEndpoint>,
     external_outputs: Vec<RenderEndpoint>,
+    sink_bindings: Vec<SinkBinding>,
 }
 
 #[derive(Debug, Default)]
@@ -116,6 +121,7 @@ struct RenderMetrics {
 struct RenderRuntime {
     config: RenderRuntimeConfig,
     external_runtime: Option<Arc<ExternalIoRuntime>>,
+    sink_runtime: Option<SinkRuntime>,
     stop: Arc<AtomicBool>,
     metrics: Arc<RenderMetrics>,
     handle: Option<JoinHandle<()>>,
@@ -188,6 +194,16 @@ impl RenderRuntime {
                 .store(snapshot.counters.xrun_count, Ordering::Relaxed);
         }
 
+        let sink_runtime = if config.sink_bindings.is_empty() {
+            None
+        } else {
+            Some(
+                SinkRuntime::start(config.sink_bindings.clone(), config.sample_rate, 256)
+                    .map_err(|error| format!("sink runtime startup failed: {error}"))?,
+            )
+        };
+        let sink_submitter = sink_runtime.as_ref().map(SinkRuntime::submitter);
+
         let thread_stop = stop.clone();
         let thread_metrics = metrics.clone();
         let thread_config = config.clone();
@@ -201,6 +217,7 @@ impl RenderRuntime {
                     thread_stop,
                     thread_metrics,
                     thread_external_runtime,
+                    sink_submitter,
                 );
             })
             .map_err(|error| format!("failed to spawn render runtime thread: {error}"))?;
@@ -208,6 +225,7 @@ impl RenderRuntime {
         Ok(Self {
             config,
             external_runtime,
+            sink_runtime,
             stop,
             metrics,
             handle: Some(handle),
@@ -218,6 +236,9 @@ impl RenderRuntime {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
+        }
+        if let Some(sink_runtime) = self.sink_runtime.take() {
+            sink_runtime.stop();
         }
     }
 }
@@ -238,6 +259,7 @@ fn run_render_loop(
     stop: Arc<AtomicBool>,
     metrics: Arc<RenderMetrics>,
     external_runtime: Option<Arc<ExternalIoRuntime>>,
+    sink_submitter: Option<Arc<SinkRuntimeSubmitter>>,
 ) {
     let frames = config.buffer_frames as usize;
     let period = Duration::from_secs_f64(config.buffer_frames as f64 / config.sample_rate as f64);
@@ -272,6 +294,11 @@ fn run_render_loop(
             sink.node_id.clone(),
             vec![0.0; frames.saturating_mul(sink.channels as usize)],
         );
+    }
+    for sink in &config.sink_bindings {
+        sink_silence
+            .entry(sink.source.clone())
+            .or_insert_with(|| vec![0.0; frames.saturating_mul(sink.channels as usize)]);
     }
     let mut rendered_sinks = sink_silence.clone();
 
@@ -384,6 +411,10 @@ fn run_render_loop(
                     );
                     let _ = external_runtime.write_output_from(&endpoint.node_id, data);
                 }
+            }
+
+            if let Some(submitter) = sink_submitter.as_ref() {
+                submitter.submit_rendered_sinks(&rendered_sinks, frames);
             }
         }
 
@@ -735,6 +766,7 @@ impl MarsDaemon {
         state.engine = Some(engine);
         state.devices = devices;
         state.external_runtime = ExternalRuntimeStatus::default();
+        state.sink_runtime = SinkRuntimeStatus::default();
         drop(state);
 
         if let Err(error) = self.sync_render_runtime() {
@@ -790,6 +822,14 @@ impl MarsDaemon {
         {
             self.state.lock().external_runtime = external_status;
         }
+        if let Some(sink_status) = self
+            .render_runtime
+            .lock()
+            .as_ref()
+            .and_then(|runtime| runtime.sink_runtime.as_ref().map(SinkRuntime::status))
+        {
+            self.state.lock().sink_runtime = sink_status;
+        }
 
         info!("apply transaction committed");
 
@@ -811,6 +851,7 @@ impl MarsDaemon {
         state.current_profile_path = None;
         state.graph = None;
         state.external_runtime = ExternalRuntimeStatus::default();
+        state.sink_runtime = SinkRuntimeStatus::default();
 
         if !keep_devices {
             state.devices.retain(|device| !device.managed);
@@ -857,6 +898,7 @@ impl MarsDaemon {
             devices,
             mut counters,
             mut external_runtime,
+            mut sink_runtime,
         ) = {
             let state = self.state.lock();
             let profile = state.current_profile.as_ref();
@@ -871,6 +913,7 @@ impl MarsDaemon {
                 state.devices.clone(),
                 state.counters.clone(),
                 state.external_runtime.clone(),
+                state.sink_runtime.clone(),
             )
         };
 
@@ -907,6 +950,9 @@ impl MarsDaemon {
                     .load(Ordering::Relaxed),
             );
             external_runtime = render_runtime.metrics.external_runtime.lock().clone();
+            if let Some(runtime) = render_runtime.sink_runtime.as_ref() {
+                sink_runtime = runtime.status();
+            }
         }
 
         DaemonStatus {
@@ -919,6 +965,7 @@ impl MarsDaemon {
             counters,
             driver,
             external_runtime,
+            sink_runtime,
             updated_at: Utc::now(),
         }
     }
@@ -1429,6 +1476,7 @@ fn render_runtime_config_from_state(
     let profile = profile?;
     let sample_rate = profile.audio.sample_rate.as_value().unwrap_or(48_000);
     let buffer_frames = profile.audio.buffer_frames;
+    let default_channels = profile.audio.channels.as_value().unwrap_or(2);
 
     let mut vout_sources = devices
         .iter()
@@ -1474,6 +1522,54 @@ fn render_runtime_config_from_state(
         .collect::<Vec<_>>();
     external_outputs.sort_by(|a, b| a.node_id.cmp(&b.node_id));
 
+    let mut sink_source_channels = BTreeMap::<String, u16>::new();
+    for input in &profile.virtual_devices.inputs {
+        sink_source_channels.insert(input.id.clone(), input.channels.unwrap_or(default_channels));
+    }
+    for output in &profile.external.outputs {
+        sink_source_channels.insert(
+            output.id.clone(),
+            output.channels.unwrap_or(default_channels),
+        );
+    }
+    for bus in &profile.buses {
+        sink_source_channels.insert(bus.id.clone(), bus.channels.unwrap_or(default_channels));
+    }
+
+    let mut sink_bindings = Vec::<SinkBinding>::new();
+    for sink in &profile.sinks.files {
+        let source_channels = sink_source_channels
+            .get(&sink.source)
+            .copied()
+            .unwrap_or(default_channels);
+        sink_bindings.push(SinkBinding {
+            id: sink.id.clone(),
+            source: sink.source.clone(),
+            channels: sink.channels.unwrap_or(source_channels),
+            kind: SinkBindingKind::File {
+                path: sink.path.clone(),
+                format: sink.format,
+            },
+        });
+    }
+    for sink in &profile.sinks.streams {
+        let source_channels = sink_source_channels
+            .get(&sink.source)
+            .copied()
+            .unwrap_or(default_channels);
+        sink_bindings.push(SinkBinding {
+            id: sink.id.clone(),
+            source: sink.source.clone(),
+            channels: source_channels,
+            kind: SinkBindingKind::Stream {
+                transport: sink.transport,
+                endpoint: sink.endpoint.clone(),
+                options_json: sink.options.to_string(),
+            },
+        });
+    }
+    sink_bindings.sort_by(|a, b| a.id.cmp(&b.id));
+
     Some(RenderRuntimeConfig {
         sample_rate,
         buffer_frames,
@@ -1481,6 +1577,7 @@ fn render_runtime_config_from_state(
         vin_sinks,
         external_inputs,
         external_outputs,
+        sink_bindings,
     })
 }
 

@@ -45,10 +45,12 @@ captures:
 sinks:
   files:
     - id: rec-main
+      source: mix1
       path: /tmp/mars-small.wav
       format: wav
   streams:
     - id: stream-main
+      source: mix1
       transport: rtp
       endpoint: rtp://127.0.0.1:5004
 pipes:
@@ -120,10 +122,12 @@ captures:
 sinks:
   files:
     - id: rec-medium
+      source: mix1
       path: /tmp/mars-medium.caf
       format: caf
   streams:
     - id: stream-medium
+      source: mix2
       transport: srt
       endpoint: srt://127.0.0.1:10080
 pipes:
@@ -244,10 +248,12 @@ captures:
 sinks:
   files:
     - id: rec-large
+      source: mix0
       path: /tmp/mars-large.wav
       format: wav
   streams:
     - id: stream-large
+      source: mix4
       transport: webrtc
       endpoint: webrtc://localhost/session
 pipes:
