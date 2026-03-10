@@ -17,11 +17,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use async_trait::async_trait;
-use capture_runtime::{CaptureRuntime, probe_capture_capability};
+use capture_runtime::{CaptureRuntime, capture_aggregate_uid, probe_capture_capability};
 use chrono::Utc;
 use mars_coreaudio::{
-    CoreAudioError, ExternalEndpointConfig, ExternalIoRuntime, detect_microphone_permission,
-    list_device_inventory, resolve_externals,
+    CoreAudioError, ExternalEndpointConfig, ExternalEndpointHealth, ExternalInputEndpointSnapshot,
+    ExternalIoRuntime, detect_microphone_permission, list_device_inventory, resolve_externals,
 };
 use mars_engine::{Engine, EngineSnapshot};
 use mars_graph::RoutingGraph;
@@ -34,9 +34,9 @@ use mars_ipc::{
 use mars_profile::{ValidatedProfile, load_profile, validate_only};
 use mars_shm::{RingSpec, StreamDirection, global_registry, stream_name};
 use mars_types::{
-    ApplyPlan, ApplyRequest, ApplyResult, CaptureRuntimeStatus, DaemonStatus, DeviceDescriptor,
-    DriverStatusSummary, ExitCode, ExternalRuntimeStatus, MANAGED_UID_PREFIX, NodeKind, PlanChange,
-    PlanChangeKind, PlanRequest, Profile, RuntimeCounters, SinkRuntimeStatus,
+    ApplyPlan, ApplyRequest, ApplyResult, CaptureRuntimeHealth, CaptureRuntimeStatus, DaemonStatus,
+    DeviceDescriptor, DriverStatusSummary, ExitCode, ExternalRuntimeStatus, MANAGED_UID_PREFIX,
+    NodeKind, PlanChange, PlanChangeKind, PlanRequest, Profile, RuntimeCounters, SinkRuntimeStatus,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -987,6 +987,7 @@ impl MarsDaemon {
             counters.xrun_count = runtime.xrun_count;
             counters.last_callback_ns = runtime.last_callback_ns;
         }
+        let mut external_input_snapshots = Vec::<ExternalInputEndpointSnapshot>::new();
         if let Some(render_runtime) = self.render_runtime.lock().as_ref() {
             counters.deadline_miss_count = render_runtime
                 .metrics
@@ -994,25 +995,22 @@ impl MarsDaemon {
                 .load(Ordering::Relaxed);
             counters.last_cycle_ns = render_runtime.metrics.last_cycle_ns.load(Ordering::Relaxed);
             counters.max_cycle_ns = render_runtime.metrics.max_cycle_ns.load(Ordering::Relaxed);
-            counters.underrun_count = counters.underrun_count.saturating_add(
-                render_runtime
-                    .metrics
-                    .external_underrun_count
-                    .load(Ordering::Relaxed),
-            );
-            counters.overrun_count = counters.overrun_count.saturating_add(
-                render_runtime
-                    .metrics
-                    .external_overrun_count
-                    .load(Ordering::Relaxed),
-            );
-            counters.xrun_count = counters.xrun_count.saturating_add(
-                render_runtime
-                    .metrics
-                    .external_xrun_count
-                    .load(Ordering::Relaxed),
-            );
-            external_runtime = render_runtime.metrics.external_runtime.lock().clone();
+            if let Some(runtime) = render_runtime.external_runtime.as_ref() {
+                let snapshot = runtime.snapshot();
+                counters.underrun_count = counters
+                    .underrun_count
+                    .saturating_add(snapshot.counters.underrun_count);
+                counters.overrun_count = counters
+                    .overrun_count
+                    .saturating_add(snapshot.counters.overrun_count);
+                counters.xrun_count = counters
+                    .xrun_count
+                    .saturating_add(snapshot.counters.xrun_count);
+                external_runtime = snapshot.status;
+                external_input_snapshots = snapshot.input_endpoints;
+            } else {
+                external_runtime = render_runtime.metrics.external_runtime.lock().clone();
+            }
             if let Some(runtime) = render_runtime.sink_runtime.as_ref() {
                 sink_runtime = runtime.status();
             }
@@ -1020,6 +1018,8 @@ impl MarsDaemon {
         if let Some(runtime) = self.capture_runtime.lock().as_ref() {
             capture_runtime = runtime.status();
         }
+        capture_runtime =
+            enrich_capture_runtime_with_external_inputs(capture_runtime, &external_input_snapshots);
 
         DaemonStatus {
             running,
@@ -1548,6 +1548,28 @@ fn collect_devices(
         });
     }
 
+    for tap in &profile.captures.process_taps {
+        devices.push(DeviceDescriptor {
+            id: tap.id.clone(),
+            name: format!("Capture Tap: {}", tap.id),
+            uid: capture_aggregate_uid(&tap.id),
+            kind: NodeKind::ExternalInput,
+            channels: tap.channels.unwrap_or(default_channels),
+            managed: true,
+        });
+    }
+
+    for tap in &profile.captures.system_taps {
+        devices.push(DeviceDescriptor {
+            id: tap.id.clone(),
+            name: format!("Capture Tap: {}", tap.id),
+            uid: capture_aggregate_uid(&tap.id),
+            kind: NodeKind::ExternalInput,
+            channels: tap.channels.unwrap_or(default_channels),
+            managed: true,
+        });
+    }
+
     dedupe_devices(devices)
 }
 
@@ -1781,6 +1803,59 @@ fn sip_disabled() -> bool {
 fn driver_stub_active() -> bool {
     let installed = Path::new("/Library/Audio/Plug-Ins/HAL/mars.driver").exists();
     installed && driver_stub_mode_enabled() && !mars_hal_client::is_driver_loaded()
+}
+
+fn enrich_capture_runtime_with_external_inputs(
+    mut capture_runtime: CaptureRuntimeStatus,
+    input_snapshots: &[ExternalInputEndpointSnapshot],
+) -> CaptureRuntimeStatus {
+    if capture_runtime.taps.is_empty() || input_snapshots.is_empty() {
+        return capture_runtime;
+    }
+
+    let endpoint_map = input_snapshots
+        .iter()
+        .map(|endpoint| (endpoint.node_id.as_str(), endpoint))
+        .collect::<BTreeMap<_, _>>();
+
+    for tap in &mut capture_runtime.taps {
+        let Some(endpoint) = endpoint_map.get(tap.id.as_str()) else {
+            continue;
+        };
+
+        tap.ingested_frames = endpoint.ingested_frames;
+        tap.underrun_count = endpoint.underrun_count;
+        tap.overrun_count = endpoint.overrun_count;
+        tap.xrun_count = endpoint.xrun_count;
+        tap.restart_attempts = endpoint.restart_attempts;
+        tap.error_ring = endpoint.error_ring.clone();
+        if tap.last_error.is_none() {
+            tap.last_error = tap.error_ring.last().cloned();
+        }
+
+        let derived_health = map_external_endpoint_health(endpoint.health);
+        if tap.health != CaptureRuntimeHealth::Failed {
+            tap.health = derived_health;
+        }
+    }
+
+    let runtime_failed = capture_runtime
+        .taps
+        .iter()
+        .filter(|tap| tap.health == CaptureRuntimeHealth::Failed)
+        .count();
+    capture_runtime.failed_taps = capture_runtime.failed_taps.max(runtime_failed);
+    capture_runtime
+}
+
+fn map_external_endpoint_health(health: ExternalEndpointHealth) -> CaptureRuntimeHealth {
+    match health {
+        ExternalEndpointHealth::Connected => CaptureRuntimeHealth::Healthy,
+        ExternalEndpointHealth::Degraded | ExternalEndpointHealth::Reconnecting => {
+            CaptureRuntimeHealth::Degraded
+        }
+        ExternalEndpointHealth::Stopped => CaptureRuntimeHealth::Failed,
+    }
 }
 
 fn feedback_risk_notes(graph: Option<&RoutingGraph>, devices: &[DeviceDescriptor]) -> Vec<String> {

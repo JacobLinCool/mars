@@ -1033,6 +1033,7 @@ fn read_ring_samples(
 
 const EXTERNAL_QUEUE_PERIODS: usize = 16;
 const STREAM_ERROR_RING_CAPACITY: usize = 64;
+const ENDPOINT_ERROR_RING_CAPACITY: usize = 32;
 const RECOVERY_EVENT_CAPACITY: usize = 256;
 const RECOVERY_BASE_BACKOFF_MS: u64 = 250;
 const RECOVERY_MAX_BACKOFF_MS: u64 = 10_000;
@@ -1057,6 +1058,34 @@ pub struct ExternalRuntimeCounters {
 pub struct ExternalRuntimeSnapshot {
     pub status: ExternalRuntimeStatus,
     pub counters: ExternalRuntimeCounters,
+    pub input_endpoints: Vec<ExternalInputEndpointSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalEndpointHealth {
+    Connected,
+    Degraded,
+    Reconnecting,
+    Stopped,
+}
+
+impl Default for ExternalEndpointHealth {
+    fn default() -> Self {
+        Self::Stopped
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ExternalInputEndpointSnapshot {
+    pub node_id: String,
+    pub uid: String,
+    pub health: ExternalEndpointHealth,
+    pub ingested_frames: u64,
+    pub underrun_count: u64,
+    pub overrun_count: u64,
+    pub xrun_count: u64,
+    pub restart_attempts: u64,
+    pub error_ring: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1081,6 +1110,15 @@ impl EndpointPhase {
     const fn is_degraded(self) -> bool {
         matches!(self, Self::Degraded | Self::Reconnecting)
     }
+
+    const fn into_health(self) -> ExternalEndpointHealth {
+        match self {
+            Self::Connected => ExternalEndpointHealth::Connected,
+            Self::Degraded => ExternalEndpointHealth::Degraded,
+            Self::Reconnecting => ExternalEndpointHealth::Reconnecting,
+            Self::Stopped => ExternalEndpointHealth::Stopped,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1095,6 +1133,15 @@ struct InputEndpointRuntime {
     attempts: u32,
     next_retry_at: Option<Instant>,
     stream: Option<Stream>,
+}
+
+#[derive(Debug, Default)]
+struct InputEndpointCounters {
+    ingested_frames: AtomicU64,
+    underrun_count: AtomicU64,
+    overrun_count: AtomicU64,
+    xrun_count: AtomicU64,
+    restart_attempts: AtomicU64,
 }
 
 struct OutputEndpointRuntime {
@@ -1115,6 +1162,8 @@ struct InputEndpoint {
     buffer_frames: u32,
     queue: Arc<Mutex<VecDeque<f32>>>,
     runtime: Arc<Mutex<InputEndpointRuntime>>,
+    counters: Arc<InputEndpointCounters>,
+    errors: Arc<Mutex<VecDeque<String>>>,
 }
 
 #[derive(Clone)]
@@ -1216,6 +1265,8 @@ impl ExternalIoRuntime {
                 next_retry_at: None,
                 stream: None,
             }));
+            let counters = Arc::new(InputEndpointCounters::default());
+            let errors = Arc::new(Mutex::new(VecDeque::new()));
             let input_endpoint = InputEndpoint {
                 node_id: endpoint.node_id.clone(),
                 uid: endpoint.uid.clone(),
@@ -1224,6 +1275,8 @@ impl ExternalIoRuntime {
                 buffer_frames,
                 queue,
                 runtime,
+                counters,
+                errors,
             };
             connect_input_endpoint(
                 &input_endpoint,
@@ -1315,46 +1368,64 @@ impl ExternalIoRuntime {
             out.fill(0.0);
             self.underrun_count.fetch_add(1, Ordering::Relaxed);
             self.xrun_count.fetch_add(1, Ordering::Relaxed);
+            endpoint
+                .counters
+                .underrun_count
+                .fetch_add(1, Ordering::Relaxed);
+            endpoint.counters.xrun_count.fetch_add(1, Ordering::Relaxed);
             return true;
         }
 
         let frames = out.len() / endpoint.node_channels.max(1);
         let mut queue = endpoint.queue.lock();
         let mut had_missing = false;
+        let mut ingested_frames = 0_u64;
 
         match (device_channels, endpoint.node_channels) {
             (dc, nc) if dc == nc => {
                 for sample in out.iter_mut() {
                     if let Some(value) = queue.pop_front() {
                         *sample = value;
+                        ingested_frames = ingested_frames.saturating_add(1);
                     } else {
                         *sample = 0.0;
                         had_missing = true;
                     }
                 }
+                ingested_frames /= endpoint.node_channels.max(1) as u64;
             }
             (1, 2) => {
                 for frame in 0..frames {
-                    let value = queue.pop_front().unwrap_or_else(|| {
+                    let value = if let Some(value) = queue.pop_front() {
+                        ingested_frames = ingested_frames.saturating_add(1);
+                        value
+                    } else {
                         had_missing = true;
                         0.0
-                    });
+                    };
                     out[frame * 2] = value;
                     out[frame * 2 + 1] = value;
                 }
             }
             (2, 1) => {
                 for sample in out.iter_mut().take(frames) {
-                    let left = queue.pop_front().unwrap_or_else(|| {
+                    let left = if let Some(value) = queue.pop_front() {
+                        ingested_frames = ingested_frames.saturating_add(1);
+                        value
+                    } else {
                         had_missing = true;
                         0.0
-                    });
-                    let right = queue.pop_front().unwrap_or_else(|| {
+                    };
+                    let right = if let Some(value) = queue.pop_front() {
+                        ingested_frames = ingested_frames.saturating_add(1);
+                        value
+                    } else {
                         had_missing = true;
                         0.0
-                    });
+                    };
                     *sample = (left + right) * 0.5;
                 }
+                ingested_frames /= 2;
             }
             _ => {
                 out.fill(0.0);
@@ -1362,9 +1433,18 @@ impl ExternalIoRuntime {
             }
         }
 
+        endpoint
+            .counters
+            .ingested_frames
+            .fetch_add(ingested_frames, Ordering::Relaxed);
         if had_missing {
             self.underrun_count.fetch_add(1, Ordering::Relaxed);
             self.xrun_count.fetch_add(1, Ordering::Relaxed);
+            endpoint
+                .counters
+                .underrun_count
+                .fetch_add(1, Ordering::Relaxed);
+            endpoint.counters.xrun_count.fetch_add(1, Ordering::Relaxed);
         }
         true
     }
@@ -1429,6 +1509,7 @@ impl ExternalIoRuntime {
     pub fn snapshot(&self) -> ExternalRuntimeSnapshot {
         let mut connected_inputs = 0usize;
         let mut degraded_inputs = 0usize;
+        let mut input_endpoints = Vec::with_capacity(self.input_endpoints.len());
         for endpoint in self.input_endpoints.values() {
             let phase = endpoint.runtime.lock().phase;
             if phase.is_connected() {
@@ -1436,6 +1517,17 @@ impl ExternalIoRuntime {
             } else if phase.is_degraded() {
                 degraded_inputs = degraded_inputs.saturating_add(1);
             }
+            input_endpoints.push(ExternalInputEndpointSnapshot {
+                node_id: endpoint.node_id.clone(),
+                uid: endpoint.uid.clone(),
+                health: phase.into_health(),
+                ingested_frames: endpoint.counters.ingested_frames.load(Ordering::Relaxed),
+                underrun_count: endpoint.counters.underrun_count.load(Ordering::Relaxed),
+                overrun_count: endpoint.counters.overrun_count.load(Ordering::Relaxed),
+                xrun_count: endpoint.counters.xrun_count.load(Ordering::Relaxed),
+                restart_attempts: endpoint.counters.restart_attempts.load(Ordering::Relaxed),
+                error_ring: endpoint.errors.lock().iter().cloned().collect(),
+            });
         }
 
         let mut connected_outputs = 0usize;
@@ -1463,6 +1555,7 @@ impl ExternalIoRuntime {
                 overrun_count: self.overrun_count.load(Ordering::Relaxed),
                 xrun_count: self.xrun_count.load(Ordering::Relaxed),
             },
+            input_endpoints,
         }
     }
 }
@@ -1492,6 +1585,9 @@ fn connect_input_endpoint(
     let callback_xrun = xrun_count.clone();
     let callback_xrun_error = callback_xrun.clone();
     let callback_events = recovery_tx.clone();
+    let callback_endpoint_counters = endpoint.counters.clone();
+    let callback_endpoint_counters_error = endpoint.counters.clone();
+    let callback_endpoint_errors = endpoint.errors.clone();
     let uid = endpoint.uid.clone();
     let node_id = endpoint.node_id.clone();
     let stream = build_input_stream_for_format(
@@ -1499,18 +1595,30 @@ fn connect_input_endpoint(
         sample_format,
         &stream_config,
         move |samples| {
-            push_samples(
+            let overrun = push_samples(
                 &callback_queue,
                 samples,
                 max_samples,
                 &callback_overrun,
                 &callback_xrun,
             );
+            if overrun {
+                callback_endpoint_counters
+                    .overrun_count
+                    .fetch_add(1, Ordering::Relaxed);
+                callback_endpoint_counters
+                    .xrun_count
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         },
         move |error| {
             callback_xrun_error.fetch_add(1, Ordering::Relaxed);
             let message = format!("external input stream error for '{uid}': {error}");
-            push_stream_error(&callback_errors, message);
+            push_stream_error(&callback_errors, message.clone());
+            push_bounded_error(&callback_endpoint_errors, message);
+            callback_endpoint_counters_error
+                .xrun_count
+                .fetch_add(1, Ordering::Relaxed);
             let _ = callback_events.try_send(RecoveryEvent::StreamError {
                 kind: EndpointKind::Input,
                 node_id: node_id.clone(),
@@ -1652,6 +1760,10 @@ fn run_recovery_supervisor(recovery_rx: Receiver<RecoveryEvent>, context: Recove
             }
 
             context.restart_attempts.fetch_add(1, Ordering::Relaxed);
+            endpoint
+                .counters
+                .restart_attempts
+                .fetch_add(1, Ordering::Relaxed);
             if let Err(error) = connect_input_endpoint(
                 endpoint,
                 &context.recovery_tx,
@@ -1666,6 +1778,11 @@ fn run_recovery_supervisor(recovery_rx: Receiver<RecoveryEvent>, context: Recove
                         endpoint.uid
                     ),
                 );
+                push_bounded_error(
+                    &endpoint.errors,
+                    format!("reconnect failed for '{}': {error}", endpoint.uid),
+                );
+                endpoint.counters.xrun_count.fetch_add(1, Ordering::Relaxed);
                 let mut runtime = endpoint.runtime.lock();
                 let attempts = runtime.attempts.saturating_add(1);
                 mark_endpoint_degraded(&mut runtime, Some(attempts));
@@ -1741,8 +1858,20 @@ fn reconnect_backoff(attempts: u32) -> Duration {
 }
 
 fn push_stream_error(stream_errors: &Arc<Mutex<VecDeque<String>>>, message: String) {
-    let mut guard = stream_errors.lock();
-    if guard.len() >= STREAM_ERROR_RING_CAPACITY {
+    push_bounded_error_with_capacity(stream_errors, message, STREAM_ERROR_RING_CAPACITY);
+}
+
+fn push_bounded_error(errors: &Arc<Mutex<VecDeque<String>>>, message: String) {
+    push_bounded_error_with_capacity(errors, message, ENDPOINT_ERROR_RING_CAPACITY);
+}
+
+fn push_bounded_error_with_capacity(
+    errors: &Arc<Mutex<VecDeque<String>>>,
+    message: String,
+    capacity: usize,
+) {
+    let mut guard = errors.lock();
+    if guard.len() >= capacity {
         let _ = guard.pop_front();
     }
     guard.push_back(message);
@@ -1968,7 +2097,7 @@ fn push_samples(
     max_samples: usize,
     overrun_count: &Arc<AtomicU64>,
     xrun_count: &Arc<AtomicU64>,
-) {
+) -> bool {
     let mut overrun = false;
     if let Some(mut guard) = queue.try_lock() {
         for sample in samples {
@@ -1985,6 +2114,7 @@ fn push_samples(
         overrun_count.fetch_add(1, Ordering::Relaxed);
         xrun_count.fetch_add(1, Ordering::Relaxed);
     }
+    overrun
 }
 
 fn pop_samples(

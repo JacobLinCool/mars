@@ -653,9 +653,23 @@ pub struct CaptureRuntimeTapStatus {
     #[serde(default)]
     pub tap_id: Option<u32>,
     #[serde(default)]
+    pub aggregate_uid: Option<String>,
+    #[serde(default)]
     pub aggregate_device_id: Option<u32>,
     #[serde(default)]
     pub matched_processes: usize,
+    #[serde(default)]
+    pub ingested_frames: u64,
+    #[serde(default)]
+    pub underrun_count: u64,
+    #[serde(default)]
+    pub overrun_count: u64,
+    #[serde(default)]
+    pub xrun_count: u64,
+    #[serde(default)]
+    pub restart_attempts: u64,
+    #[serde(default)]
+    pub error_ring: Vec<String>,
     #[serde(default)]
     pub last_error: Option<String>,
 }

@@ -203,6 +203,30 @@ pub fn build_routing_graph(profile: &Profile) -> Result<RoutingGraph, GraphError
             },
         )?;
     }
+    for tap in &profile.captures.process_taps {
+        add_node(
+            &mut nodes,
+            &mut seen,
+            NodeDescriptor {
+                id: tap.id.clone(),
+                kind: NodeKind::ExternalInput,
+                channels: tap.channels.unwrap_or(default_channels),
+                mix: None,
+            },
+        )?;
+    }
+    for tap in &profile.captures.system_taps {
+        add_node(
+            &mut nodes,
+            &mut seen,
+            NodeDescriptor {
+                id: tap.id.clone(),
+                kind: NodeKind::ExternalInput,
+                channels: tap.channels.unwrap_or(default_channels),
+                mix: None,
+            },
+        )?;
+    }
 
     let processor_plan = compile_processor_plan(profile)?;
     let (edges, routes) = if profile.routes.is_empty() {
@@ -561,8 +585,9 @@ fn node_from_vin(device: &VirtualInputDevice, default_channels: u16) -> NodeDesc
 #[allow(clippy::expect_used)]
 mod tests {
     use mars_types::{
-        Bus, Pipe, ProcessorChain, ProcessorDefinition, ProcessorKind, Profile, Route, RouteMatrix,
-        VirtualInputDevice, VirtualOutputDevice,
+        Bus, CaptureConfig, Pipe, ProcessTap, ProcessTapSelector, ProcessorChain,
+        ProcessorDefinition, ProcessorKind, Profile, Route, RouteMatrix, VirtualInputDevice,
+        VirtualOutputDevice,
     };
 
     use super::{GraphError, build_routing_graph};
@@ -641,6 +666,47 @@ mod tests {
             graph.compiled_route_plan().routes[0].matrix,
             vec![1.0, 0.0, 0.0, 1.0]
         );
+    }
+
+    #[test]
+    fn builds_graph_with_capture_tap_source_node() {
+        let mut profile = Profile::default();
+        profile.virtual_devices.inputs.push(VirtualInputDevice {
+            id: "mix".to_string(),
+            name: "Mix".to_string(),
+            channels: Some(2),
+            uid: None,
+            mix: None,
+        });
+        profile.captures = CaptureConfig {
+            process_taps: vec![ProcessTap {
+                id: "tap-app".to_string(),
+                selector: ProcessTapSelector::Pid { pid: 4242 },
+                channels: Some(2),
+            }],
+            system_taps: Vec::new(),
+        };
+        profile.routes.push(Route {
+            id: "route-main".to_string(),
+            from: "tap-app".to_string(),
+            to: "mix".to_string(),
+            enabled: true,
+            matrix: RouteMatrix {
+                rows: 2,
+                cols: 2,
+                coefficients: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            },
+            chain: None,
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+
+        let graph = build_routing_graph(&profile).expect("valid graph");
+        assert!(graph.nodes.contains_key("tap-app"));
+        assert_eq!(graph.compiled_route_plan().routes.len(), 1);
+        assert_eq!(graph.compiled_route_plan().routes[0].from, "tap-app");
     }
 
     #[test]

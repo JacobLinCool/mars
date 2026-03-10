@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! YAML profile parsing, schema generation, and semantic validation.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::Path;
 
@@ -72,6 +72,10 @@ pub enum ProfileError {
         route_id: String,
         destination: String,
     },
+    #[error(
+        "system tap '{tap_id}' has a self-capture path into external output '{output_id}'; remove this route path to avoid feedback"
+    )]
+    SystemTapSelfCapturePath { tap_id: String, output_id: String },
     #[error("route '{route_id}' references unknown processor chain '{chain_id}'")]
     UnknownRouteChain { route_id: String, chain_id: String },
     #[error(
@@ -181,6 +185,7 @@ pub fn validate_profile(profile: Profile) -> Result<ValidatedProfile, ProfileErr
     validate_ids(&profile)?;
     validate_pipe_ranges(&profile)?;
     validate_routes(&profile)?;
+    validate_system_tap_loop_avoidance(&profile)?;
     validate_processor_chains(&profile)?;
     validate_sinks(&profile)?;
     validate_external_matchers(&profile)?;
@@ -766,8 +771,74 @@ fn collect_node_channels(profile: &Profile) -> BTreeMap<&str, u16> {
             output.channels.unwrap_or(default_channels),
         );
     }
+    for tap in &profile.captures.process_taps {
+        map.insert(tap.id.as_str(), tap.channels.unwrap_or(default_channels));
+    }
+    for tap in &profile.captures.system_taps {
+        map.insert(tap.id.as_str(), tap.channels.unwrap_or(default_channels));
+    }
 
     map
+}
+
+fn validate_system_tap_loop_avoidance(profile: &Profile) -> Result<(), ProfileError> {
+    if profile.captures.system_taps.is_empty() || profile.external.outputs.is_empty() {
+        return Ok(());
+    }
+
+    let output_ids = profile
+        .external
+        .outputs
+        .iter()
+        .map(|output| output.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let adjacency = route_adjacency(profile);
+
+    for tap in &profile.captures.system_taps {
+        let mut visited = BTreeSet::<&str>::new();
+        let mut queue = VecDeque::<&str>::from([tap.id.as_str()]);
+
+        while let Some(node_id) = queue.pop_front() {
+            if !visited.insert(node_id) {
+                continue;
+            }
+            if output_ids.contains(node_id) {
+                return Err(ProfileError::SystemTapSelfCapturePath {
+                    tap_id: tap.id.clone(),
+                    output_id: node_id.to_string(),
+                });
+            }
+            if let Some(next) = adjacency.get(node_id) {
+                queue.extend(next.iter().copied());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn route_adjacency(profile: &Profile) -> BTreeMap<&str, Vec<&str>> {
+    let mut adjacency = BTreeMap::<&str, Vec<&str>>::new();
+    if profile.routes.is_empty() {
+        for pipe in profile.pipes.iter().filter(|pipe| pipe.enabled) {
+            adjacency
+                .entry(pipe.from.as_str())
+                .or_default()
+                .push(pipe.to.as_str());
+        }
+    } else {
+        for route in profile.routes.iter().filter(|route| route.enabled) {
+            adjacency
+                .entry(route.from.as_str())
+                .or_default()
+                .push(route.to.as_str());
+        }
+    }
+    for next_nodes in adjacency.values_mut() {
+        next_nodes.sort_unstable();
+        next_nodes.dedup();
+    }
+    adjacency
 }
 
 fn validate_external_matchers(profile: &Profile) -> Result<(), ProfileError> {
@@ -1266,6 +1337,74 @@ pipes: []
         let profile = parse_profile_str(yaml).expect("yaml parse should work");
         let err = validate_profile(profile).expect_err("validation must fail");
         assert!(err.to_string().contains("unknown source"));
+    }
+
+    #[test]
+    fn accepts_route_from_capture_tap_to_mix() {
+        let yaml = r#"
+version: 2
+virtual:
+  outputs: []
+  inputs:
+    - id: mix1
+      name: Mix 1
+captures:
+  process_taps:
+    - id: app-tap
+      selector:
+        type: pid
+        pid: 1234
+      channels: 2
+  system_taps: []
+routes:
+  - id: route1
+    from: app-tap
+    to: mix1
+    matrix:
+      rows: 2
+      cols: 2
+      coefficients:
+        - [1.0, 0.0]
+        - [0.0, 1.0]
+pipes: []
+"#;
+        let profile = parse_profile_str(yaml).expect("yaml parse should work");
+        let validated = validate_profile(profile).expect("validation should pass");
+        assert_eq!(validated.graph.edges.len(), 1);
+    }
+
+    #[test]
+    fn rejects_system_tap_self_capture_path_to_external_output() {
+        let yaml = r#"
+version: 2
+external:
+  outputs:
+    - id: speaker
+      match:
+        name: "Speaker"
+captures:
+  process_taps: []
+  system_taps:
+    - id: system-main
+      mode: all_output
+      channels: 2
+routes:
+  - id: route1
+    from: system-main
+    to: speaker
+    matrix:
+      rows: 2
+      cols: 2
+      coefficients:
+        - [1.0, 0.0]
+        - [0.0, 1.0]
+pipes: []
+"#;
+        let profile = parse_profile_str(yaml).expect("yaml parse should work");
+        let err = validate_profile(profile).expect_err("validation must fail");
+        assert!(err.to_string().contains("self-capture path"));
+        assert!(err.to_string().contains("system-main"));
+        assert!(err.to_string().contains("speaker"));
     }
 
     #[test]
