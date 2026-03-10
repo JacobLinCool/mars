@@ -969,6 +969,7 @@ routes:
   - id: route-app-main
     from: bus-1
     to: mix-1
+    chain: chain-main
     matrix:
       rows: 2
       cols: 2
@@ -976,21 +977,47 @@ routes:
         - [1.0, 0.0]
         - [0.0, 1.0]
 
-processors: []
+processors:
+  - id: eq-main
+    kind: eq
+    config:
+      bands:
+        - freq_hz: 120.0
+          q: 0.8
+          gain_db: -2.0
 
-processor_chains: []
+processor_chains:
+  - id: chain-main
+    processors:
+      - eq-main
 
 captures:
-  process_taps: []
-  system_taps: []
+  process_taps:
+    - id: tap-browser
+      selector:
+        type: bundle_id
+        bundle_id: "com.apple.Safari"
+  system_taps:
+    - id: tap-system
+      mode: default_output
 
 sinks:
-  files: []
-  streams: []
+  files:
+    - id: rec-main
+      source: mix-1
+      path: "~/Music/mars-main.wav"
+      format: wav
+  streams:
+    - id: stream-main
+      source: mix-1
+      transport: rtp
+      endpoint: "127.0.0.1:5004"
 
-pipes:
-  - from: bus-1
-    to: mix-1
+pipes: []
+
+policy:
+  on_missing_external: error
+  apply_mode: atomic
 "#
     )
 }
@@ -1029,8 +1056,36 @@ external:
         name_regex: ".*Speakers.*"
 
 routes:
+  - id: route-browser-merge
+    from: app-browser
+    to: merge-bus
+    matrix:
+      rows: 2
+      cols: 2
+      coefficients:
+        - [1.0, 0.0]
+        - [0.0, 1.0]
+  - id: route-music-merge
+    from: app-music
+    to: merge-bus
+    matrix:
+      rows: 2
+      cols: 2
+      coefficients:
+        - [1.0, 0.0]
+        - [0.0, 1.0]
   - id: route-merge-main
     from: merge-bus
+    to: mix-main
+    chain: chain-main
+    matrix:
+      rows: 2
+      cols: 2
+      coefficients:
+        - [1.0, 0.0]
+        - [0.0, 1.0]
+  - id: route-tap-main
+    from: tap-browser
     to: mix-main
     matrix:
       rows: 2
@@ -1039,29 +1094,55 @@ routes:
         - [1.0, 0.0]
         - [0.0, 1.0]
 
-processors: []
+processors:
+  - id: eq-main
+    kind: eq
+    config:
+      bands:
+        - freq_hz: 5000.0
+          q: 1.2
+          gain_db: 2.5
+  - id: dyn-main
+    kind: dynamics
+    config:
+      threshold_db: -16.0
+      ratio: 3.0
+      attack_ms: 8.0
+      release_ms: 150.0
 
-processor_chains: []
+processor_chains:
+  - id: chain-main
+    processors:
+      - eq-main
+      - dyn-main
 
 captures:
-  process_taps: []
-  system_taps: []
+  process_taps:
+    - id: tap-browser
+      selector:
+        type: bundle_id
+        bundle_id: "com.apple.Safari"
+  system_taps:
+    - id: tap-system
+      mode: all_output
 
 sinks:
-  files: []
-  streams: []
+  files:
+    - id: rec-main
+      source: mix-main
+      path: "~/Music/mars-multi.caf"
+      format: caf
+  streams:
+    - id: stream-main
+      source: mix-main
+      transport: rtp
+      endpoint: "127.0.0.1:5006"
 
-pipes:
-  - from: app-browser
-    to: merge-bus
-    gain_db: -6.0
-  - from: app-music
-    to: merge-bus
-  - from: merge-bus
-    to: mix-main
-  - from: merge-bus
-    to: monitor
-    gain_db: -3.0
+pipes: []
+
+policy:
+  on_missing_external: error
+  apply_mode: atomic
 "#
     )
 }
@@ -1111,7 +1192,7 @@ policy:
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::{parse_profile_str, validate_profile};
+    use super::{TemplateKind, parse_profile_str, render_template, validate_profile};
 
     #[test]
     fn validates_default_profile() {
@@ -1136,6 +1217,34 @@ pipes:
         let profile = parse_profile_str(yaml).expect("parse should work");
         let validated = validate_profile(profile).expect("validation should pass");
         assert_eq!(validated.graph.edges.len(), 1);
+    }
+
+    #[test]
+    fn default_template_renders_v2_matrix_dsp_capture_sink_example() {
+        let yaml = render_template("default-template", TemplateKind::Default);
+        let profile = parse_profile_str(&yaml).expect("default template should parse");
+        let validated = validate_profile(profile).expect("default template should validate");
+
+        assert_eq!(validated.profile.version, 2);
+        assert!(!validated.profile.routes.is_empty());
+        assert!(!validated.profile.processors.is_empty());
+        assert!(!validated.profile.processor_chains.is_empty());
+        assert!(!validated.profile.captures.process_taps.is_empty());
+        assert!(!validated.profile.sinks.files.is_empty());
+    }
+
+    #[test]
+    fn multi_template_renders_v2_matrix_dsp_capture_sink_example() {
+        let yaml = render_template("multi-template", TemplateKind::Multi);
+        let profile = parse_profile_str(&yaml).expect("multi template should parse");
+        let validated = validate_profile(profile).expect("multi template should validate");
+
+        assert_eq!(validated.profile.version, 2);
+        assert!(validated.profile.routes.len() >= 3);
+        assert!(validated.profile.processors.len() >= 2);
+        assert!(!validated.profile.processor_chains.is_empty());
+        assert!(!validated.profile.captures.process_taps.is_empty());
+        assert!(!validated.profile.sinks.streams.is_empty());
     }
 
     #[test]

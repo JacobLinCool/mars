@@ -5,8 +5,8 @@ use mars_audio_tap::{
     TapCapability, TapHandle, TapMuteBehavior,
 };
 use mars_types::{
-    CaptureRuntimeHealth, CaptureRuntimeKind, CaptureRuntimeStatus, CaptureRuntimeTapStatus,
-    ProcessTapSelector, Profile, SystemTapMode,
+    CaptureProcessInfo, CaptureRuntimeHealth, CaptureRuntimeKind, CaptureRuntimeStatus,
+    CaptureRuntimeTapStatus, ProcessTapSelector, Profile, SystemTapMode,
 };
 
 #[derive(Debug)]
@@ -265,6 +265,22 @@ impl CaptureRuntime {
 
 pub fn probe_capture_capability() -> Result<TapCapability, String> {
     CoreAudioTapBackend::default().capability()
+}
+
+pub fn list_audio_processes() -> Result<Vec<CaptureProcessInfo>, String> {
+    let mut processes = CoreAudioTapBackend::default().list_processes()?;
+    processes.sort_by_key(|process| (process.pid, process.process_object_id));
+    Ok(processes
+        .into_iter()
+        .map(|process| CaptureProcessInfo {
+            process_object_id: process.process_object_id,
+            pid: process.pid,
+            bundle_id: process.bundle_id,
+            is_running: process.is_running,
+            is_running_input: process.is_running_input,
+            is_running_output: process.is_running_output,
+        })
+        .collect())
 }
 
 fn cleanup_handles(backend: &Arc<dyn TapBackend>, active: &[ActiveCaptureTap]) {

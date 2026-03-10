@@ -218,6 +218,7 @@ mars validate demo
 mars plan demo
 mars apply demo
 mars status --json
+mars processes --json
 mars doctor
 mars test
 mars test --route

@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 //! Shared types for MARS CLI, daemon, and supporting crates.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -442,6 +444,20 @@ pub enum SystemTapMode {
     AllOutput,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+pub struct CaptureProcessInfo {
+    pub process_object_id: u32,
+    pub pid: i32,
+    #[serde(default)]
+    pub bundle_id: String,
+    #[serde(default)]
+    pub is_running: bool,
+    #[serde(default)]
+    pub is_running_input: bool,
+    #[serde(default)]
+    pub is_running_output: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct SinkConfig {
@@ -605,6 +621,18 @@ pub struct RuntimeCounters {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+pub struct ProcessorRuntimeStats {
+    #[serde(default)]
+    pub prepare_calls: u64,
+    #[serde(default)]
+    pub process_calls: u64,
+    #[serde(default)]
+    pub reset_calls: u64,
+    #[serde(default)]
+    pub last_generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 pub struct DriverStatusSummary {
     pub generation: u64,
     pub request_count: u64,
@@ -760,8 +788,12 @@ pub struct DaemonStatus {
     pub buffer_frames: u32,
     pub graph_pipe_count: usize,
     #[serde(default)]
+    pub graph_route_count: usize,
+    #[serde(default)]
     pub devices: Vec<DeviceDescriptor>,
     pub counters: RuntimeCounters,
+    #[serde(default)]
+    pub processor_runtime: BTreeMap<String, ProcessorRuntimeStats>,
     #[serde(default)]
     pub driver: DriverStatusSummary,
     #[serde(default)]
@@ -793,6 +825,14 @@ pub struct DoctorReport {
     pub capture_active_taps: usize,
     #[serde(default)]
     pub capture_failed_taps: usize,
+    #[serde(default)]
+    pub sink_active: usize,
+    #[serde(default)]
+    pub sink_degraded: usize,
+    #[serde(default)]
+    pub sink_failed: usize,
+    #[serde(default)]
+    pub sink_write_errors: u64,
     #[serde(default)]
     pub notes: Vec<String>,
 }

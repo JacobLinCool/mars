@@ -18,6 +18,7 @@ A profile is addressed by file name stem (`<name>.yaml`).
 - `mars clear [--keep-devices]`
 - `mars status [--json]`
 - `mars devices [--json]`
+- `mars processes [--json]`
 - `mars logs [--follow]`
 - `mars doctor [--json]`
 
@@ -28,6 +29,11 @@ A profile is addressed by file name stem (`<name>.yaml`).
   - Output endpoint disconnect: MARS drops that endpoint's output and keeps routing active.
   - A background recovery supervisor retries reconnect with exponential backoff.
 - `mars status --json` includes `external_runtime.degraded_inputs` and `external_runtime.degraded_outputs`.
+- `mars status --json` also includes:
+  - `graph_route_count`
+  - `processor_runtime` (per-processor prepare/process/reset counters)
+  - `capture_runtime` and `sink_runtime` health/counter snapshots
+- `mars processes --json` lists process object id, pid, bundle id, and running I/O flags for capture selector authoring.
 - `external_runtime.stream_errors` is capped (ring buffer) to avoid unbounded growth.
 
 ## Log cursor semantics
