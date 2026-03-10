@@ -72,6 +72,8 @@ scripts/bench/verify.sh --platform macos-15 \
 
 ```bash
 scripts/bench/verify.sh --platform macos-15 \
-  --bench-cmd "cargo bench -p mars-daemon --bench sink_runtime" \
+  --bench-cmd "cargo bench -p mars-daemon --bench sink_runtime -- daemon/sink/submit/1sinks/256" \
+  --bench-cmd "cargo bench -p mars-daemon --bench sink_runtime -- daemon/sink/submit/4sinks/256" \
+  --bench-cmd "cargo bench -p mars-daemon --bench sink_runtime -- daemon/sink/backpressure/queue4/256" \
   --benchmark-prefix "daemon/sink/"
 ```

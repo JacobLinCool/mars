@@ -201,18 +201,20 @@ impl SinkRuntimeSubmitter {
                 frames,
                 samples: data.clone(),
             };
+            {
+                let mut state = self.state.lock();
+                state.queued_batches = state.queued_batches.saturating_add(1);
+            }
             match self.sender.try_send(batch) {
-                Ok(()) => {
-                    let mut state = self.state.lock();
-                    state.queued_batches = state.queued_batches.saturating_add(1);
-                }
+                Ok(()) => {}
                 Err(TrySendError::Full(batch)) => {
-                    self.state
-                        .lock()
-                        .mark_drop(&binding.id, batch.samples.len());
+                    let mut state = self.state.lock();
+                    state.queued_batches = state.queued_batches.saturating_sub(1);
+                    state.mark_drop(&binding.id, batch.samples.len());
                 }
                 Err(TrySendError::Disconnected(batch)) => {
                     let mut state = self.state.lock();
+                    state.queued_batches = state.queued_batches.saturating_sub(1);
                     state.mark_sink_failed(&binding.id, "sink runtime worker disconnected");
                     state.mark_drop(&binding.id, batch.samples.len());
                 }
@@ -313,10 +315,6 @@ fn sink_worker_loop(
     stop: Arc<AtomicBool>,
 ) {
     loop {
-        if stop.load(Ordering::Relaxed) && state.lock().queued_batches == 0 {
-            break;
-        }
-
         match receiver.recv_timeout(Duration::from_millis(WORKER_POLL_INTERVAL_MS)) {
             Ok(batch) => {
                 {
@@ -338,7 +336,11 @@ fn sink_worker_loop(
                     Err(error) => state.lock().mark_write_error(&batch.sink_id, error),
                 }
             }
-            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Timeout) => {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
