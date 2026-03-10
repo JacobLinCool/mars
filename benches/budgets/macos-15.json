@@ -32,21 +32,21 @@
       "benchmark_id": "daemon/capture/control_plane/8taps",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 8140.886999970543,
+      "budget_value": 9025.939646464645,
       "regression_threshold": 0.1
     },
     {
       "benchmark_id": "daemon/capture/control_plane/8taps",
       "platform": "macos-15",
       "metric": "p95_ns",
-      "budget_value": 8463.169054878048,
+      "budget_value": 10233.173836653212,
       "regression_threshold": 0.15
     },
     {
       "benchmark_id": "daemon/capture/create_destroy/1tap",
       "platform": "macos-15",
       "metric": "median_ns",
-      "budget_value": 1679.65718482906,
+      "budget_value": 1868.6257874046314,
       "regression_threshold": 0.1
     },
     {

@@ -107,6 +107,12 @@ def main() -> int:
     parser.add_argument("--budgets-dir", default="benches/budgets", type=Path)
     parser.add_argument("--metrics", required=True, type=Path)
     parser.add_argument("--platform", default=detect_platform())
+    parser.add_argument(
+        "--benchmark-prefix",
+        action="append",
+        default=[],
+        help="Restrict verification to benchmark_id prefixes (repeatable)",
+    )
     args = parser.parse_args()
 
     budget_entries = load_budget_entries(args.budgets_dir)
@@ -147,6 +153,19 @@ def main() -> int:
     relevant_budgets = [entry for entry in budget_entries if str(entry["platform"]) == args.platform]
     if not relevant_budgets:
         raise SystemExit(f"no budget entries found for platform '{args.platform}'")
+
+    benchmark_prefixes = [prefix for prefix in args.benchmark_prefix if prefix]
+    if benchmark_prefixes:
+        relevant_budgets = [
+            entry
+            for entry in relevant_budgets
+            if any(str(entry["benchmark_id"]).startswith(prefix) for prefix in benchmark_prefixes)
+        ]
+        if not relevant_budgets:
+            joined = ", ".join(benchmark_prefixes)
+            raise SystemExit(
+                f"no budget entries found for platform '{args.platform}' with prefixes: {joined}"
+            )
 
     failures: list[str] = []
     checked = 0

@@ -24,22 +24,104 @@ jobs:
       - name: Run mars-engine tests
         run: cargo test -p mars-engine
 
-  benchmark-budget-gate:
+  benchmark-gate-matrix:
     needs: mars-engine-tests
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Verify non-finite metric guardrails
         run: scripts/bench/test_non_finite.sh
-      - name: Run benchmark budget verification
-        run: scripts/bench/verify.sh --platform macos-15
+      - name: Run matrix benchmark budget verification
+        run: |
+          scripts/bench/verify.sh --platform macos-15 \
+            --bench-cmd "cargo bench -p mars-engine --bench engine -- engine/render_matrix" \
+            --benchmark-prefix "engine/render_matrix/"
       - name: Upload benchmark metrics artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bench-metrics
+          name: bench-metrics-matrix
+          path: target/bench/latest/metrics.json
+          if-no-files-found: ignore
+
+  benchmark-gate-dsp:
+    needs: mars-engine-tests
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify non-finite metric guardrails
+        run: scripts/bench/test_non_finite.sh
+      - name: Run DSP benchmark budget verification
+        run: |
+          scripts/bench/verify.sh --platform macos-15 \
+            --bench-cmd "cargo bench -p mars-engine --bench engine -- engine/render_chain_length" \
+            --bench-cmd "cargo bench -p mars-engine --bench engine -- engine/render_param_updates" \
+            --bench-cmd "cargo bench -p mars-engine --bench engine -- engine/render_processor_block" \
+            --bench-cmd "cargo bench -p mars-engine --bench engine -- engine/render_processor_chain_kind" \
+            --bench-cmd "cargo bench -p mars-engine --bench engine -- engine/render_timeshift_depth" \
+            --benchmark-prefix "engine/render_chain_length/" \
+            --benchmark-prefix "engine/render_param_updates/" \
+            --benchmark-prefix "engine/render_processor_block/" \
+            --benchmark-prefix "engine/render_processor_chain_kind/" \
+            --benchmark-prefix "engine/render_timeshift_depth/"
+      - name: Upload benchmark metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-metrics-dsp
+          path: target/bench/latest/metrics.json
+          if-no-files-found: ignore
+
+  benchmark-gate-capture:
+    needs: mars-engine-tests
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify non-finite metric guardrails
+        run: scripts/bench/test_non_finite.sh
+      - name: Run capture benchmark budget verification
+        run: |
+          scripts/bench/verify.sh --platform macos-15 \
+            --bench-cmd "cargo bench -p mars-daemon --bench capture_runtime" \
+            --bench-cmd "cargo bench -p mars-daemon --bench capture_render" \
+            --benchmark-prefix "daemon/capture/" \
+            --benchmark-prefix "daemon/capture_render/"
+      - name: Upload benchmark metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-metrics-capture
+          path: target/bench/latest/metrics.json
+          if-no-files-found: ignore
+
+  benchmark-gate-sink:
+    needs: mars-engine-tests
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify non-finite metric guardrails
+        run: scripts/bench/test_non_finite.sh
+      - name: Run sink benchmark budget verification
+        run: |
+          scripts/bench/verify.sh --platform macos-15 \
+            --bench-cmd "cargo bench -p mars-daemon --bench sink_runtime" \
+            --benchmark-prefix "daemon/sink/"
+      - name: Upload benchmark metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-metrics-sink
           path: target/bench/latest/metrics.json
           if-no-files-found: ignore
