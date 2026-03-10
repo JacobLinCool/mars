@@ -6,10 +6,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use chrono::Utc;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use mars_daemon::MarsDaemon;
 use mars_ipc::{DaemonRequest, DaemonResponse, IpcClient, LogRequest};
 use mars_shm::{RingSpec, StreamDirection, global_registry, stream_name};
+use mars_types::{
+    CaptureRuntimeHealth, CaptureRuntimeKind, CaptureRuntimeStatus, CaptureRuntimeTapStatus,
+    DaemonStatus, DeviceDescriptor, DriverStatusSummary, ExternalRuntimeStatus, NodeKind,
+    RuntimeCounters, SinkRuntimeHealth, SinkRuntimeKind, SinkRuntimeSinkStatus, SinkRuntimeStatus,
+};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
@@ -105,6 +111,133 @@ async fn probe_ipc_status(client: &IpcClient, requests: usize) -> (f64, f64) {
     (req_per_sec, p95_micros(latencies_us))
 }
 
+fn sample_status_payload() -> DaemonStatus {
+    DaemonStatus {
+        running: true,
+        current_profile: Some("bench-profile".to_string()),
+        sample_rate: 48_000,
+        buffer_frames: 256,
+        graph_pipe_count: 8,
+        graph_route_count: 12,
+        devices: vec![
+            DeviceDescriptor {
+                id: "app".to_string(),
+                name: "App".to_string(),
+                uid: "bench-vout".to_string(),
+                kind: NodeKind::VirtualOutput,
+                channels: 2,
+                managed: true,
+            },
+            DeviceDescriptor {
+                id: "mix".to_string(),
+                name: "Mix".to_string(),
+                uid: "bench-vin".to_string(),
+                kind: NodeKind::VirtualInput,
+                channels: 2,
+                managed: true,
+            },
+        ],
+        counters: RuntimeCounters {
+            underrun_count: 1,
+            overrun_count: 2,
+            xrun_count: 3,
+            deadline_miss_count: 4,
+            last_callback_ns: 125_000,
+            last_cycle_ns: 95_000,
+            max_cycle_ns: 140_000,
+        },
+        processor_runtime: std::collections::BTreeMap::from([
+            (
+                "eq-main".to_string(),
+                mars_types::ProcessorRuntimeStats {
+                    prepare_calls: 1,
+                    process_calls: 1024,
+                    reset_calls: 0,
+                    last_generation: 7,
+                },
+            ),
+            (
+                "dyn-main".to_string(),
+                mars_types::ProcessorRuntimeStats {
+                    prepare_calls: 1,
+                    process_calls: 1024,
+                    reset_calls: 0,
+                    last_generation: 7,
+                },
+            ),
+        ]),
+        driver: DriverStatusSummary {
+            generation: 7,
+            request_count: 9,
+            perform_count: 9,
+            applied_device_count: 2,
+            pending_change: false,
+        },
+        external_runtime: ExternalRuntimeStatus {
+            connected_inputs: 1,
+            connected_outputs: 1,
+            degraded_inputs: 0,
+            degraded_outputs: 0,
+            restart_attempts: 0,
+            stream_errors: Vec::new(),
+        },
+        capture_runtime: CaptureRuntimeStatus {
+            supported: true,
+            discovered_processes: 32,
+            active_taps: 2,
+            failed_taps: 0,
+            taps: vec![CaptureRuntimeTapStatus {
+                id: "tap-browser".to_string(),
+                kind: CaptureRuntimeKind::ProcessTap,
+                health: CaptureRuntimeHealth::Healthy,
+                selector: "bundle_id:com.apple.Safari".to_string(),
+                tap_id: Some(11),
+                aggregate_uid: Some("bench.tap.browser".to_string()),
+                aggregate_device_id: Some(99),
+                matched_processes: 1,
+                ingested_frames: 48_000,
+                underrun_count: 0,
+                overrun_count: 0,
+                xrun_count: 0,
+                restart_attempts: 0,
+                error_ring: Vec::new(),
+                last_error: None,
+            }],
+            errors: Vec::new(),
+        },
+        sink_runtime: SinkRuntimeStatus {
+            queue_capacity: 128,
+            queued_batches: 2,
+            dropped_batches: 0,
+            dropped_samples: 0,
+            write_errors: 0,
+            active_file_sinks: 1,
+            active_stream_sinks: 1,
+            sinks: vec![
+                SinkRuntimeSinkStatus {
+                    id: "record-main".to_string(),
+                    source: "mix".to_string(),
+                    kind: SinkRuntimeKind::File,
+                    health: SinkRuntimeHealth::Healthy,
+                    written_frames: 96_000,
+                    dropped_batches: 0,
+                    last_error: None,
+                },
+                SinkRuntimeSinkStatus {
+                    id: "stream-main".to_string(),
+                    source: "mix".to_string(),
+                    kind: SinkRuntimeKind::Stream,
+                    health: SinkRuntimeHealth::Healthy,
+                    written_frames: 96_000,
+                    dropped_batches: 0,
+                    last_error: None,
+                },
+            ],
+        },
+        updated_at: Utc::now(),
+    }
+}
+
 fn probe_shm_roundtrip(frames: usize, iterations: usize) -> (f64, f64) {
     let uid = shm_uid("d");
     let name = stream_name(StreamDirection::Vout, &uid);
@@ -190,6 +323,25 @@ fn bench_daemon_ipc(c: &mut Criterion) {
         });
     });
     group.finish();
+
+    let sample_status = sample_status_payload();
+    let encoded_status = serde_json::to_vec(&sample_status).expect("status encode baseline");
+    let mut serde_group = c.benchmark_group("daemon/ipc_serde");
+    serde_group.throughput(Throughput::Bytes(encoded_status.len() as u64));
+    serde_group.bench_function("status_encode", |b| {
+        b.iter(|| {
+            let encoded = serde_json::to_vec(black_box(&sample_status)).expect("status encode");
+            black_box(encoded);
+        });
+    });
+    serde_group.bench_function("status_decode", |b| {
+        b.iter(|| {
+            let decoded: DaemonStatus =
+                serde_json::from_slice(black_box(&encoded_status)).expect("status decode");
+            black_box(decoded);
+        });
+    });
+    serde_group.finish();
 
     runtime.block_on(stop_ipc_env(env));
 }

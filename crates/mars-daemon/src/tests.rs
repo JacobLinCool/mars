@@ -13,8 +13,9 @@ use mars_shm::{RingSpec, StreamDirection, global_registry, stream_name};
 use mars_types::{
     AutoOrU32, CaptureRuntimeHealth, CaptureRuntimeKind, CaptureRuntimeStatus,
     CaptureRuntimeTapStatus, DeviceDescriptor, FileSink, FileSinkFormat, NodeKind, Pipe,
-    ProcessTap, ProcessTapSelector, Profile, SystemTap, SystemTapMode, VirtualInputDevice,
-    VirtualOutputDevice,
+    ProcessTap, ProcessTapSelector, ProcessorChain, ProcessorDefinition, ProcessorKind, Profile,
+    Route, RouteMatrix, SinkRuntimeHealth, SinkRuntimeKind, SinkRuntimeSinkStatus,
+    SinkRuntimeStatus, SystemTap, SystemTapMode, VirtualInputDevice, VirtualOutputDevice,
 };
 
 use super::{
@@ -92,6 +93,62 @@ fn clear_diff_when_none() {
     let before = Profile::default();
     let diff = diff_profiles(Some(&before), None);
     assert!(!diff.changes.is_empty());
+}
+
+#[test]
+fn diff_detects_v2_routes_processors_captures_and_sinks() {
+    let before = Profile::default();
+    let mut after = Profile::default();
+
+    after.routes.push(Route {
+        id: "route-main".to_string(),
+        from: "src".to_string(),
+        to: "dst".to_string(),
+        enabled: true,
+        matrix: RouteMatrix {
+            rows: 2,
+            cols: 2,
+            coefficients: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+        },
+        chain: Some("chain-main".to_string()),
+        gain_db: 0.0,
+        mute: false,
+        pan: 0.0,
+        delay_ms: 0.0,
+    });
+    after.processors.push(ProcessorDefinition {
+        id: "eq-main".to_string(),
+        kind: ProcessorKind::Eq,
+        config: serde_json::Value::Null,
+    });
+    after.processor_chains.push(ProcessorChain {
+        id: "chain-main".to_string(),
+        processors: vec!["eq-main".to_string()],
+    });
+    after.captures.process_taps.push(ProcessTap {
+        id: "tap-main".to_string(),
+        selector: ProcessTapSelector::Pid { pid: 1234 },
+        channels: Some(2),
+    });
+    after.sinks.files.push(FileSink {
+        id: "record-main".to_string(),
+        source: "mix".to_string(),
+        path: "/tmp/mars-record.wav".to_string(),
+        format: FileSinkFormat::Wav,
+        channels: Some(2),
+    });
+
+    let diff = diff_profiles(Some(&before), Some(&after));
+    let targets = diff
+        .changes
+        .iter()
+        .map(|change| change.target.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(targets.contains(&"routes"));
+    assert!(targets.contains(&"processor_chains"));
+    assert!(targets.contains(&"captures"));
+    assert!(targets.contains(&"sinks"));
 }
 
 #[test]
@@ -278,6 +335,55 @@ fn status_reports_sink_runtime_health_and_write_stats() {
 
     daemon.stop_render_runtime();
     let _ = fs::remove_file(sink_path);
+}
+
+#[test]
+fn doctor_report_includes_sink_runtime_health_summary() {
+    let daemon = MarsDaemon::new(temp_log_path("doctor-sink-health"));
+    {
+        let mut state = daemon.state.lock();
+        state.sink_runtime = SinkRuntimeStatus {
+            queue_capacity: 64,
+            queued_batches: 1,
+            dropped_batches: 2,
+            dropped_samples: 512,
+            write_errors: 3,
+            active_file_sinks: 1,
+            active_stream_sinks: 1,
+            sinks: vec![
+                SinkRuntimeSinkStatus {
+                    id: "record-main".to_string(),
+                    source: "mix".to_string(),
+                    kind: SinkRuntimeKind::File,
+                    health: SinkRuntimeHealth::Degraded,
+                    written_frames: 1024,
+                    dropped_batches: 1,
+                    last_error: Some("disk slow".to_string()),
+                },
+                SinkRuntimeSinkStatus {
+                    id: "stream-main".to_string(),
+                    source: "mix".to_string(),
+                    kind: SinkRuntimeKind::Stream,
+                    health: SinkRuntimeHealth::Failed,
+                    written_frames: 0,
+                    dropped_batches: 2,
+                    last_error: Some("disconnected".to_string()),
+                },
+            ],
+        };
+    }
+
+    let report = daemon.doctor_report_internal();
+    assert_eq!(report.sink_active, 2);
+    assert_eq!(report.sink_degraded, 1);
+    assert_eq!(report.sink_failed, 1);
+    assert_eq!(report.sink_write_errors, 3);
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("sink runtime health"))
+    );
 }
 
 #[test]

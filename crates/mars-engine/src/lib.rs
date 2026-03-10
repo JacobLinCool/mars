@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use mars_graph::RoutingGraph;
-use mars_types::{MixMode, ProcessorKind, RuntimeCounters};
+use mars_types::{MixMode, ProcessorKind, ProcessorRuntimeStats, RuntimeCounters};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::Value;
@@ -76,14 +76,6 @@ pub struct ProcessorControl {
 }
 
 pub type ProcessorControlSnapshot = BTreeMap<String, ProcessorControl>;
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ProcessorRuntimeStats {
-    pub prepare_calls: u64,
-    pub process_calls: u64,
-    pub reset_calls: u64,
-    pub last_generation: u64,
-}
 
 #[derive(Debug, Clone, Default)]
 pub struct ProcessorSchedule {

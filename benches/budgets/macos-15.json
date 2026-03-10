@@ -141,6 +141,34 @@
       "regression_threshold": 0.15
     },
     {
+      "benchmark_id": "daemon/ipc_serde/status_decode",
+      "platform": "macos-15",
+      "metric": "median_ns",
+      "budget_value": 3678.4595129158324,
+      "regression_threshold": 0.1
+    },
+    {
+      "benchmark_id": "daemon/ipc_serde/status_decode",
+      "platform": "macos-15",
+      "metric": "p95_ns",
+      "budget_value": 3821.615565870372,
+      "regression_threshold": 0.15
+    },
+    {
+      "benchmark_id": "daemon/ipc_serde/status_encode",
+      "platform": "macos-15",
+      "metric": "median_ns",
+      "budget_value": 1942.4370648844333,
+      "regression_threshold": 0.1
+    },
+    {
+      "benchmark_id": "daemon/ipc_serde/status_encode",
+      "platform": "macos-15",
+      "metric": "p95_ns",
+      "budget_value": 1989.5615865059474,
+      "regression_threshold": 0.15
+    },
+    {
       "benchmark_id": "daemon/shm_roundtrip/1024",
       "platform": "macos-15",
       "metric": "median_ns",

@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use async_trait::async_trait;
-use capture_runtime::{CaptureRuntime, capture_aggregate_uid, probe_capture_capability};
+use capture_runtime::{
+    CaptureRuntime, capture_aggregate_uid, list_audio_processes, probe_capture_capability,
+};
 use chrono::Utc;
 use mars_coreaudio::{
     CoreAudioError, ExternalEndpointConfig, ExternalEndpointHealth, ExternalInputEndpointSnapshot,
@@ -36,7 +38,8 @@ use mars_shm::{RingSpec, StreamDirection, global_registry, stream_name};
 use mars_types::{
     ApplyPlan, ApplyRequest, ApplyResult, CaptureRuntimeHealth, CaptureRuntimeStatus, DaemonStatus,
     DeviceDescriptor, DriverStatusSummary, ExitCode, ExternalRuntimeStatus, MANAGED_UID_PREFIX,
-    NodeKind, PlanChange, PlanChangeKind, PlanRequest, Profile, RuntimeCounters, SinkRuntimeStatus,
+    NodeKind, PlanChange, PlanChangeKind, PlanRequest, Profile, RuntimeCounters, SinkRuntimeHealth,
+    SinkRuntimeStatus,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -956,8 +959,10 @@ impl MarsDaemon {
             sample_rate,
             buffer_frames,
             graph_pipe_count,
+            graph_route_count,
             devices,
             mut counters,
+            processor_runtime,
             mut external_runtime,
             mut capture_runtime,
             mut sink_runtime,
@@ -972,8 +977,16 @@ impl MarsDaemon {
                     .unwrap_or(48_000),
                 profile.map_or(256, |profile| profile.audio.buffer_frames),
                 state.graph.as_ref().map_or(0, |graph| graph.edges.len()),
+                state
+                    .graph
+                    .as_ref()
+                    .map_or(0, |graph| graph.compiled_route_plan().routes.len()),
                 state.devices.clone(),
                 state.counters.clone(),
+                state
+                    .engine
+                    .as_ref()
+                    .map_or_else(BTreeMap::new, |engine| engine.processor_runtime_stats()),
                 state.external_runtime.clone(),
                 state.capture_runtime.clone(),
                 state.sink_runtime.clone(),
@@ -1027,8 +1040,10 @@ impl MarsDaemon {
             sample_rate,
             buffer_frames,
             graph_pipe_count,
+            graph_route_count,
             devices,
             counters,
+            processor_runtime,
             driver,
             external_runtime,
             capture_runtime,
@@ -1195,10 +1210,31 @@ impl MarsDaemon {
         let state = self.state.lock();
         let capture_active_taps = state.capture_runtime.active_taps;
         let capture_failed_taps = state.capture_runtime.failed_taps;
+        let sink_active =
+            state.sink_runtime.active_file_sinks + state.sink_runtime.active_stream_sinks;
+        let sink_degraded = state
+            .sink_runtime
+            .sinks
+            .iter()
+            .filter(|sink| sink.health == SinkRuntimeHealth::Degraded)
+            .count();
+        let sink_failed = state
+            .sink_runtime
+            .sinks
+            .iter()
+            .filter(|sink| sink.health == SinkRuntimeHealth::Failed)
+            .count();
+        let sink_write_errors = state.sink_runtime.write_errors;
         if capture_failed_taps > 0 {
             for error in &state.capture_runtime.errors {
                 notes.push(format!("capture runtime error: {error}"));
             }
+        }
+        if sink_degraded > 0 || sink_failed > 0 || sink_write_errors > 0 {
+            notes.push(format!(
+                "sink runtime health: active={} degraded={} failed={} write_errors={}",
+                sink_active, sink_degraded, sink_failed, sink_write_errors
+            ));
         }
         notes.extend(feedback_risk_notes(state.graph.as_ref(), &state.devices));
         drop(state);
@@ -1215,6 +1251,10 @@ impl MarsDaemon {
             capture_tap_supported,
             capture_active_taps,
             capture_failed_taps,
+            sink_active,
+            sink_degraded,
+            sink_failed,
+            sink_write_errors,
             notes,
         }
     }
@@ -1252,6 +1292,15 @@ impl RequestHandler for MarsDaemon {
             DaemonRequest::Devices => {
                 let inventory = list_device_inventory().map_err(coreaudio_to_api_error)?;
                 Ok(DaemonResponse::Devices(inventory))
+            }
+            DaemonRequest::Processes => {
+                let processes = list_audio_processes().map_err(|error| {
+                    ApiError::new(
+                        format!("capture process discovery failed: {error}"),
+                        ExitCode::DriverUnavailable,
+                    )
+                })?;
+                Ok(DaemonResponse::Processes(processes))
             }
             DaemonRequest::Logs(request) => self.logs_internal(&request).map(DaemonResponse::Logs),
             DaemonRequest::Doctor => Ok(DaemonResponse::Doctor(self.doctor_report_internal())),
@@ -1430,8 +1479,42 @@ fn diff_profiles(previous: Option<&Profile>, next: Option<&Profile>) -> ApplyPla
         if previous.pipes != next.pipes || previous.buses != next.buses {
             changes.push(PlanChange {
                 kind: PlanChangeKind::UpdateGraph,
-                target: "graph".to_string(),
-                details: "update routing graph".to_string(),
+                target: "pipes".to_string(),
+                details: "update legacy pipe/bus routing".to_string(),
+            });
+        }
+
+        if previous.routes != next.routes {
+            changes.push(PlanChange {
+                kind: PlanChangeKind::UpdateGraph,
+                target: "routes".to_string(),
+                details: "update matrix routes".to_string(),
+            });
+        }
+
+        if previous.processors != next.processors
+            || previous.processor_chains != next.processor_chains
+        {
+            changes.push(PlanChange {
+                kind: PlanChangeKind::UpdateGraph,
+                target: "processor_chains".to_string(),
+                details: "update DSP processor chains".to_string(),
+            });
+        }
+
+        if previous.captures != next.captures {
+            changes.push(PlanChange {
+                kind: PlanChangeKind::UpdateGraph,
+                target: "captures".to_string(),
+                details: "update capture taps".to_string(),
+            });
+        }
+
+        if previous.sinks != next.sinks {
+            changes.push(PlanChange {
+                kind: PlanChangeKind::UpdateGraph,
+                target: "sinks".to_string(),
+                details: "update sink bindings".to_string(),
             });
         }
     }

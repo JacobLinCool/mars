@@ -10,8 +10,8 @@ use clap::{Parser, Subcommand};
 use mars_ipc::{DaemonRequest, DaemonResponse, IpcClient, LogRequest, LogResponse};
 use mars_profile::{TemplateKind, render_template};
 use mars_types::{
-    ApplyRequest, ClearRequest, DEFAULT_PROFILE_DIR_RELATIVE, DEFAULT_SOCKET_PATH_RELATIVE,
-    ExitCode, PlanRequest, ValidateRequest,
+    ApplyRequest, CaptureProcessInfo, ClearRequest, DEFAULT_PROFILE_DIR_RELATIVE,
+    DEFAULT_SOCKET_PATH_RELATIVE, ExitCode, PlanRequest, ValidateRequest,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -73,6 +73,7 @@ enum Commands {
     },
     Status,
     Devices,
+    Processes,
     Test {
         #[arg(
             long,
@@ -373,14 +374,18 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let current_profile = result.current_profile.clone();
             print_output(cli.json, &result, || {
                 format!(
-                    "running={} profile={} pipes={} driver_gen={} driver_pending={} capture_active={} capture_failed={}",
+                    "running={} profile={} pipes={} routes={} driver_gen={} driver_pending={} processor_nodes={} capture_active={} capture_failed={} sink_active={} sink_errors={}",
                     result.running,
                     current_profile.unwrap_or_else(|| "<none>".to_string()),
                     result.graph_pipe_count,
+                    result.graph_route_count,
                     result.driver.generation,
                     result.driver.pending_change,
+                    result.processor_runtime.len(),
                     result.capture_runtime.active_taps,
-                    result.capture_runtime.failed_taps
+                    result.capture_runtime.failed_taps,
+                    result.sink_runtime.active_file_sinks + result.sink_runtime.active_stream_sinks,
+                    result.sink_runtime.write_errors
                 )
             })?;
             Ok(ExitCode::Success)
@@ -405,6 +410,22 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     result.outputs.len()
                 )
             })?;
+            Ok(ExitCode::Success)
+        }
+        Commands::Processes => {
+            let client = daemon_client(Duration::from_millis(5000)).await?;
+            let response = client
+                .send(DaemonRequest::Processes)
+                .await
+                .map_err(ipc_to_cli_error)?;
+            let DaemonResponse::Processes(processes) = response else {
+                return Err(CliError::WithExit {
+                    message: "unexpected daemon response for processes".to_string(),
+                    exit_code: ExitCode::DaemonCommunication,
+                });
+            };
+
+            print_output(cli.json, &processes, || format_processes_report(&processes))?;
             Ok(ExitCode::Success)
         }
         Commands::Test {
@@ -484,7 +505,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
 
             print_output(cli.json, &result, || {
                 format!(
-                    "driver_installed={} daemon_reachable={} mic_permission={} mic_source={} driver_version={} daemon_version={} driver_gen={} driver_pending={} capture_supported={} capture_active={} capture_failed={}",
+                    "driver_installed={} daemon_reachable={} mic_permission={} mic_source={} driver_version={} daemon_version={} driver_gen={} driver_pending={} capture_supported={} capture_active={} capture_failed={} sink_active={} sink_degraded={} sink_failed={} sink_write_errors={}",
                     result.driver_installed,
                     result.daemon_reachable,
                     result.microphone_permission_ok,
@@ -495,7 +516,11 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     result.driver.pending_change,
                     result.capture_tap_supported,
                     result.capture_active_taps,
-                    result.capture_failed_taps
+                    result.capture_failed_taps,
+                    result.sink_active,
+                    result.sink_degraded,
+                    result.sink_failed,
+                    result.sink_write_errors
                 )
             })?;
 
@@ -518,6 +543,41 @@ where
         println!("{}", human());
     }
     Ok(())
+}
+
+fn format_processes_report(processes: &[CaptureProcessInfo]) -> String {
+    let running = processes
+        .iter()
+        .filter(|process| process.is_running)
+        .count();
+    if processes.is_empty() {
+        return "discovered 0 audio processes".to_string();
+    }
+
+    let mut lines = Vec::with_capacity(processes.len() + 1);
+    lines.push(format!(
+        "discovered {} audio processes (running: {})",
+        processes.len(),
+        running
+    ));
+    for process in processes {
+        let io_state = match (process.is_running_input, process.is_running_output) {
+            (true, true) => "io",
+            (true, false) => "in",
+            (false, true) => "out",
+            (false, false) => "-",
+        };
+        let bundle = if process.bundle_id.is_empty() {
+            "<unknown>"
+        } else {
+            process.bundle_id.as_str()
+        };
+        lines.push(format!(
+            "pid={} object_id={} running={} io={} bundle={}",
+            process.pid, process.process_object_id, process.is_running, io_state, bundle
+        ));
+    }
+    lines.join("\n")
 }
 
 fn profile_path(profile_name: &str) -> Result<PathBuf, CliError> {
@@ -853,7 +913,10 @@ fn compute_log_delta(previous: &[String], current: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_log_delta, is_stale_socket_error, is_valid_profile_name};
+    use super::{
+        compute_log_delta, format_processes_report, is_stale_socket_error, is_valid_profile_name,
+    };
+    use mars_types::CaptureProcessInfo;
 
     fn lines(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -919,5 +982,33 @@ mod tests {
         let previous = lines(&["one", "two"]);
         let current = lines(&["one", "two"]);
         assert!(compute_log_delta(&previous, &current).is_empty());
+    }
+
+    #[test]
+    fn processes_report_includes_running_summary_and_entries() {
+        let report = format_processes_report(&[
+            CaptureProcessInfo {
+                process_object_id: 10,
+                pid: 111,
+                bundle_id: "com.example.First".to_string(),
+                is_running: true,
+                is_running_input: true,
+                is_running_output: true,
+            },
+            CaptureProcessInfo {
+                process_object_id: 11,
+                pid: 222,
+                bundle_id: String::new(),
+                is_running: false,
+                is_running_input: false,
+                is_running_output: false,
+            },
+        ]);
+
+        assert!(report.contains("discovered 2 audio processes (running: 1)"));
+        assert!(
+            report.contains("pid=111 object_id=10 running=true io=io bundle=com.example.First")
+        );
+        assert!(report.contains("pid=222 object_id=11 running=false io=- bundle=<unknown>"));
     }
 }

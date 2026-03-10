@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use mars_types::{
-    ApplyPlan, ApplyRequest, ApplyResult, ClearRequest, DaemonStatus, DeviceInventory,
-    DoctorReport, ExitCode, PlanRequest, ValidateRequest, ValidationReport,
+    ApplyPlan, ApplyRequest, ApplyResult, CaptureProcessInfo, ClearRequest, DaemonStatus,
+    DeviceInventory, DoctorReport, ExitCode, PlanRequest, ValidateRequest, ValidationReport,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -31,6 +31,7 @@ pub enum Command {
     Clear,
     Status,
     Devices,
+    Processes,
     Logs,
     Doctor,
 }
@@ -80,6 +81,7 @@ pub enum DaemonRequest {
     Clear(ClearRequest),
     Status,
     Devices,
+    Processes,
     Logs(LogRequest),
     Doctor,
 }
@@ -95,6 +97,7 @@ impl DaemonRequest {
             Self::Clear(_) => Command::Clear,
             Self::Status => Command::Status,
             Self::Devices => Command::Devices,
+            Self::Processes => Command::Processes,
             Self::Logs(_) => Command::Logs,
             Self::Doctor => Command::Doctor,
         }
@@ -102,7 +105,9 @@ impl DaemonRequest {
 
     pub fn into_payload(self) -> Result<Value, IpcError> {
         match self {
-            Self::Ping | Self::Status | Self::Devices | Self::Doctor => Ok(Value::Null),
+            Self::Ping | Self::Status | Self::Devices | Self::Processes | Self::Doctor => {
+                Ok(Value::Null)
+            }
             Self::Validate(payload) => serde_json::to_value(payload).map_err(IpcError::SerdeJson),
             Self::Plan(payload) => serde_json::to_value(payload).map_err(IpcError::SerdeJson),
             Self::Apply(payload) => serde_json::to_value(payload).map_err(IpcError::SerdeJson),
@@ -121,6 +126,7 @@ pub enum DaemonResponse {
     Clear(ApplyResult),
     Status(DaemonStatus),
     Devices(DeviceInventory),
+    Processes(Vec<CaptureProcessInfo>),
     Logs(LogResponse),
     Doctor(DoctorReport),
 }
@@ -147,6 +153,9 @@ impl DaemonResponse {
             Command::Devices => Ok(Self::Devices(
                 serde_json::from_value(payload).map_err(IpcError::SerdeJson)?,
             )),
+            Command::Processes => Ok(Self::Processes(
+                serde_json::from_value(payload).map_err(IpcError::SerdeJson)?,
+            )),
             Command::Logs => Ok(Self::Logs(
                 serde_json::from_value(payload).map_err(IpcError::SerdeJson)?,
             )),
@@ -165,6 +174,7 @@ impl DaemonResponse {
             Self::Clear(value) => serde_json::to_value(value).map_err(IpcError::SerdeJson),
             Self::Status(value) => serde_json::to_value(value).map_err(IpcError::SerdeJson),
             Self::Devices(value) => serde_json::to_value(value).map_err(IpcError::SerdeJson),
+            Self::Processes(value) => serde_json::to_value(value).map_err(IpcError::SerdeJson),
             Self::Logs(value) => serde_json::to_value(value).map_err(IpcError::SerdeJson),
             Self::Doctor(value) => serde_json::to_value(value).map_err(IpcError::SerdeJson),
         }
@@ -390,6 +400,7 @@ fn deserialize_request(command: Command, payload: Value) -> Result<DaemonRequest
             .map_err(|error| IpcError::InvalidRequestPayload(command, error)),
         Command::Status => Ok(DaemonRequest::Status),
         Command::Devices => Ok(DaemonRequest::Devices),
+        Command::Processes => Ok(DaemonRequest::Processes),
         Command::Logs => serde_json::from_value(payload)
             .map(DaemonRequest::Logs)
             .map_err(|error| IpcError::InvalidRequestPayload(command, error)),
@@ -571,5 +582,41 @@ mod tests {
                 limit: Some(7)
             })
         ));
+    }
+
+    #[test]
+    fn deserialize_processes_request_accepts_null_payload() {
+        let request =
+            deserialize_request(Command::Processes, Value::Null).expect("parse processes payload");
+        assert!(matches!(request, DaemonRequest::Processes));
+    }
+
+    #[test]
+    fn processes_response_payload_round_trip_preserves_fields() {
+        let payload = DaemonResponse::Processes(vec![CaptureProcessInfo {
+            process_object_id: 42,
+            pid: 9001,
+            bundle_id: "com.example.App".to_string(),
+            is_running: true,
+            is_running_input: true,
+            is_running_output: false,
+        }])
+        .into_payload()
+        .expect("serialize processes response");
+
+        let DaemonResponse::Processes(processes) =
+            DaemonResponse::from_payload(Command::Processes, payload)
+                .expect("deserialize processes response")
+        else {
+            panic!("expected processes response");
+        };
+
+        assert_eq!(processes.len(), 1);
+        assert_eq!(processes[0].process_object_id, 42);
+        assert_eq!(processes[0].pid, 9001);
+        assert_eq!(processes[0].bundle_id, "com.example.App");
+        assert!(processes[0].is_running);
+        assert!(processes[0].is_running_input);
+        assert!(!processes[0].is_running_output);
     }
 }
