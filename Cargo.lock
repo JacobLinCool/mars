@@ -903,6 +903,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mars-plugin-host"
+version = "0.1.0"
+dependencies = [
+ "mars-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "mars-profile"
 version = "0.1.0"
 dependencies = [

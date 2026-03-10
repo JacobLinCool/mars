@@ -38,8 +38,8 @@ use mars_shm::{RingSpec, StreamDirection, global_registry, stream_name};
 use mars_types::{
     ApplyPlan, ApplyRequest, ApplyResult, CaptureRuntimeHealth, CaptureRuntimeStatus, DaemonStatus,
     DeviceDescriptor, DriverStatusSummary, ExitCode, ExternalRuntimeStatus, MANAGED_UID_PREFIX,
-    NodeKind, PlanChange, PlanChangeKind, PlanRequest, Profile, RuntimeCounters, SinkRuntimeHealth,
-    SinkRuntimeStatus,
+    NodeKind, PlanChange, PlanChangeKind, PlanRequest, PluginHostRuntimeStatus, Profile,
+    RuntimeCounters, SinkRuntimeHealth, SinkRuntimeStatus,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -65,6 +65,7 @@ struct DaemonState {
     external_runtime: ExternalRuntimeStatus,
     capture_runtime: CaptureRuntimeStatus,
     sink_runtime: SinkRuntimeStatus,
+    plugin_runtime: PluginHostRuntimeStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -812,6 +813,7 @@ impl MarsDaemon {
         state.external_runtime = ExternalRuntimeStatus::default();
         state.capture_runtime = CaptureRuntimeStatus::default();
         state.sink_runtime = SinkRuntimeStatus::default();
+        state.plugin_runtime = PluginHostRuntimeStatus::default();
         drop(state);
 
         if let Err(error) = self.sync_capture_runtime() {
@@ -916,6 +918,7 @@ impl MarsDaemon {
         state.external_runtime = ExternalRuntimeStatus::default();
         state.capture_runtime = CaptureRuntimeStatus::default();
         state.sink_runtime = SinkRuntimeStatus::default();
+        state.plugin_runtime = PluginHostRuntimeStatus::default();
 
         if !keep_devices {
             state.devices.retain(|device| !device.managed);
@@ -966,6 +969,7 @@ impl MarsDaemon {
             mut external_runtime,
             mut capture_runtime,
             mut sink_runtime,
+            mut plugin_runtime,
         ) = {
             let state = self.state.lock();
             let profile = state.current_profile.as_ref();
@@ -990,6 +994,7 @@ impl MarsDaemon {
                 state.external_runtime.clone(),
                 state.capture_runtime.clone(),
                 state.sink_runtime.clone(),
+                state.plugin_runtime.clone(),
             )
         };
 
@@ -1028,11 +1033,15 @@ impl MarsDaemon {
                 sink_runtime = runtime.status();
             }
         }
+        if let Some(engine) = self.state.lock().engine.as_ref() {
+            plugin_runtime = engine.plugin_runtime_status();
+        }
         if let Some(runtime) = self.capture_runtime.lock().as_ref() {
             capture_runtime = runtime.status();
         }
         capture_runtime =
             enrich_capture_runtime_with_external_inputs(capture_runtime, &external_input_snapshots);
+        self.state.lock().plugin_runtime = plugin_runtime.clone();
 
         DaemonStatus {
             running,
@@ -1048,6 +1057,7 @@ impl MarsDaemon {
             external_runtime,
             capture_runtime,
             sink_runtime,
+            plugin_runtime,
             updated_at: Utc::now(),
         }
     }
@@ -1225,6 +1235,11 @@ impl MarsDaemon {
             .filter(|sink| sink.health == SinkRuntimeHealth::Failed)
             .count();
         let sink_write_errors = state.sink_runtime.write_errors;
+        let plugin_active = state.plugin_runtime.active_instances;
+        let plugin_failed = state.plugin_runtime.failed_instances;
+        let plugin_timeouts = state.plugin_runtime.timeout_count;
+        let plugin_errors = state.plugin_runtime.error_count;
+        let plugin_restarts = state.plugin_runtime.restart_count;
         if capture_failed_taps > 0 {
             for error in &state.capture_runtime.errors {
                 notes.push(format!("capture runtime error: {error}"));
@@ -1234,6 +1249,12 @@ impl MarsDaemon {
             notes.push(format!(
                 "sink runtime health: active={} degraded={} failed={} write_errors={}",
                 sink_active, sink_degraded, sink_failed, sink_write_errors
+            ));
+        }
+        if plugin_failed > 0 || plugin_timeouts > 0 || plugin_errors > 0 || plugin_restarts > 0 {
+            notes.push(format!(
+                "plugin runtime health: active={} failed={} timeouts={} errors={} restarts={}",
+                plugin_active, plugin_failed, plugin_timeouts, plugin_errors, plugin_restarts
             ));
         }
         notes.extend(feedback_risk_notes(state.graph.as_ref(), &state.devices));
@@ -1255,6 +1276,11 @@ impl MarsDaemon {
             sink_degraded,
             sink_failed,
             sink_write_errors,
+            plugin_active,
+            plugin_failed,
+            plugin_timeouts,
+            plugin_errors,
+            plugin_restarts,
             notes,
         }
     }

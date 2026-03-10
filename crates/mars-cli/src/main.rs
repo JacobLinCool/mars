@@ -11,7 +11,8 @@ use mars_ipc::{DaemonRequest, DaemonResponse, IpcClient, LogRequest, LogResponse
 use mars_profile::{TemplateKind, render_template};
 use mars_types::{
     ApplyRequest, CaptureProcessInfo, ClearRequest, DEFAULT_PROFILE_DIR_RELATIVE,
-    DEFAULT_SOCKET_PATH_RELATIVE, ExitCode, PlanRequest, ValidateRequest,
+    DEFAULT_SOCKET_PATH_RELATIVE, DaemonStatus, DoctorReport, ExitCode, PlanRequest,
+    ValidateRequest,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -371,23 +372,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 });
             };
 
-            let current_profile = result.current_profile.clone();
-            print_output(cli.json, &result, || {
-                format!(
-                    "running={} profile={} pipes={} routes={} driver_gen={} driver_pending={} processor_nodes={} capture_active={} capture_failed={} sink_active={} sink_errors={}",
-                    result.running,
-                    current_profile.unwrap_or_else(|| "<none>".to_string()),
-                    result.graph_pipe_count,
-                    result.graph_route_count,
-                    result.driver.generation,
-                    result.driver.pending_change,
-                    result.processor_runtime.len(),
-                    result.capture_runtime.active_taps,
-                    result.capture_runtime.failed_taps,
-                    result.sink_runtime.active_file_sinks + result.sink_runtime.active_stream_sinks,
-                    result.sink_runtime.write_errors
-                )
-            })?;
+            print_output(cli.json, &result, || format_status_report(&result))?;
             Ok(ExitCode::Success)
         }
         Commands::Devices => {
@@ -503,26 +488,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 });
             };
 
-            print_output(cli.json, &result, || {
-                format!(
-                    "driver_installed={} daemon_reachable={} mic_permission={} mic_source={} driver_version={} daemon_version={} driver_gen={} driver_pending={} capture_supported={} capture_active={} capture_failed={} sink_active={} sink_degraded={} sink_failed={} sink_write_errors={}",
-                    result.driver_installed,
-                    result.daemon_reachable,
-                    result.microphone_permission_ok,
-                    result.mic_permission_source,
-                    result.driver_version.as_deref().unwrap_or("<unknown>"),
-                    result.daemon_version,
-                    result.driver.generation,
-                    result.driver.pending_change,
-                    result.capture_tap_supported,
-                    result.capture_active_taps,
-                    result.capture_failed_taps,
-                    result.sink_active,
-                    result.sink_degraded,
-                    result.sink_failed,
-                    result.sink_write_errors
-                )
-            })?;
+            print_output(cli.json, &result, || format_doctor_report(&result))?;
 
             Ok(if result.driver_installed && result.driver_compatible {
                 ExitCode::Success
@@ -578,6 +544,54 @@ fn format_processes_report(processes: &[CaptureProcessInfo]) -> String {
         ));
     }
     lines.join("\n")
+}
+
+fn format_status_report(status: &DaemonStatus) -> String {
+    format!(
+        "running={} profile={} pipes={} routes={} driver_gen={} driver_pending={} processor_nodes={} capture_active={} capture_failed={} sink_active={} sink_errors={} plugin_active={} plugin_failed={} plugin_timeouts={} plugin_errors={} plugin_restarts={}",
+        status.running,
+        status.current_profile.as_deref().unwrap_or("<none>"),
+        status.graph_pipe_count,
+        status.graph_route_count,
+        status.driver.generation,
+        status.driver.pending_change,
+        status.processor_runtime.len(),
+        status.capture_runtime.active_taps,
+        status.capture_runtime.failed_taps,
+        status.sink_runtime.active_file_sinks + status.sink_runtime.active_stream_sinks,
+        status.sink_runtime.write_errors,
+        status.plugin_runtime.active_instances,
+        status.plugin_runtime.failed_instances,
+        status.plugin_runtime.timeout_count,
+        status.plugin_runtime.error_count,
+        status.plugin_runtime.restart_count
+    )
+}
+
+fn format_doctor_report(report: &DoctorReport) -> String {
+    format!(
+        "driver_installed={} daemon_reachable={} mic_permission={} mic_source={} driver_version={} daemon_version={} driver_gen={} driver_pending={} capture_supported={} capture_active={} capture_failed={} sink_active={} sink_degraded={} sink_failed={} sink_write_errors={} plugin_active={} plugin_failed={} plugin_timeouts={} plugin_errors={} plugin_restarts={}",
+        report.driver_installed,
+        report.daemon_reachable,
+        report.microphone_permission_ok,
+        report.mic_permission_source,
+        report.driver_version.as_deref().unwrap_or("<unknown>"),
+        report.daemon_version,
+        report.driver.generation,
+        report.driver.pending_change,
+        report.capture_tap_supported,
+        report.capture_active_taps,
+        report.capture_failed_taps,
+        report.sink_active,
+        report.sink_degraded,
+        report.sink_failed,
+        report.sink_write_errors,
+        report.plugin_active,
+        report.plugin_failed,
+        report.plugin_timeouts,
+        report.plugin_errors,
+        report.plugin_restarts
+    )
 }
 
 fn profile_path(profile_name: &str) -> Result<PathBuf, CliError> {
@@ -914,9 +928,11 @@ fn compute_log_delta(previous: &[String], current: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_log_delta, format_processes_report, is_stale_socket_error, is_valid_profile_name,
+        compute_log_delta, format_doctor_report, format_processes_report, format_status_report,
+        is_stale_socket_error, is_valid_profile_name,
     };
-    use mars_types::CaptureProcessInfo;
+    use mars_types::{CaptureProcessInfo, DaemonStatus, DoctorReport};
+    use serde_json::json;
 
     fn lines(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -1010,5 +1026,103 @@ mod tests {
             report.contains("pid=111 object_id=10 running=true io=io bundle=com.example.First")
         );
         assert!(report.contains("pid=222 object_id=11 running=false io=- bundle=<unknown>"));
+    }
+
+    #[test]
+    fn status_report_includes_plugin_runtime_summary() {
+        let status: DaemonStatus = serde_json::from_value(json!({
+            "running": true,
+            "current_profile": "demo",
+            "sample_rate": 48000,
+            "buffer_frames": 256,
+            "graph_pipe_count": 3,
+            "graph_route_count": 4,
+            "devices": [],
+            "counters": {
+                "underrun_count": 0,
+                "overrun_count": 0,
+                "xrun_count": 0,
+                "deadline_miss_count": 0,
+                "last_callback_ns": 0,
+                "last_cycle_ns": 0,
+                "max_cycle_ns": 0
+            },
+            "processor_runtime": {},
+            "driver": {
+                "generation": 11,
+                "request_count": 0,
+                "perform_count": 0,
+                "applied_device_count": 0,
+                "pending_change": false
+            },
+            "capture_runtime": {
+                "supported": true,
+                "discovered_processes": 0,
+                "active_taps": 1,
+                "failed_taps": 0,
+                "taps": [],
+                "errors": []
+            },
+            "sink_runtime": {
+                "queue_capacity": 0,
+                "queued_batches": 0,
+                "dropped_batches": 0,
+                "dropped_samples": 0,
+                "write_errors": 2,
+                "active_file_sinks": 1,
+                "active_stream_sinks": 0,
+                "sinks": []
+            },
+            "plugin_runtime": {
+                "active_instances": 2,
+                "failed_instances": 1,
+                "timeout_count": 3,
+                "error_count": 4,
+                "restart_count": 5,
+                "instances": []
+            },
+            "updated_at": "2026-03-10T00:00:00Z"
+        }))
+        .expect("status json");
+
+        let report = format_status_report(&status);
+        assert!(report.contains("profile=demo"));
+        assert!(report.contains("plugin_active=2"));
+        assert!(report.contains("plugin_failed=1"));
+        assert!(report.contains("plugin_timeouts=3"));
+        assert!(report.contains("plugin_errors=4"));
+        assert!(report.contains("plugin_restarts=5"));
+    }
+
+    #[test]
+    fn doctor_report_includes_plugin_runtime_summary() {
+        let report = format_doctor_report(&DoctorReport {
+            driver_installed: true,
+            driver_compatible: true,
+            daemon_reachable: true,
+            microphone_permission_ok: true,
+            driver_version: Some("1.0.0".to_string()),
+            daemon_version: "1.0.0".to_string(),
+            mic_permission_source: "none".to_string(),
+            driver: Default::default(),
+            capture_tap_supported: true,
+            capture_active_taps: 1,
+            capture_failed_taps: 0,
+            sink_active: 1,
+            sink_degraded: 0,
+            sink_failed: 0,
+            sink_write_errors: 0,
+            plugin_active: 4,
+            plugin_failed: 2,
+            plugin_timeouts: 6,
+            plugin_errors: 7,
+            plugin_restarts: 9,
+            notes: Vec::new(),
+        });
+        assert!(report.contains("plugin_active=4"));
+        assert!(report.contains("plugin_failed=2"));
+        assert!(report.contains("plugin_timeouts=6"));
+        assert!(report.contains("plugin_errors=7"));
+        assert!(report.contains("plugin_restarts=9"));
     }
 }

@@ -6,7 +6,10 @@ use std::fs;
 use std::path::Path;
 
 use mars_graph::{GraphError, RoutingGraph, build_routing_graph};
-use mars_types::{AutoOrU16, AutoOrU32, PROFILE_VERSION, ProcessorKind, Profile, ValidationReport};
+use mars_types::{
+    AuPluginApi, AuPluginConfig, AutoOrU16, AutoOrU32, PROFILE_VERSION, ProcessorKind, Profile,
+    ValidationReport,
+};
 use regex::Regex;
 use schemars::schema_for;
 use thiserror::Error;
@@ -127,6 +130,11 @@ pub enum ProfileError {
     },
     #[error("processor '{processor_id}' time-shift config is invalid: {reason}")]
     InvalidTimeShiftConfig {
+        processor_id: String,
+        reason: String,
+    },
+    #[error("processor '{processor_id}' au config is invalid: {reason}")]
+    InvalidAuConfig {
         processor_id: String,
         reason: String,
     },
@@ -601,6 +609,73 @@ fn validate_time_shift_config(
     Ok(())
 }
 
+fn validate_au_config(config: &AuPluginConfig, processor_id: &str) -> Result<(), ProfileError> {
+    let non_empty = |value: &str| !value.trim().is_empty();
+    if config.process_timeout_ms == 0 || config.process_timeout_ms > 500 {
+        return Err(ProfileError::InvalidAuConfig {
+            processor_id: processor_id.to_string(),
+            reason: "process_timeout_ms must be in [1, 500]".to_string(),
+        });
+    }
+    if config.max_frames < 64 || config.max_frames > 8_192 {
+        return Err(ProfileError::InvalidAuConfig {
+            processor_id: processor_id.to_string(),
+            reason: "max_frames must be in [64, 8192]".to_string(),
+        });
+    }
+    if config.host_command.contains('\n') || config.host_command.contains('\r') {
+        return Err(ProfileError::InvalidAuConfig {
+            processor_id: processor_id.to_string(),
+            reason: "host_command must not contain line breaks".to_string(),
+        });
+    }
+    for (index, argument) in config.host_args.iter().enumerate() {
+        if argument.contains('\n') || argument.contains('\r') {
+            return Err(ProfileError::InvalidAuConfig {
+                processor_id: processor_id.to_string(),
+                reason: format!("host_args[{index}] must not contain line breaks"),
+            });
+        }
+    }
+
+    match config.api {
+        AuPluginApi::Auv2 => {
+            let fields = [
+                ("component_type", config.component_type.as_str()),
+                ("component_subtype", config.component_subtype.as_str()),
+                (
+                    "component_manufacturer",
+                    config.component_manufacturer.as_str(),
+                ),
+            ];
+            for (name, value) in fields {
+                if !non_empty(value) {
+                    return Err(ProfileError::InvalidAuConfig {
+                        processor_id: processor_id.to_string(),
+                        reason: format!("{name} must not be empty for auv2"),
+                    });
+                }
+                if value.chars().count() != 4 {
+                    return Err(ProfileError::InvalidAuConfig {
+                        processor_id: processor_id.to_string(),
+                        reason: format!("{name} must be a 4-character code for auv2"),
+                    });
+                }
+            }
+        }
+        AuPluginApi::Auv3 => {
+            if !non_empty(&config.bundle_id) {
+                return Err(ProfileError::InvalidAuConfig {
+                    processor_id: processor_id.to_string(),
+                    reason: "bundle_id must not be empty for auv3".to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn normalized_processor_config(config: &serde_json::Value) -> serde_json::Value {
     if config.is_null() {
         return serde_json::Value::Object(serde_json::Map::new());
@@ -651,7 +726,16 @@ fn validate_processor_chains(profile: &Profile) -> Result<(), ProfileError> {
                 })?;
                 validate_time_shift_config(&config, &processor.id)?;
             }
-            _ => {}
+            ProcessorKind::Au => {
+                let config = serde_json::from_value::<AuPluginConfig>(normalized_processor_config(
+                    &processor.config,
+                ))
+                .map_err(|error| ProfileError::InvalidAuConfig {
+                    processor_id: processor.id.clone(),
+                    reason: error.to_string(),
+                })?;
+                validate_au_config(&config, &processor.id)?;
+            }
         }
     }
 
@@ -1712,6 +1796,78 @@ pipes: []
         let err = validate_profile(profile).expect_err("validation must fail");
         assert!(err.to_string().contains("time-shift config is invalid"));
         assert!(err.to_string().contains("delay_ms must be <= max_delay_ms"));
+    }
+
+    #[test]
+    fn accepts_valid_auv2_processor_config() {
+        let yaml = r#"
+version: 2
+virtual:
+  outputs: []
+  inputs: []
+processors:
+  - id: au1
+    kind: au
+    config:
+      api: auv2
+      component_type: aufx
+      component_subtype: gain
+      component_manufacturer: appl
+      process_timeout_ms: 8
+      max_frames: 2048
+pipes: []
+"#;
+        let profile = parse_profile_str(yaml).expect("yaml parse should work");
+        validate_profile(profile).expect("validation should pass");
+    }
+
+    #[test]
+    fn accepts_valid_auv3_processor_config() {
+        let yaml = r#"
+version: 2
+virtual:
+  outputs: []
+  inputs: []
+processors:
+  - id: au3
+    kind: au
+    config:
+      api: auv3
+      bundle_id: com.example.unit
+      process_timeout_ms: 10
+      max_frames: 1024
+pipes: []
+"#;
+        let profile = parse_profile_str(yaml).expect("yaml parse should work");
+        validate_profile(profile).expect("validation should pass");
+    }
+
+    #[test]
+    fn rejects_invalid_auv2_processor_config() {
+        let yaml = r#"
+version: 2
+virtual:
+  outputs: []
+  inputs: []
+processors:
+  - id: au-invalid
+    kind: au
+    config:
+      api: auv2
+      component_type: aufx
+      component_subtype: bad
+      component_manufacturer: appl
+      process_timeout_ms: 0
+      max_frames: 32
+pipes: []
+"#;
+        let profile = parse_profile_str(yaml).expect("yaml parse should work");
+        let err = validate_profile(profile).expect_err("validation must fail");
+        assert!(err.to_string().contains("au config is invalid"));
+        assert!(
+            err.to_string()
+                .contains("process_timeout_ms must be in [1, 500]")
+        );
     }
 
     #[test]

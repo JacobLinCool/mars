@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const PROFILE_VERSION: u32 = 2;
+pub const PLUGIN_HOST_PROTOCOL_VERSION: u16 = 1;
 pub const PROFILE_FILE_EXTENSION: &str = "yaml";
 pub const MANAGED_UID_PREFIX: &str = "com.mars.";
 pub const MANUFACTURER_MARS: &str = "MARS";
@@ -393,6 +394,92 @@ pub enum ProcessorKind {
     Au,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AuPluginApi {
+    #[default]
+    Auv2,
+    Auv3,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuPluginConfig {
+    pub api: AuPluginApi,
+    pub component_type: String,
+    pub component_subtype: String,
+    pub component_manufacturer: String,
+    pub bundle_id: String,
+    pub process_timeout_ms: u32,
+    pub max_frames: u32,
+    pub host_command: String,
+    pub host_args: Vec<String>,
+}
+
+impl Default for AuPluginConfig {
+    fn default() -> Self {
+        Self {
+            api: AuPluginApi::Auv2,
+            component_type: String::new(),
+            component_subtype: String::new(),
+            component_manufacturer: String::new(),
+            bundle_id: String::new(),
+            process_timeout_ms: default_au_process_timeout_ms(),
+            max_frames: default_au_max_frames(),
+            host_command: String::new(),
+            host_args: Vec::new(),
+        }
+    }
+}
+
+const fn default_au_process_timeout_ms() -> u32 {
+    8
+}
+
+const fn default_au_max_frames() -> u32 {
+    2_048
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PluginHostRequest {
+    Handshake {
+        protocol_version: u16,
+    },
+    Load {
+        instance_id: String,
+        config: AuPluginConfig,
+    },
+    Prepare {
+        instance_id: String,
+        sample_rate: u32,
+        channels: u16,
+        max_frames: u32,
+    },
+    Process {
+        instance_id: String,
+        channels: u16,
+        frames: u32,
+        samples: Vec<f32>,
+    },
+    Reset {
+        instance_id: String,
+    },
+    Unload {
+        instance_id: String,
+    },
+    Shutdown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PluginHostResponse {
+    Handshake { protocol_version: u16 },
+    Ack,
+    Processed { samples: Vec<f32> },
+    Error { message: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessorChain {
@@ -769,6 +856,52 @@ pub struct SinkRuntimeStatus {
     pub sinks: Vec<SinkRuntimeSinkStatus>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginHostHealth {
+    #[default]
+    Healthy,
+    Degraded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+pub struct PluginHostInstanceStatus {
+    pub id: String,
+    pub api: AuPluginApi,
+    pub health: PluginHostHealth,
+    #[serde(default)]
+    pub loaded: bool,
+    #[serde(default)]
+    pub host_pid: Option<u32>,
+    #[serde(default)]
+    pub process_calls: u64,
+    #[serde(default)]
+    pub timeout_count: u64,
+    #[serde(default)]
+    pub error_count: u64,
+    #[serde(default)]
+    pub restart_count: u64,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+pub struct PluginHostRuntimeStatus {
+    #[serde(default)]
+    pub active_instances: usize,
+    #[serde(default)]
+    pub failed_instances: usize,
+    #[serde(default)]
+    pub timeout_count: u64,
+    #[serde(default)]
+    pub error_count: u64,
+    #[serde(default)]
+    pub restart_count: u64,
+    #[serde(default)]
+    pub instances: Vec<PluginHostInstanceStatus>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct DeviceDescriptor {
     pub id: String,
@@ -802,6 +935,8 @@ pub struct DaemonStatus {
     pub capture_runtime: CaptureRuntimeStatus,
     #[serde(default)]
     pub sink_runtime: SinkRuntimeStatus,
+    #[serde(default)]
+    pub plugin_runtime: PluginHostRuntimeStatus,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -833,6 +968,16 @@ pub struct DoctorReport {
     pub sink_failed: usize,
     #[serde(default)]
     pub sink_write_errors: u64,
+    #[serde(default)]
+    pub plugin_active: usize,
+    #[serde(default)]
+    pub plugin_failed: usize,
+    #[serde(default)]
+    pub plugin_timeouts: u64,
+    #[serde(default)]
+    pub plugin_errors: u64,
+    #[serde(default)]
+    pub plugin_restarts: u64,
     #[serde(default)]
     pub notes: Vec<String>,
 }
