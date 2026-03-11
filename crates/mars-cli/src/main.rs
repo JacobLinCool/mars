@@ -4,11 +4,12 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use mars_ipc::{DaemonRequest, DaemonResponse, IpcClient, LogRequest, LogResponse};
 use mars_profile::{TemplateKind, render_template};
+use mars_telemetry::{Attribute, ServiceIdentity, TelemetryRuntime};
 use mars_types::{
     ApplyRequest, CaptureProcessInfo, ClearRequest, DEFAULT_PROFILE_DIR_RELATIVE,
     DEFAULT_SOCKET_PATH_RELATIVE, DaemonStatus, DoctorReport, ExitCode, PlanRequest,
@@ -103,6 +104,26 @@ enum Commands {
     Doctor,
 }
 
+impl Commands {
+    #[must_use]
+    const fn telemetry_name(&self) -> &'static str {
+        match self {
+            Self::Create { .. } => "create",
+            Self::Open { .. } => "open",
+            Self::Apply { .. } => "apply",
+            Self::Clear { .. } => "clear",
+            Self::Validate { .. } => "validate",
+            Self::Plan { .. } => "plan",
+            Self::Status => "status",
+            Self::Devices => "devices",
+            Self::Processes => "processes",
+            Self::Test { .. } => "test",
+            Self::Logs { .. } => "logs",
+            Self::Doctor => "doctor",
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 enum CliError {
     #[error("{message}")]
@@ -118,11 +139,91 @@ enum CliError {
     Yaml(#[from] serde_yaml::Error),
 }
 
+#[derive(Debug, Clone)]
+struct CliTelemetry {
+    tracer: mars_telemetry::TelemetryTracer,
+    command_count: mars_telemetry::U64Counter,
+    command_duration: mars_telemetry::U64Histogram,
+}
+
+impl CliTelemetry {
+    fn new(runtime: &TelemetryRuntime) -> Self {
+        let meter = runtime.meter("mars-cli");
+        Self {
+            tracer: runtime.tracer("mars-cli"),
+            command_count: meter.u64_counter(
+                "mars.cli.command.count",
+                "Count of mars CLI commands",
+                "{command}",
+            ),
+            command_duration: meter.u64_histogram(
+                "mars.cli.command.duration",
+                "Duration of mars CLI commands",
+                "ms",
+            ),
+        }
+    }
+
+    fn record(
+        &self,
+        command_name: &'static str,
+        json_output: bool,
+        elapsed_ms: u64,
+        outcome: &Result<ExitCode, CliError>,
+        span: &mars_telemetry::SpanGuard,
+    ) {
+        let (success, exit_code, error_description) = command_outcome(outcome);
+        let attrs = [
+            Attribute::string("command", command_name),
+            Attribute::bool("success", success),
+            Attribute::i64("exit_code", i64::from(exit_code.as_i32())),
+            Attribute::bool("json_output", json_output),
+        ];
+        self.command_count.add(1, &attrs);
+        self.command_duration.record(elapsed_ms, &attrs);
+        span.set_attributes(&attrs);
+        if success {
+            span.set_status_ok();
+        } else {
+            span.set_status_error(error_description);
+        }
+    }
+}
+
+fn command_outcome(outcome: &Result<ExitCode, CliError>) -> (bool, ExitCode, String) {
+    match outcome {
+        Ok(exit_code) => (
+            *exit_code == ExitCode::Success,
+            *exit_code,
+            if *exit_code == ExitCode::Success {
+                String::new()
+            } else {
+                format!("command exited with code {}", exit_code.as_i32())
+            },
+        ),
+        Err(CliError::WithExit { message, exit_code }) => (false, *exit_code, message.clone()),
+        Err(other) => (false, ExitCode::DaemonCommunication, other.to_string()),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let telemetry_runtime = match TelemetryRuntime::init(ServiceIdentity::new(
+        "mars-cli",
+        env!("CARGO_PKG_VERSION"),
+        "cli",
+    )) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(ExitCode::DaemonCommunication.as_i32());
+        }
+    };
+    let telemetry = CliTelemetry::new(&telemetry_runtime);
+
     let exit_code = tokio::select! {
-        result = run(cli) => {
+        result = run(cli, &telemetry) => {
             match result {
                 Ok(code) => code,
                 Err(error) => {
@@ -137,10 +238,30 @@ async fn main() {
         }
         _ = tokio::signal::ctrl_c() => ExitCode::Interrupted,
     };
+
+    drop(telemetry_runtime);
     std::process::exit(exit_code.as_i32());
 }
 
-async fn run(cli: Cli) -> Result<ExitCode, CliError> {
+async fn run(cli: Cli, telemetry: &CliTelemetry) -> Result<ExitCode, CliError> {
+    let command_name = cli.command.telemetry_name();
+    let json_output = cli.json;
+    let mut span = telemetry.tracer.start_span(
+        "mars.cli.command",
+        &[
+            Attribute::string("command", command_name),
+            Attribute::bool("json_output", json_output),
+        ],
+    );
+    let started = Instant::now();
+    let outcome = run_inner(cli).await;
+    let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    telemetry.record(command_name, json_output, elapsed_ms, &outcome, &span);
+    span.end();
+    outcome
+}
+
+async fn run_inner(cli: Cli) -> Result<ExitCode, CliError> {
     match cli.command {
         Commands::Create {
             profile_name,

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
+use mars_telemetry::{ServiceIdentity, TelemetryRuntime};
 use mars_types::{
     AuPluginConfig, PLUGIN_HOST_PROTOCOL_VERSION, PluginHostRequest, PluginHostResponse,
 };
@@ -241,8 +242,19 @@ fn run_server(socket_path: PathBuf) -> Result<(), String> {
 }
 
 fn main() {
-    let exit = match parse_socket_path().and_then(run_server) {
-        Ok(()) => 0,
+    let telemetry_runtime = TelemetryRuntime::init(ServiceIdentity::new(
+        "mars-plugin-host",
+        env!("CARGO_PKG_VERSION"),
+        "plugin_host",
+    ));
+    let exit = match telemetry_runtime {
+        Ok(_runtime) => match parse_socket_path().and_then(run_server) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("{error}");
+                1
+            }
+        },
         Err(error) => {
             eprintln!("{error}");
             1

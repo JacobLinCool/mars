@@ -8,15 +8,17 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::mpsc::{
     Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, channel, sync_channel,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use mars_telemetry::{Attribute, U64Counter, U64Histogram};
 use mars_types::{
-    AuPluginConfig, PLUGIN_HOST_PROTOCOL_VERSION, PluginHostHealth, PluginHostInstanceStatus,
-    PluginHostRequest, PluginHostResponse,
+    AuPluginApi, AuPluginConfig, PLUGIN_HOST_PROTOCOL_VERSION, PluginHostHealth,
+    PluginHostInstanceStatus, PluginHostRequest, PluginHostResponse,
 };
 use parking_lot::Mutex;
 
@@ -25,6 +27,51 @@ const RESULT_QUEUE_CAPACITY: usize = 1;
 const WORKER_POLL_INTERVAL_MS: u64 = 5;
 const HOST_STARTUP_TIMEOUT_MS: u64 = 2_000;
 const HOST_CONNECT_RETRY_MS: u64 = 20;
+
+#[derive(Debug)]
+struct AuHostTelemetry {
+    process_duration: U64Histogram,
+    timeout_count: U64Counter,
+    error_count: U64Counter,
+    restart_count: U64Counter,
+}
+
+static AU_HOST_TELEMETRY: OnceLock<AuHostTelemetry> = OnceLock::new();
+
+fn au_host_telemetry() -> &'static AuHostTelemetry {
+    AU_HOST_TELEMETRY.get_or_init(|| {
+        let meter = mars_telemetry::global_meter("mars-engine");
+        AuHostTelemetry {
+            process_duration: meter.u64_histogram(
+                "mars.plugin.process.duration",
+                "Plugin host process call duration",
+                "ms",
+            ),
+            timeout_count: meter.u64_counter(
+                "mars.plugin.timeout.count",
+                "Plugin host timeout count",
+                "{timeout}",
+            ),
+            error_count: meter.u64_counter(
+                "mars.plugin.error.count",
+                "Plugin host error count",
+                "{error}",
+            ),
+            restart_count: meter.u64_counter(
+                "mars.plugin.restart.count",
+                "Plugin host restart count",
+                "{restart}",
+            ),
+        }
+    })
+}
+
+const fn au_api_label(api: AuPluginApi) -> &'static str {
+    match api {
+        AuPluginApi::Auv2 => "auv2",
+        AuPluginApi::Auv3 => "auv3",
+    }
+}
 
 #[derive(Debug)]
 pub struct AuWorker {
@@ -179,6 +226,9 @@ fn run_worker(
     stop_rx: std::sync::mpsc::Receiver<()>,
     status: Arc<Mutex<PluginHostInstanceStatus>>,
 ) {
+    let telemetry = au_host_telemetry();
+    let api_label = au_api_label(settings.config.api);
+
     let mut session = match HostSession::start(&settings) {
         Ok(session) => {
             {
@@ -197,6 +247,9 @@ fn run_worker(
             lock.health = PluginHostHealth::Failed;
             lock.error_count = lock.error_count.saturating_add(1);
             lock.last_error = Some(error.message());
+            telemetry
+                .error_count
+                .add(1, &[Attribute::string("api", api_label)]);
             None
         }
     };
@@ -235,6 +288,9 @@ fn run_worker(
                     lock.loaded = false;
                     lock.host_pid = None;
                     lock.last_error = Some(error.message());
+                    telemetry
+                        .error_count
+                        .add(1, &[Attribute::string("api", api_label)]);
                     let _ = result_tx.try_send(request.samples);
                     continue;
                 }
@@ -243,8 +299,20 @@ fn run_worker(
 
         let mut failed = None;
         if let Some(current) = session.as_mut() {
+            let process_started = Instant::now();
             match current.process(request.frames, request.channels, request.samples.clone()) {
                 Ok(samples) => {
+                    let elapsed_ms = process_started
+                        .elapsed()
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64;
+                    telemetry.process_duration.record(
+                        elapsed_ms,
+                        &[
+                            Attribute::string("api", api_label),
+                            Attribute::string("health", "healthy"),
+                        ],
+                    );
                     let mut lock = status.lock();
                     lock.loaded = true;
                     lock.health = PluginHostHealth::Healthy;
@@ -253,6 +321,24 @@ fn run_worker(
                     let _ = result_tx.try_send(samples);
                 }
                 Err(error) => {
+                    let elapsed_ms = process_started
+                        .elapsed()
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64;
+                    telemetry.process_duration.record(
+                        elapsed_ms,
+                        &[
+                            Attribute::string("api", api_label),
+                            Attribute::string(
+                                "health",
+                                if error.is_timeout() {
+                                    "degraded"
+                                } else {
+                                    "failed"
+                                },
+                            ),
+                        ],
+                    );
                     failed = Some(error);
                 }
             }
@@ -261,9 +347,15 @@ fn run_worker(
         if let Some(error) = failed {
             let mut lock = status.lock();
             lock.error_count = lock.error_count.saturating_add(1);
+            telemetry
+                .error_count
+                .add(1, &[Attribute::string("api", api_label)]);
             if error.is_timeout() {
                 lock.timeout_count = lock.timeout_count.saturating_add(1);
                 lock.health = PluginHostHealth::Degraded;
+                telemetry
+                    .timeout_count
+                    .add(1, &[Attribute::string("api", api_label)]);
             } else {
                 lock.health = PluginHostHealth::Failed;
             }
@@ -271,6 +363,9 @@ fn run_worker(
             lock.host_pid = None;
             lock.last_error = Some(error.message());
             lock.restart_count = lock.restart_count.saturating_add(1);
+            telemetry
+                .restart_count
+                .add(1, &[Attribute::string("api", api_label)]);
             drop(lock);
 
             if let Some(mut current) = session.take() {

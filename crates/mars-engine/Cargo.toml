@@ -10,9 +10,14 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+otel = ["mars-telemetry/otel"]
+
 [dependencies]
 arc-swap.workspace = true
 mars-graph = { path = "../mars-graph" }
+mars-telemetry = { path = "../mars-telemetry" }
 mars-types = { path = "../mars-types" }
 parking_lot.workspace = true
 serde.workspace = true

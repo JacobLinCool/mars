@@ -183,6 +183,12 @@ cargo build
 cargo test
 ```
 
+Optional telemetry build (OTel support):
+
+```bash
+cargo build --workspace --features otel
+```
+
 Engine robustness and perf checks:
 
 ```bash
@@ -198,6 +204,8 @@ Benchmark gate policy, CI job mapping, and local reproduction commands:
 ## Getting Started
 
 See the full setup and first-run guide: `docs/getting-started.md`.
+
+Telemetry setup and metric/span reference: `docs/telemetry.md`.
 
 Quick install:
 
