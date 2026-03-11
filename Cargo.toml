@@ -3,6 +3,7 @@ members = [
   "crates/mars-types",
   "crates/mars-profile",
   "crates/mars-graph",
+  "crates/mars-sdk",
   "crates/mars-shm",
   "crates/mars-engine",
   "crates/mars-coreaudio",

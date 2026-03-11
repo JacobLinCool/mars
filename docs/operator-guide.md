@@ -7,6 +7,7 @@ Default profile directory:
 - `~/Library/Application Support/mars/profiles/`
 
 A profile is addressed by file name stem (`<name>.yaml`).
+All active profiles must use `version: 2` (v1 is rejected).
 
 ## Core commands
 
@@ -33,7 +34,13 @@ A profile is addressed by file name stem (`<name>.yaml`).
   - `graph_route_count`
   - `processor_runtime` (per-processor prepare/process/reset counters)
   - `capture_runtime` and `sink_runtime` health/counter snapshots
+  - `plugin_runtime.*` (active/failed instances, timeout/error/restart counters, per-instance health)
+- `mars doctor --json` includes plugin host summary counters:
+  - `plugin_active`, `plugin_failed`, `plugin_timeouts`, `plugin_errors`, `plugin_restarts`
 - `mars processes --json` lists process object id, pid, bundle id, and running I/O flags for capture selector authoring.
+- Sink runtime capability boundary:
+  - `sinks.files` (WAV/CAF) is implemented.
+  - `sinks.streams` is currently descriptor-only; runtime marks stream sinks as failed with `last_error`.
 - `external_runtime.stream_errors` is capped (ring buffer) to avoid unbounded growth.
 
 ## Log cursor semantics

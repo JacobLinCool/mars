@@ -1,10 +1,10 @@
 # MARS Getting Started
 
-This guide covers a full dev-first setup on macOS, from first install to first profile apply.
+This guide covers a full dev-first setup on macOS 15+, from first install to first profile apply.
 
 ## Prerequisites
 
-- macOS (MARS uses CoreAudio HAL and launchd user agents).
+- macOS 15+ (MARS uses CoreAudio HAL and launchd user agents).
 - Rust toolchain (`cargo`, `rustc`) available in your shell.
 - `sudo` access (needed for protected system paths like `/usr/local/bin` and `/Library/Audio/Plug-Ins/HAL`).
 - Run commands from the repository root.
@@ -46,9 +46,14 @@ mars doctor
 
 ## 3. Run Your First Profile
 
+The default template includes process/system taps and a stream sink descriptor. Before apply:
+- use `mars processes --json` to choose real process selectors on your host
+- remove or edit `captures`/`sinks.streams` entries you do not need
+
 ```bash
 mars create demo
 mars open demo
+mars processes --json
 mars validate demo
 mars plan demo
 mars apply demo

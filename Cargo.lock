@@ -928,6 +928,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mars-sdk"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dirs",
+ "mars-ipc",
+ "mars-types",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "mars-shm"
 version = "0.1.0"
 dependencies = [

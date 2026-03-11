@@ -1062,18 +1062,15 @@ pub struct ExternalRuntimeSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum ExternalEndpointHealth {
     Connected,
     Degraded,
     Reconnecting,
+    #[default]
     Stopped,
 }
 
-impl Default for ExternalEndpointHealth {
-    fn default() -> Self {
-        Self::Stopped
-    }
-}
 
 #[derive(Debug, Clone, Default)]
 pub struct ExternalInputEndpointSnapshot {
