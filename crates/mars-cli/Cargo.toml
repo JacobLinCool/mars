@@ -10,6 +10,10 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+otel = ["mars-telemetry/otel", "mars-ipc/otel"]
+
 [[bin]]
 name = "mars"
 path = "src/main.rs"
@@ -20,6 +24,7 @@ dirs.workspace = true
 mars-coreaudio = { path = "../mars-coreaudio" }
 mars-ipc = { path = "../mars-ipc" }
 mars-profile = { path = "../mars-profile" }
+mars-telemetry = { path = "../mars-telemetry" }
 mars-types = { path = "../mars-types" }
 serde.workspace = true
 serde_json.workspace = true

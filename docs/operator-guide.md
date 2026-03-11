@@ -43,6 +43,14 @@ All active profiles must use `version: 2` (v1 is rejected).
   - `sinks.streams` is currently descriptor-only; runtime marks stream sinks as failed with `last_error`.
 - `external_runtime.stream_errors` is capped (ring buffer) to avoid unbounded growth.
 
+## Optional telemetry (OTel)
+
+- Telemetry is opt-in and off by default.
+- Set `MARS_OTEL_MODE=required` to require telemetry initialization at startup.
+- Set `OTEL_EXPORTER_OTLP_ENDPOINT` when `MARS_OTEL_MODE=required`.
+- Build telemetry-enabled binaries with `cargo build --workspace --features otel`.
+- Full metric/span reference: `docs/telemetry.md`.
+
 ## Log cursor semantics
 
 - `mars logs` / daemon `LogResponse.next_cursor` now represent a byte offset in `marsd.log`.

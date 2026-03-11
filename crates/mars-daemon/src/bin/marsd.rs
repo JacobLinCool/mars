@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use mars_daemon::{MarsDaemon, setup_logging};
+use mars_telemetry::{ServiceIdentity, TelemetryRuntime};
 use mars_types::DEFAULT_LOG_PATH_RELATIVE;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
@@ -38,6 +39,13 @@ async fn main() -> anyhow::Result<()> {
     if !args.serve {
         return Ok(());
     }
+
+    let _telemetry_runtime = TelemetryRuntime::init(ServiceIdentity::new(
+        "marsd",
+        env!("CARGO_PKG_VERSION"),
+        "daemon",
+    ))
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
 
     let _guard = setup_logging()?;
     let daemon = Arc::new(MarsDaemon::new(default_log_path()));

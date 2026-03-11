@@ -10,7 +10,12 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+otel = ["mars-telemetry/otel"]
+
 [dependencies]
+mars-telemetry = { path = "../mars-telemetry" }
 mars-types = { path = "../mars-types" }
 serde.workspace = true
 serde_json.workspace = true

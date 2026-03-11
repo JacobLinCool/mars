@@ -35,6 +35,7 @@ use mars_ipc::{
 };
 use mars_profile::{ValidatedProfile, load_profile, validate_only};
 use mars_shm::{RingSpec, StreamDirection, global_registry, stream_name};
+use mars_telemetry::{Attribute, F64Histogram, TelemetryTracer, U64Counter, U64Histogram};
 use mars_types::{
     ApplyPlan, ApplyRequest, ApplyResult, CaptureRuntimeHealth, CaptureRuntimeStatus, DaemonStatus,
     DeviceDescriptor, DriverStatusSummary, ExitCode, ExternalRuntimeStatus, MANAGED_UID_PREFIX,
@@ -45,6 +46,124 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sink_runtime::{SinkBinding, SinkBindingKind, SinkRuntime, SinkRuntimeSubmitter};
 use tracing::{debug, info, warn};
+
+#[derive(Debug)]
+struct DaemonTelemetry {
+    tracer: TelemetryTracer,
+    apply_count: U64Counter,
+    apply_duration: U64Histogram,
+    apply_stage_duration: U64Histogram,
+    apply_rollback_count: U64Counter,
+    render_cycle_duration: U64Histogram,
+    render_budget_utilization: F64Histogram,
+    render_deadline_miss_count: U64Counter,
+    render_xrun_count: U64Counter,
+    external_underrun_count: U64Counter,
+    external_overrun_count: U64Counter,
+    sink_drop_count: U64Counter,
+    sink_write_error_count: U64Counter,
+    capture_active_taps: U64Histogram,
+    capture_failed_taps: U64Counter,
+    plugin_timeout_count: U64Counter,
+    plugin_error_count: U64Counter,
+    plugin_restart_count: U64Counter,
+}
+
+static DAEMON_TELEMETRY: OnceLock<DaemonTelemetry> = OnceLock::new();
+
+fn daemon_telemetry() -> &'static DaemonTelemetry {
+    DAEMON_TELEMETRY.get_or_init(|| {
+        let meter = mars_telemetry::global_meter("mars-daemon");
+        DaemonTelemetry {
+            tracer: mars_telemetry::global_tracer("mars-daemon"),
+            apply_count: meter.u64_counter(
+                "mars.apply.count",
+                "Count of apply requests",
+                "{apply}",
+            ),
+            apply_duration: meter.u64_histogram(
+                "mars.apply.duration",
+                "Apply transaction duration",
+                "ms",
+            ),
+            apply_stage_duration: meter.u64_histogram(
+                "mars.apply.stage.duration",
+                "Apply stage duration",
+                "ms",
+            ),
+            apply_rollback_count: meter.u64_counter(
+                "mars.apply.rollback.count",
+                "Count of apply rollbacks",
+                "{rollback}",
+            ),
+            render_cycle_duration: meter.u64_histogram(
+                "mars.render.cycle.duration",
+                "Render cycle duration sampled from runtime",
+                "ns",
+            ),
+            render_budget_utilization: meter.f64_histogram(
+                "mars.render.cycle.budget_utilization",
+                "Render cycle budget utilization ratio",
+                "ratio",
+            ),
+            render_deadline_miss_count: meter.u64_counter(
+                "mars.render.deadline_miss.count",
+                "Render deadline miss count",
+                "{miss}",
+            ),
+            render_xrun_count: meter.u64_counter(
+                "mars.render.xrun.count",
+                "Render xrun count",
+                "{xrun}",
+            ),
+            external_underrun_count: meter.u64_counter(
+                "mars.external.underrun.count",
+                "External runtime underrun count",
+                "{underrun}",
+            ),
+            external_overrun_count: meter.u64_counter(
+                "mars.external.overrun.count",
+                "External runtime overrun count",
+                "{overrun}",
+            ),
+            sink_drop_count: meter.u64_counter(
+                "mars.sink.drop.count",
+                "Sink dropped batch count",
+                "{drop}",
+            ),
+            sink_write_error_count: meter.u64_counter(
+                "mars.sink.write_error.count",
+                "Sink write error count",
+                "{error}",
+            ),
+            capture_active_taps: meter.u64_histogram(
+                "mars.capture.tap.active",
+                "Active capture taps sampled from runtime",
+                "{tap}",
+            ),
+            capture_failed_taps: meter.u64_counter(
+                "mars.capture.tap.failed",
+                "Failed capture tap count",
+                "{failed_tap}",
+            ),
+            plugin_timeout_count: meter.u64_counter(
+                "mars.plugin.timeout.count",
+                "Plugin timeout count",
+                "{timeout}",
+            ),
+            plugin_error_count: meter.u64_counter(
+                "mars.plugin.error.count",
+                "Plugin error count",
+                "{error}",
+            ),
+            plugin_restart_count: meter.u64_counter(
+                "mars.plugin.restart.count",
+                "Plugin restart count",
+                "{restart}",
+            ),
+        }
+    })
+}
 
 #[derive(Debug)]
 pub struct MarsDaemon {
@@ -251,6 +370,82 @@ impl RenderRuntime {
     }
 }
 
+#[derive(Debug)]
+struct ApplyStageGuard<'a> {
+    telemetry: &'a DaemonTelemetry,
+    span: mars_telemetry::SpanGuard,
+    stage: &'static str,
+    started: Instant,
+    success: bool,
+    failed_stage: &'a mut Option<&'static str>,
+}
+
+impl<'a> ApplyStageGuard<'a> {
+    fn new(
+        telemetry: &'a DaemonTelemetry,
+        parent_span: &mars_telemetry::SpanGuard,
+        stage: &'static str,
+        span_name: &'static str,
+        failed_stage: &'a mut Option<&'static str>,
+    ) -> Self {
+        let span = telemetry.tracer.start_child_span(
+            parent_span,
+            span_name,
+            &[Attribute::string("stage", stage)],
+        );
+        Self {
+            telemetry,
+            span,
+            stage,
+            started: Instant::now(),
+            success: false,
+            failed_stage,
+        }
+    }
+
+    fn success(&mut self) {
+        self.success = true;
+    }
+}
+
+impl Drop for ApplyStageGuard<'_> {
+    fn drop(&mut self) {
+        let elapsed_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let attrs = [
+            Attribute::string("stage", self.stage),
+            Attribute::bool("success", self.success),
+        ];
+        self.telemetry
+            .apply_stage_duration
+            .record(elapsed_ms, &attrs);
+        self.span.set_attributes(&attrs);
+        if self.success {
+            self.span.set_status_ok();
+        } else {
+            if self.failed_stage.is_none() {
+                *self.failed_stage = Some(self.stage);
+            }
+            self.span
+                .set_status_error(format!("apply stage '{}' failed", self.stage));
+        }
+        self.span.end();
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct RuntimeTelemetryCheckpoint {
+    deadline_miss_count: u64,
+    xrun_count: u64,
+    underrun_count: u64,
+    overrun_count: u64,
+    sink_drop_count: u64,
+    sink_write_error_count: u64,
+    capture_failed_taps: u64,
+    plugin_timeout_count: u64,
+    plugin_error_count: u64,
+    plugin_restart_count: u64,
+}
+
 fn update_max_atomic(cell: &AtomicU64, value: u64) {
     let mut current = cell.load(Ordering::Relaxed);
     while value > current {
@@ -259,6 +454,12 @@ fn update_max_atomic(cell: &AtomicU64, value: u64) {
             Err(actual) => current = actual,
         }
     }
+}
+
+fn counter_delta(current: u64, previous: &mut u64) -> u64 {
+    let delta = current.saturating_sub(*previous);
+    *previous = current;
+    delta
 }
 
 fn run_render_loop(
@@ -470,7 +671,159 @@ impl MarsDaemon {
     }
 
     pub async fn run(self: Arc<Self>, socket_path: &Path) -> Result<(), mars_ipc::IpcError> {
-        serve(socket_path, self).await
+        let reporter = self.start_runtime_telemetry_reporter();
+        let result = serve(socket_path, self).await;
+        if let Some((stop, handle)) = reporter {
+            stop.store(true, Ordering::Relaxed);
+            let _ = handle.join();
+        }
+        result
+    }
+
+    fn start_runtime_telemetry_reporter(
+        self: &Arc<Self>,
+    ) -> Option<(Arc<AtomicBool>, JoinHandle<()>)> {
+        if !mars_telemetry::telemetry_enabled() {
+            return None;
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let daemon = Arc::clone(self);
+        let thread_stop = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("marsd-telemetry".to_string())
+            .spawn(move || {
+                let telemetry = daemon_telemetry();
+                let mut checkpoint = RuntimeTelemetryCheckpoint::default();
+                while !thread_stop.load(Ordering::Relaxed) {
+                    daemon.runtime_telemetry_tick(telemetry, &mut checkpoint);
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            })
+            .ok()?;
+
+        Some((stop, handle))
+    }
+
+    fn runtime_telemetry_tick(
+        &self,
+        telemetry: &DaemonTelemetry,
+        checkpoint: &mut RuntimeTelemetryCheckpoint,
+    ) {
+        let status = self.status_internal();
+        let sample_rate = status.sample_rate.max(1);
+        let buffer_frames = status.buffer_frames.max(1);
+        let attrs = [
+            Attribute::u64("sample_rate", u64::from(sample_rate)),
+            Attribute::u64("buffer_frames", u64::from(buffer_frames)),
+        ];
+
+        telemetry
+            .render_cycle_duration
+            .record(status.counters.last_cycle_ns, &attrs);
+
+        let budget_ns = (1_000_000_000_f64 * f64::from(buffer_frames)) / f64::from(sample_rate);
+        if budget_ns.is_finite() && budget_ns > 0.0 {
+            telemetry
+                .render_budget_utilization
+                .record(status.counters.last_cycle_ns as f64 / budget_ns, &attrs);
+        }
+
+        let deadline_delta = counter_delta(
+            status.counters.deadline_miss_count,
+            &mut checkpoint.deadline_miss_count,
+        );
+        if deadline_delta > 0 {
+            telemetry
+                .render_deadline_miss_count
+                .add(deadline_delta, &attrs);
+        }
+
+        let xrun_delta = counter_delta(status.counters.xrun_count, &mut checkpoint.xrun_count);
+        if xrun_delta > 0 {
+            telemetry
+                .render_xrun_count
+                .add(xrun_delta, &[Attribute::string("source", "runtime")]);
+        }
+
+        let underrun_delta = counter_delta(
+            status.counters.underrun_count,
+            &mut checkpoint.underrun_count,
+        );
+        if underrun_delta > 0 {
+            telemetry
+                .external_underrun_count
+                .add(underrun_delta, &attrs);
+        }
+
+        let overrun_delta =
+            counter_delta(status.counters.overrun_count, &mut checkpoint.overrun_count);
+        if overrun_delta > 0 {
+            telemetry.external_overrun_count.add(overrun_delta, &attrs);
+        }
+
+        let sink_drop_delta = counter_delta(
+            status.sink_runtime.dropped_batches,
+            &mut checkpoint.sink_drop_count,
+        );
+        if sink_drop_delta > 0 {
+            telemetry
+                .sink_drop_count
+                .add(sink_drop_delta, &[Attribute::string("sink_kind", "all")]);
+        }
+
+        let sink_write_error_delta = counter_delta(
+            status.sink_runtime.write_errors,
+            &mut checkpoint.sink_write_error_count,
+        );
+        if sink_write_error_delta > 0 {
+            telemetry.sink_write_error_count.add(
+                sink_write_error_delta,
+                &[Attribute::string("sink_kind", "all")],
+            );
+        }
+
+        telemetry.capture_active_taps.record(
+            status.capture_runtime.active_taps as u64,
+            &[Attribute::string("kind", "all")],
+        );
+        let capture_failed_delta = counter_delta(
+            status.capture_runtime.failed_taps as u64,
+            &mut checkpoint.capture_failed_taps,
+        );
+        if capture_failed_delta > 0 {
+            telemetry
+                .capture_failed_taps
+                .add(capture_failed_delta, &[Attribute::string("kind", "all")]);
+        }
+
+        let plugin_timeout_delta = counter_delta(
+            status.plugin_runtime.timeout_count,
+            &mut checkpoint.plugin_timeout_count,
+        );
+        if plugin_timeout_delta > 0 {
+            telemetry
+                .plugin_timeout_count
+                .add(plugin_timeout_delta, &[Attribute::string("api", "all")]);
+        }
+        let plugin_error_delta = counter_delta(
+            status.plugin_runtime.error_count,
+            &mut checkpoint.plugin_error_count,
+        );
+        if plugin_error_delta > 0 {
+            telemetry
+                .plugin_error_count
+                .add(plugin_error_delta, &[Attribute::string("api", "all")]);
+        }
+        let plugin_restart_delta = counter_delta(
+            status.plugin_runtime.restart_count,
+            &mut checkpoint.plugin_restart_count,
+        );
+        if plugin_restart_delta > 0 {
+            telemetry
+                .plugin_restart_count
+                .add(plugin_restart_delta, &[Attribute::string("api", "all")]);
+        }
     }
 
     fn stop_render_runtime(&self) {
@@ -647,262 +1000,414 @@ impl MarsDaemon {
     }
 
     fn apply_internal(&self, request: ApplyRequest) -> Result<ApplyResult, ApiError> {
-        let deadline = Self::apply_deadline(request.timeout_ms);
-        Self::ensure_within_deadline(deadline, "profile-validate")?;
+        let telemetry = daemon_telemetry();
+        let started = Instant::now();
+        let mut failed_stage = None::<&'static str>;
+        let mut rollback_triggered = false;
+        let mut apply_span = telemetry.tracer.start_span(
+            "mars.apply.transaction",
+            &[
+                Attribute::bool("dry_run", request.dry_run),
+                Attribute::bool("no_delete", request.no_delete),
+                Attribute::u64("timeout_ms", request.timeout_ms),
+            ],
+        );
 
-        let validated = load_profile(Path::new(&request.profile_path)).map_err(|error| {
-            ApiError::new(
-                format!(
-                    "profile validation failed (strict policy requires apply_mode=atomic and on_missing_external=error): {error}"
-                ),
-                ExitCode::InvalidInput,
-            )
-        })?;
+        let outcome = (|| {
+            let deadline = Self::apply_deadline(request.timeout_ms);
+            let validated = {
+                let mut stage = ApplyStageGuard::new(
+                    telemetry,
+                    &apply_span,
+                    "profile_validate",
+                    "mars.apply.stage.profile_validate",
+                    &mut failed_stage,
+                );
+                Self::ensure_within_deadline(deadline, "profile-validate")?;
+                let validated = load_profile(Path::new(&request.profile_path)).map_err(|error| {
+                    ApiError::new(
+                        format!(
+                            "profile validation failed (strict policy requires apply_mode=atomic and on_missing_external=error): {error}"
+                        ),
+                        ExitCode::InvalidInput,
+                    )
+                })?;
+                stage.success();
+                validated
+            };
 
-        let plan_request = PlanRequest {
-            profile_path: request.profile_path.clone(),
-            no_delete: request.no_delete,
-        };
+            let plan_request = PlanRequest {
+                profile_path: request.profile_path.clone(),
+                no_delete: request.no_delete,
+            };
+            let plan = {
+                let mut stage = ApplyStageGuard::new(
+                    telemetry,
+                    &apply_span,
+                    "plan",
+                    "mars.apply.stage.plan",
+                    &mut failed_stage,
+                );
+                Self::ensure_within_deadline(deadline, "plan")?;
+                let plan = self.plan_internal(&plan_request, &validated)?;
+                stage.success();
+                plan
+            };
 
-        Self::ensure_within_deadline(deadline, "plan")?;
-        let plan = self.plan_internal(&plan_request, &validated)?;
-        if request.dry_run {
-            return Ok(ApplyResult {
-                applied: false,
-                warnings: plan.warnings.clone(),
-                plan,
-                errors: Vec::new(),
-            });
-        }
+            if request.dry_run {
+                return Ok(ApplyResult {
+                    applied: false,
+                    warnings: plan.warnings.clone(),
+                    plan,
+                    errors: Vec::new(),
+                });
+            }
 
-        Self::ensure_within_deadline(deadline, "external-resolve")?;
-        let inventory = list_device_inventory().map_err(coreaudio_to_api_error)?;
-        let resolution = resolve_externals(&validated.profile, &inventory);
-        if !resolution.errors.is_empty() {
-            return Err(ApiError::new(
-                format!("missing external devices: {}", resolution.errors.join("; ")),
-                ExitCode::MissingExternal,
-            ));
-        }
-
-        let previous_state = self.state.lock().clone();
-        let driver_snapshot_path = driver_state_path()
-            .map_err(|error| ApiError::new(error, ExitCode::DriverUnavailable))?;
-        let driver_snapshot = capture_driver_state_snapshot(&driver_snapshot_path)
-            .map_err(|error| ApiError::new(error, ExitCode::DriverUnavailable))?;
-
-        // When --no-delete is set, merge devices from the previous profile that
-        // would otherwise be removed so the HAL desired state retains them.
-        let effective_profile = if request.no_delete {
-            if let Some(prev) = previous_state.current_profile.clone() {
-                let next_output_ids: BTreeSet<&str> = validated
-                    .profile
-                    .virtual_devices
-                    .outputs
-                    .iter()
-                    .map(|d| d.id.as_str())
-                    .collect();
-                let next_input_ids: BTreeSet<&str> = validated
-                    .profile
-                    .virtual_devices
-                    .inputs
-                    .iter()
-                    .map(|d| d.id.as_str())
-                    .collect();
-
-                let mut merged = validated.profile.clone();
-                for output in &prev.virtual_devices.outputs {
-                    if !next_output_ids.contains(output.id.as_str()) {
-                        merged.virtual_devices.outputs.push(output.clone());
-                    }
+            let resolution = {
+                let mut stage = ApplyStageGuard::new(
+                    telemetry,
+                    &apply_span,
+                    "external_resolve",
+                    "mars.apply.stage.external_resolve",
+                    &mut failed_stage,
+                );
+                Self::ensure_within_deadline(deadline, "external-resolve")?;
+                let inventory = list_device_inventory().map_err(coreaudio_to_api_error)?;
+                let resolution = resolve_externals(&validated.profile, &inventory);
+                if !resolution.errors.is_empty() {
+                    return Err(ApiError::new(
+                        format!("missing external devices: {}", resolution.errors.join("; ")),
+                        ExitCode::MissingExternal,
+                    ));
                 }
-                for input in &prev.virtual_devices.inputs {
-                    if !next_input_ids.contains(input.id.as_str()) {
-                        merged.virtual_devices.inputs.push(input.clone());
+                stage.success();
+                resolution
+            };
+
+            let previous_state = self.state.lock().clone();
+            let driver_snapshot_path = driver_state_path()
+                .map_err(|error| ApiError::new(error, ExitCode::DriverUnavailable))?;
+            let driver_snapshot = capture_driver_state_snapshot(&driver_snapshot_path)
+                .map_err(|error| ApiError::new(error, ExitCode::DriverUnavailable))?;
+
+            // When --no-delete is set, merge devices from the previous profile that
+            // would otherwise be removed so the HAL desired state retains them.
+            let effective_profile = if request.no_delete {
+                if let Some(prev) = previous_state.current_profile.clone() {
+                    let next_output_ids: BTreeSet<&str> = validated
+                        .profile
+                        .virtual_devices
+                        .outputs
+                        .iter()
+                        .map(|d| d.id.as_str())
+                        .collect();
+                    let next_input_ids: BTreeSet<&str> = validated
+                        .profile
+                        .virtual_devices
+                        .inputs
+                        .iter()
+                        .map(|d| d.id.as_str())
+                        .collect();
+
+                    let mut merged = validated.profile.clone();
+                    for output in &prev.virtual_devices.outputs {
+                        if !next_output_ids.contains(output.id.as_str()) {
+                            merged.virtual_devices.outputs.push(output.clone());
+                        }
                     }
+                    for input in &prev.virtual_devices.inputs {
+                        if !next_input_ids.contains(input.id.as_str()) {
+                            merged.virtual_devices.inputs.push(input.clone());
+                        }
+                    }
+                    merged
+                } else {
+                    validated.profile.clone()
                 }
-                merged
             } else {
                 validated.profile.clone()
+            };
+
+            let sample_rate = effective_profile
+                .audio
+                .sample_rate
+                .as_value()
+                .unwrap_or(48_000);
+            let channels = effective_profile.audio.channels.as_value().unwrap_or(2);
+            let mut warnings = plan.warnings.clone();
+            if driver_stub_active() {
+                warnings.push(
+                    "mars.driver is not loaded by coreaudiod; apply completed in stub mode (virtual devices will not appear in system audio list)".to_string(),
+                );
             }
-        } else {
-            validated.profile.clone()
-        };
 
-        let sample_rate = effective_profile
-            .audio
-            .sample_rate
-            .as_value()
-            .unwrap_or(48_000);
-        let channels = effective_profile.audio.channels.as_value().unwrap_or(2);
-        let mut warnings = plan.warnings.clone();
-        if driver_stub_active() {
-            warnings.push(
-                "mars.driver is not loaded by coreaudiod; apply completed in stub mode (virtual devices will not appear in system audio list)".to_string(),
-            );
-        }
-        Self::ensure_within_deadline(deadline, "driver-compatibility")?;
-        if let Err(error) = ensure_driver_compatibility_for_apply() {
-            return Err(ApiError::new(error, ExitCode::DriverUnavailable));
-        }
-
-        let devices = collect_devices(&effective_profile, &resolution.resolved);
-
-        self.stop_render_runtime();
-        self.stop_capture_runtime();
-
-        Self::ensure_within_deadline(deadline, "driver-stage").map_err(|timeout_error| {
-            self.rollback_apply(
-                previous_state.clone(),
-                &driver_snapshot,
-                timeout_error.message,
-                ExitCode::ApplyFailed,
-            )
-        })?;
-        if let Err(error) =
-            stage_driver_state(&effective_profile, &validated.graph, sample_rate, channels)
-        {
-            warn!(error = %error, "failed to stage driver state");
-            return Err(self.rollback_apply(
-                previous_state,
-                &driver_snapshot,
-                error,
-                ExitCode::DriverUnavailable,
-            ));
-        }
-        Self::ensure_within_deadline(deadline, "graph-activate").map_err(|timeout_error| {
-            self.rollback_apply(
-                previous_state.clone(),
-                &driver_snapshot,
-                timeout_error.message,
-                ExitCode::ApplyFailed,
-            )
-        })?;
-
-        let mut state = self.state.lock();
-        let engine = if let (Some(previous_profile), Some(existing_engine)) =
-            (state.current_profile.as_ref(), state.engine.as_ref())
-        {
-            if render_restart_required(previous_profile, &effective_profile) {
-                Arc::new(Engine::new(EngineSnapshot {
-                    graph: validated.graph.clone(),
-                    sample_rate,
-                    buffer_frames: effective_profile.audio.buffer_frames,
-                }))
-            } else {
-                existing_engine.swap_snapshot(EngineSnapshot {
-                    graph: validated.graph.clone(),
-                    sample_rate,
-                    buffer_frames: effective_profile.audio.buffer_frames,
-                });
-                existing_engine.clone()
+            {
+                let mut stage = ApplyStageGuard::new(
+                    telemetry,
+                    &apply_span,
+                    "driver_compatibility",
+                    "mars.apply.stage.driver_compatibility",
+                    &mut failed_stage,
+                );
+                Self::ensure_within_deadline(deadline, "driver-compatibility")?;
+                if let Err(error) = ensure_driver_compatibility_for_apply() {
+                    return Err(ApiError::new(error, ExitCode::DriverUnavailable));
+                }
+                stage.success();
             }
-        } else {
-            Arc::new(Engine::new(EngineSnapshot {
-                graph: validated.graph.clone(),
-                sample_rate,
-                buffer_frames: effective_profile.audio.buffer_frames,
-            }))
-        };
 
-        state.current_profile_path = Some(request.profile_path);
-        state.current_profile = Some(effective_profile);
-        state.graph = Some(validated.graph.clone());
-        state.engine = Some(engine);
-        state.devices = devices;
-        state.external_runtime = ExternalRuntimeStatus::default();
-        state.capture_runtime = CaptureRuntimeStatus::default();
-        state.sink_runtime = SinkRuntimeStatus::default();
-        state.plugin_runtime = PluginHostRuntimeStatus::default();
-        drop(state);
+            let devices = collect_devices(&effective_profile, &resolution.resolved);
 
-        if let Err(error) = self.sync_capture_runtime() {
-            return Err(self.rollback_apply(
-                previous_state.clone(),
-                &driver_snapshot,
-                error,
-                ExitCode::ApplyFailed,
-            ));
-        }
+            self.stop_render_runtime();
+            self.stop_capture_runtime();
 
-        if let Err(error) = self.sync_render_runtime() {
-            return Err(self.rollback_apply(
-                previous_state.clone(),
-                &driver_snapshot,
-                error,
-                ExitCode::ApplyFailed,
-            ));
-        }
-
-        Self::ensure_within_deadline(deadline, "runtime-ready").map_err(|timeout_error| {
-            self.rollback_apply(
-                previous_state.clone(),
-                &driver_snapshot,
-                timeout_error.message,
-                ExitCode::ApplyFailed,
-            )
-        })?;
-
-        {
-            let runtime_guard = self.render_runtime.lock();
-            if let Some(runtime) = runtime_guard.as_ref() {
-                if let Some(external_runtime) = runtime.external_runtime.as_ref() {
-                    let snapshot = external_runtime.snapshot();
-                    let expected_inputs = runtime.config.external_inputs.len();
-                    let expected_outputs = runtime.config.external_outputs.len();
-                    if snapshot.status.connected_inputs != expected_inputs
-                        || snapshot.status.connected_outputs != expected_outputs
-                    {
-                        return Err(self.rollback_apply(
+            {
+                let mut stage = ApplyStageGuard::new(
+                    telemetry,
+                    &apply_span,
+                    "driver_stage",
+                    "mars.apply.stage.driver_stage",
+                    &mut failed_stage,
+                );
+                Self::ensure_within_deadline(deadline, "driver-stage").map_err(
+                    |timeout_error| {
+                        rollback_triggered = true;
+                        self.rollback_apply(
                             previous_state.clone(),
                             &driver_snapshot,
-                            format!(
-                                "external runtime readiness failed: expected inputs={} outputs={}, got inputs={} outputs={}",
-                                expected_inputs,
-                                expected_outputs,
-                                snapshot.status.connected_inputs,
-                                snapshot.status.connected_outputs
-                            ),
+                            timeout_error.message,
                             ExitCode::ApplyFailed,
-                        ));
+                        )
+                    },
+                )?;
+                if let Err(error) =
+                    stage_driver_state(&effective_profile, &validated.graph, sample_rate, channels)
+                {
+                    rollback_triggered = true;
+                    warn!(error = %error, "failed to stage driver state");
+                    return Err(self.rollback_apply(
+                        previous_state.clone(),
+                        &driver_snapshot,
+                        error,
+                        ExitCode::DriverUnavailable,
+                    ));
+                }
+                stage.success();
+            }
+
+            {
+                let mut stage = ApplyStageGuard::new(
+                    telemetry,
+                    &apply_span,
+                    "graph_activate",
+                    "mars.apply.stage.graph_activate",
+                    &mut failed_stage,
+                );
+                Self::ensure_within_deadline(deadline, "graph-activate").map_err(
+                    |timeout_error| {
+                        rollback_triggered = true;
+                        self.rollback_apply(
+                            previous_state.clone(),
+                            &driver_snapshot,
+                            timeout_error.message,
+                            ExitCode::ApplyFailed,
+                        )
+                    },
+                )?;
+
+                let mut state = self.state.lock();
+                let engine = if let (Some(previous_profile), Some(existing_engine)) =
+                    (state.current_profile.as_ref(), state.engine.as_ref())
+                {
+                    if render_restart_required(previous_profile, &effective_profile) {
+                        Arc::new(Engine::new(EngineSnapshot {
+                            graph: validated.graph.clone(),
+                            sample_rate,
+                            buffer_frames: effective_profile.audio.buffer_frames,
+                        }))
+                    } else {
+                        existing_engine.swap_snapshot(EngineSnapshot {
+                            graph: validated.graph.clone(),
+                            sample_rate,
+                            buffer_frames: effective_profile.audio.buffer_frames,
+                        });
+                        existing_engine.clone()
+                    }
+                } else {
+                    Arc::new(Engine::new(EngineSnapshot {
+                        graph: validated.graph.clone(),
+                        sample_rate,
+                        buffer_frames: effective_profile.audio.buffer_frames,
+                    }))
+                };
+
+                state.current_profile_path = Some(request.profile_path.clone());
+                state.current_profile = Some(effective_profile);
+                state.graph = Some(validated.graph.clone());
+                state.engine = Some(engine);
+                state.devices = devices;
+                state.external_runtime = ExternalRuntimeStatus::default();
+                state.capture_runtime = CaptureRuntimeStatus::default();
+                state.sink_runtime = SinkRuntimeStatus::default();
+                state.plugin_runtime = PluginHostRuntimeStatus::default();
+                drop(state);
+                stage.success();
+            }
+
+            {
+                let mut stage = ApplyStageGuard::new(
+                    telemetry,
+                    &apply_span,
+                    "capture_sync",
+                    "mars.apply.stage.capture_sync",
+                    &mut failed_stage,
+                );
+                if let Err(error) = self.sync_capture_runtime() {
+                    rollback_triggered = true;
+                    return Err(self.rollback_apply(
+                        previous_state.clone(),
+                        &driver_snapshot,
+                        error,
+                        ExitCode::ApplyFailed,
+                    ));
+                }
+                stage.success();
+            }
+
+            {
+                let mut stage = ApplyStageGuard::new(
+                    telemetry,
+                    &apply_span,
+                    "render_sync",
+                    "mars.apply.stage.render_sync",
+                    &mut failed_stage,
+                );
+                if let Err(error) = self.sync_render_runtime() {
+                    rollback_triggered = true;
+                    return Err(self.rollback_apply(
+                        previous_state.clone(),
+                        &driver_snapshot,
+                        error,
+                        ExitCode::ApplyFailed,
+                    ));
+                }
+                stage.success();
+            }
+
+            {
+                let mut stage = ApplyStageGuard::new(
+                    telemetry,
+                    &apply_span,
+                    "runtime_ready",
+                    "mars.apply.stage.runtime_ready",
+                    &mut failed_stage,
+                );
+                Self::ensure_within_deadline(deadline, "runtime-ready").map_err(
+                    |timeout_error| {
+                        rollback_triggered = true;
+                        self.rollback_apply(
+                            previous_state.clone(),
+                            &driver_snapshot,
+                            timeout_error.message,
+                            ExitCode::ApplyFailed,
+                        )
+                    },
+                )?;
+
+                {
+                    let runtime_guard = self.render_runtime.lock();
+                    if let Some(runtime) = runtime_guard.as_ref() {
+                        if let Some(external_runtime) = runtime.external_runtime.as_ref() {
+                            let snapshot = external_runtime.snapshot();
+                            let expected_inputs = runtime.config.external_inputs.len();
+                            let expected_outputs = runtime.config.external_outputs.len();
+                            if snapshot.status.connected_inputs != expected_inputs
+                                || snapshot.status.connected_outputs != expected_outputs
+                            {
+                                rollback_triggered = true;
+                                return Err(self.rollback_apply(
+                                    previous_state.clone(),
+                                    &driver_snapshot,
+                                    format!(
+                                        "external runtime readiness failed: expected inputs={} outputs={}, got inputs={} outputs={}",
+                                        expected_inputs,
+                                        expected_outputs,
+                                        snapshot.status.connected_inputs,
+                                        snapshot.status.connected_outputs
+                                    ),
+                                    ExitCode::ApplyFailed,
+                                ));
+                            }
+                        }
                     }
                 }
+
+                if let Some(external_status) = self
+                    .render_runtime
+                    .lock()
+                    .as_ref()
+                    .map(|runtime| runtime.metrics.external_runtime.lock().clone())
+                {
+                    self.state.lock().external_runtime = external_status;
+                }
+                if let Some(sink_status) = self
+                    .render_runtime
+                    .lock()
+                    .as_ref()
+                    .and_then(|runtime| runtime.sink_runtime.as_ref().map(SinkRuntime::status))
+                {
+                    self.state.lock().sink_runtime = sink_status;
+                }
+                if let Some(capture_status) = self
+                    .capture_runtime
+                    .lock()
+                    .as_ref()
+                    .map(CaptureRuntime::status)
+                {
+                    self.state.lock().capture_runtime = capture_status;
+                }
+                stage.success();
             }
-        }
 
-        if let Some(external_status) = self
-            .render_runtime
-            .lock()
-            .as_ref()
-            .map(|runtime| runtime.metrics.external_runtime.lock().clone())
-        {
-            self.state.lock().external_runtime = external_status;
-        }
-        if let Some(sink_status) = self
-            .render_runtime
-            .lock()
-            .as_ref()
-            .and_then(|runtime| runtime.sink_runtime.as_ref().map(SinkRuntime::status))
-        {
-            self.state.lock().sink_runtime = sink_status;
-        }
-        if let Some(capture_status) = self
-            .capture_runtime
-            .lock()
-            .as_ref()
-            .map(CaptureRuntime::status)
-        {
-            self.state.lock().capture_runtime = capture_status;
-        }
+            info!("apply transaction committed");
 
-        info!("apply transaction committed");
+            Ok(ApplyResult {
+                applied: true,
+                plan,
+                warnings,
+                errors: Vec::new(),
+            })
+        })();
 
-        Ok(ApplyResult {
-            applied: true,
-            plan,
-            warnings,
-            errors: Vec::new(),
-        })
+        let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let attrs = [
+            Attribute::bool("dry_run", request.dry_run),
+            Attribute::bool("no_delete", request.no_delete),
+            Attribute::bool("success", outcome.is_ok()),
+            Attribute::bool("rollback", rollback_triggered),
+        ];
+        telemetry.apply_count.add(1, &attrs);
+        telemetry.apply_duration.record(elapsed_ms, &attrs);
+        apply_span.set_attributes(&attrs);
+        if let Some(stage) = failed_stage {
+            apply_span.set_attributes(&[Attribute::string("error_stage", stage)]);
+        }
+        if rollback_triggered {
+            telemetry.apply_rollback_count.add(
+                1,
+                &[Attribute::string(
+                    "stage",
+                    failed_stage.unwrap_or("unknown"),
+                )],
+            );
+            apply_span.set_attributes(&[Attribute::bool("rollback", true)]);
+        }
+        match &outcome {
+            Ok(_) => apply_span.set_status_ok(),
+            Err(error) => apply_span.set_status_error(error.message.clone()),
+        }
+        apply_span.end();
+        outcome
     }
 
     fn clear_internal(&self, keep_devices: bool) -> Result<ApplyResult, ApiError> {

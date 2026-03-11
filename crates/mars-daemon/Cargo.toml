@@ -10,6 +10,10 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+otel = ["mars-telemetry/otel", "mars-ipc/otel", "mars-engine/otel"]
+
 [[bin]]
 name = "marsd"
 path = "src/bin/marsd.rs"
@@ -29,6 +33,7 @@ mars-hal-client = { path = "../mars-hal-client" }
 mars-ipc = { path = "../mars-ipc" }
 mars-profile = { path = "../mars-profile" }
 mars-shm = { path = "../mars-shm" }
+mars-telemetry = { path = "../mars-telemetry" }
 mars-types = { path = "../mars-types" }
 once_cell.workspace = true
 parking_lot.workspace = true

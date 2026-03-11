@@ -3,9 +3,12 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
+use std::time::Instant;
 
 use async_trait::async_trait;
+use mars_telemetry::{Attribute, TelemetryTracer, U64Counter, U64Histogram};
 use mars_types::{
     ApplyPlan, ApplyRequest, ApplyResult, CaptureProcessInfo, ClearRequest, DaemonStatus,
     DeviceInventory, DoctorReport, ExitCode, PlanRequest, ValidateRequest, ValidationReport,
@@ -20,6 +23,46 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u16 = 2;
+
+#[derive(Debug)]
+struct IpcTelemetry {
+    tracer: TelemetryTracer,
+    client_request_count: U64Counter,
+    client_request_duration: U64Histogram,
+    daemon_request_count: U64Counter,
+    daemon_request_duration: U64Histogram,
+}
+
+static IPC_TELEMETRY: OnceLock<IpcTelemetry> = OnceLock::new();
+
+fn ipc_telemetry() -> &'static IpcTelemetry {
+    IPC_TELEMETRY.get_or_init(|| {
+        let meter = mars_telemetry::global_meter("mars-ipc");
+        IpcTelemetry {
+            tracer: mars_telemetry::global_tracer("mars-ipc"),
+            client_request_count: meter.u64_counter(
+                "mars.ipc.request.count",
+                "Count of IPC client requests",
+                "{request}",
+            ),
+            client_request_duration: meter.u64_histogram(
+                "mars.ipc.request.duration",
+                "Duration of IPC client requests",
+                "ms",
+            ),
+            daemon_request_count: meter.u64_counter(
+                "mars.daemon.request.count",
+                "Count of daemon requests",
+                "{request}",
+            ),
+            daemon_request_duration: meter.u64_histogram(
+                "mars.daemon.request.duration",
+                "Duration of daemon requests",
+                "ms",
+            ),
+        }
+    })
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -233,6 +276,7 @@ impl IpcClient {
 
     pub async fn send(&self, request: DaemonRequest) -> Result<DaemonResponse, IpcError> {
         let command = request.command();
+        let command_name = command_label(command);
         let payload = request.into_payload()?;
         let envelope = RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
@@ -240,46 +284,79 @@ impl IpcClient {
             command,
             payload,
         };
+        let request_id = envelope.request_id.clone();
+        let timeout_ms = self.timeout.as_millis().min(u128::from(u64::MAX)) as u64;
+        let telemetry = ipc_telemetry();
+        let mut span = telemetry.tracer.start_span(
+            "mars.ipc.client.request",
+            &[
+                Attribute::string("command", command_name),
+                Attribute::string("request_id", request_id.clone()),
+                Attribute::u64("timeout_ms", timeout_ms),
+            ],
+        );
+        let started = Instant::now();
 
-        let stream = UnixStream::connect(&self.socket_path).await?;
-        let (reader, mut writer) = stream.into_split();
-        let encoded = serde_json::to_string(&envelope).map_err(IpcError::SerdeJson)?;
-        writer.write_all(encoded.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
+        let outcome: Result<DaemonResponse, IpcError> = async {
+            let stream = UnixStream::connect(&self.socket_path).await?;
+            let (reader, mut writer) = stream.into_split();
+            let encoded = serde_json::to_string(&envelope).map_err(IpcError::SerdeJson)?;
+            writer.write_all(encoded.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
 
-        let mut lines = BufReader::new(reader).lines();
-        let maybe_line = timeout(self.timeout, lines.next_line())
-            .await
-            .map_err(|_| IpcError::Timeout)??;
-        let Some(line) = maybe_line else {
-            return Err(IpcError::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "daemon closed connection",
-            )));
-        };
+            let mut lines = BufReader::new(reader).lines();
+            let maybe_line = timeout(self.timeout, lines.next_line())
+                .await
+                .map_err(|_| IpcError::Timeout)??;
+            let Some(line) = maybe_line else {
+                return Err(IpcError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "daemon closed connection",
+                )));
+            };
 
-        let response: ResponseEnvelope =
-            serde_json::from_str(&line).map_err(IpcError::SerdeJson)?;
-        if response.protocol_version != PROTOCOL_VERSION {
-            return Err(IpcError::ProtocolVersionMismatch {
-                expected: PROTOCOL_VERSION,
-                actual: response.protocol_version,
-            });
+            let response: ResponseEnvelope =
+                serde_json::from_str(&line).map_err(IpcError::SerdeJson)?;
+            if response.protocol_version != PROTOCOL_VERSION {
+                return Err(IpcError::ProtocolVersionMismatch {
+                    expected: PROTOCOL_VERSION,
+                    actual: response.protocol_version,
+                });
+            }
+
+            if !response.ok {
+                return Err(IpcError::DaemonError {
+                    message: response
+                        .error
+                        .unwrap_or_else(|| "unknown daemon error".to_string()),
+                    exit_code: response
+                        .exit_code
+                        .and_then(|code| ExitCode::try_from(code).ok()),
+                });
+            }
+
+            DaemonResponse::from_payload(response.command, response.payload)
         }
+        .await;
 
-        if !response.ok {
-            return Err(IpcError::DaemonError {
-                message: response
-                    .error
-                    .unwrap_or_else(|| "unknown daemon error".to_string()),
-                exit_code: response
-                    .exit_code
-                    .and_then(|code| ExitCode::try_from(code).ok()),
-            });
+        let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let success = outcome.is_ok();
+        let attrs = [
+            Attribute::string("command", command_name),
+            Attribute::bool("success", success),
+        ];
+        telemetry.client_request_count.add(1, &attrs);
+        telemetry.client_request_duration.record(elapsed_ms, &attrs);
+        span.set_attributes(&attrs);
+        if let Err(error) = outcome.as_ref() {
+            span.set_status_error(error.to_string());
+        } else {
+            span.set_status_ok();
         }
+        span.end();
 
-        DaemonResponse::from_payload(response.command, response.payload)
+        outcome
     }
 }
 
@@ -320,6 +397,7 @@ where
 {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
+    let telemetry = ipc_telemetry();
 
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
@@ -327,8 +405,19 @@ where
         }
 
         let envelope: RequestEnvelope = serde_json::from_str(&line).map_err(IpcError::SerdeJson)?;
-        if envelope.protocol_version != PROTOCOL_VERSION {
-            let response = ResponseEnvelope {
+        let command_name = command_label(envelope.command);
+        let request_id = envelope.request_id.clone();
+        let mut span = telemetry.tracer.start_span(
+            "mars.daemon.request",
+            &[
+                Attribute::string("command", command_name),
+                Attribute::string("request_id", request_id),
+            ],
+        );
+        let started = Instant::now();
+
+        let response = if envelope.protocol_version != PROTOCOL_VERSION {
+            ResponseEnvelope {
                 protocol_version: PROTOCOL_VERSION,
                 request_id: envelope.request_id,
                 command: envelope.command,
@@ -339,22 +428,29 @@ where
                     PROTOCOL_VERSION, envelope.protocol_version
                 )),
                 exit_code: Some(ExitCode::DaemonCommunication.as_i32()),
-            };
-            write_response(&mut writer, &response).await?;
-            continue;
-        }
-
-        let request = deserialize_request(envelope.command, envelope.payload);
-        let response = match request {
-            Ok(request) => match handler.handle(request).await {
-                Ok(payload) => ResponseEnvelope {
-                    protocol_version: PROTOCOL_VERSION,
-                    request_id: envelope.request_id,
-                    command: envelope.command,
-                    ok: true,
-                    payload: payload.into_payload()?,
-                    error: None,
-                    exit_code: None,
+            }
+        } else {
+            let request = deserialize_request(envelope.command, envelope.payload);
+            match request {
+                Ok(request) => match handler.handle(request).await {
+                    Ok(payload) => ResponseEnvelope {
+                        protocol_version: PROTOCOL_VERSION,
+                        request_id: envelope.request_id,
+                        command: envelope.command,
+                        ok: true,
+                        payload: payload.into_payload()?,
+                        error: None,
+                        exit_code: None,
+                    },
+                    Err(error) => ResponseEnvelope {
+                        protocol_version: PROTOCOL_VERSION,
+                        request_id: envelope.request_id,
+                        command: envelope.command,
+                        ok: false,
+                        payload: Value::Null,
+                        error: Some(error.message),
+                        exit_code: Some(error.exit_code.as_i32()),
+                    },
                 },
                 Err(error) => ResponseEnvelope {
                     protocol_version: PROTOCOL_VERSION,
@@ -362,21 +458,32 @@ where
                     command: envelope.command,
                     ok: false,
                     payload: Value::Null,
-                    error: Some(error.message),
-                    exit_code: Some(error.exit_code.as_i32()),
+                    error: Some(error.to_string()),
+                    exit_code: Some(ExitCode::InvalidInput.as_i32()),
                 },
-            },
-            Err(error) => ResponseEnvelope {
-                protocol_version: PROTOCOL_VERSION,
-                request_id: envelope.request_id,
-                command: envelope.command,
-                ok: false,
-                payload: Value::Null,
-                error: Some(error.to_string()),
-                exit_code: Some(ExitCode::InvalidInput.as_i32()),
-            },
+            }
         };
 
+        let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let attrs = [
+            Attribute::string("command", command_name),
+            Attribute::bool("success", response.ok),
+            Attribute::i64("exit_code", i64::from(response.exit_code.unwrap_or(0))),
+        ];
+        telemetry.daemon_request_count.add(1, &attrs);
+        telemetry.daemon_request_duration.record(elapsed_ms, &attrs);
+        span.set_attributes(&attrs);
+        if response.ok {
+            span.set_status_ok();
+        } else {
+            span.set_status_error(
+                response
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "unknown daemon error".to_string()),
+            );
+        }
+        span.end();
         write_response(&mut writer, &response).await?;
     }
 
@@ -417,6 +524,21 @@ async fn write_response(
     writer.write_all(b"\n").await?;
     writer.flush().await?;
     Ok(())
+}
+
+const fn command_label(command: Command) -> &'static str {
+    match command {
+        Command::Ping => "ping",
+        Command::Validate => "validate",
+        Command::Plan => "plan",
+        Command::Apply => "apply",
+        Command::Clear => "clear",
+        Command::Status => "status",
+        Command::Devices => "devices",
+        Command::Processes => "processes",
+        Command::Logs => "logs",
+        Command::Doctor => "doctor",
+    }
 }
 
 #[cfg(test)]
