@@ -1,13 +1,23 @@
 # MARS
 
-MARS (macOS Audio Router Service) is an audio routing system for macOS.
+MARS (macOS Audio Router Service) is an audio routing system for macOS 15+.
 
 ## What is included
 
-- `mars` CLI with commands: `create`, `open`, `apply`, `clear`, `validate`, `plan`, `status`, `devices`, `test`, `logs`, `doctor`
+- `mars` CLI with commands: `create`, `open`, `apply`, `clear`, `validate`, `plan`, `status`, `devices`, `processes`, `test`, `logs`, `doctor`
 - `marsd` daemon with declarative apply transaction and rollback semantics
+- `mars-sdk` Rust SDK crate for building external apps/tools on the typed MARS API
 - `mars-hal` AudioServerPlugIn driver crate and `mars.driver` bundle scaffold
+- Profile schema `version: 2` only (`version: 1` is rejected)
+- Process/system capture tap model (`captures.process_taps` and `captures.system_taps`)
+- Built-in file sinks (`sinks.files`) for WAV/CAF recording
+- AUv2/AUv3 processor hosting through isolated `mars-plugin-host`
 - Shared profile schema, graph validator, ring-buffer model, and realtime engine core
+
+## Current limitations
+
+- `sinks.streams` is an extensible descriptor model, but stream sink runtime is not implemented yet.
+- When a stream sink is configured, runtime status/doctor surfaces it as failed with `last_error` details.
 
 ## Architecture
 
@@ -109,6 +119,7 @@ graph BT
     halclient["mars-hal-client<br/><i>safe driver API</i>"]
     shm["mars-shm<br/><i>ring buffer facade</i>"]
     ipc["mars-ipc<br/><i>Unix socket protocol</i>"]
+    sdk["mars-sdk<br/><i>public app SDK</i>"]
     daemon["mars-daemon<br/><i>marsd orchestrator</i>"]
     cli["mars-cli<br/><i>user interface</i>"]
 
@@ -121,6 +132,8 @@ graph BT
     shm --> hal
     halclient --> hal
     ipc --> types
+    sdk --> types
+    sdk --> ipc
     daemon --> profile
     daemon --> engine
     daemon --> coreaudio
@@ -132,7 +145,7 @@ graph BT
     cli --> ipc
 
     class types foundation
-    class graph_,profile,engine,ipc core
+    class graph_,profile,engine,ipc,sdk core
     class hal,halclient,shm,coreaudio platform
     class daemon,cli app
 ```
@@ -214,9 +227,14 @@ sudo killall -9 coreaudiod
 
 ## Usage
 
+The default template includes process/system taps and a stream sink descriptor. Before `mars apply`, update or remove those entries so they match your host:
+- use `mars processes --json` to select real process selectors (PID or bundle id)
+- remove `captures` or `sinks.streams` entries you do not need
+
 ```bash
 mars create demo
 mars open demo
+mars processes --json
 mars validate demo
 mars plan demo
 mars apply demo
@@ -230,6 +248,13 @@ mars clear
 
 `mars test` measures internal MARS data-plane latency only.
 `mars test --route` verifies the microphone-to-speaker and microphone-to-virtual-capture route.
+
+## SDK
+
+For third-party app/tool development, use the Rust SDK:
+
+- docs: `docs/sdk.md`
+- example: `cargo run -p mars-sdk --example status`
 
 ## Uninstall
 

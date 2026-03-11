@@ -43,6 +43,61 @@ Notes:
 - `manufacturer` / `transport` matching is best-effort when metadata is unavailable on the host.
 - If matching succeeded via unknown metadata, `plan` / `apply` warnings will mention it.
 
+## Process tap selector did not match any process object
+
+Symptom:
+
+- `process tap '<id>' selector '<selector>' did not match any active CoreAudio process object`
+
+Cause:
+
+- The configured PID or bundle id does not match current CoreAudio process objects.
+
+Fix:
+
+1. Run `mars processes --json`.
+2. Pick a selector that exists on the current host:
+   - `type: pid` for a specific running process.
+   - `type: bundle_id` for stable app matching.
+3. Update profile `captures.process_taps`, then re-run `mars validate` and `mars apply`.
+
+## Stream sink reports `not implemented`
+
+Symptom:
+
+- `stream sink not implemented for transport=...` appears in logs or sink status.
+
+Cause:
+
+- `sinks.streams` is descriptor-only in the current runtime; file sinks are implemented, stream sinks are not.
+
+Fix:
+
+1. Check runtime health:
+   - `mars status --json` -> `sink_runtime.sinks[].health` and `sink_runtime.sinks[].last_error`
+   - `mars doctor --json` -> `sink_failed` and `sink_write_errors`
+2. Remove or disable `sinks.streams` entries.
+3. Use `sinks.files` (`wav` or `caf`) for current recording output.
+
+## AU plugin host shows timeouts/errors/restarts
+
+Symptom:
+
+- `plugin_timeouts`, `plugin_errors`, or `plugin_restarts` is non-zero in `mars doctor --json`.
+
+Cause:
+
+- The isolated AU host (`mars-plugin-host`) hit timeout/restart/error conditions.
+
+Fix:
+
+1. Inspect counters:
+   - `mars status --json` -> `plugin_runtime.*` and `plugin_runtime.instances[]`
+   - `mars doctor --json` -> `plugin_active`, `plugin_failed`, `plugin_timeouts`, `plugin_errors`, `plugin_restarts`
+2. Check logs:
+   - `mars logs`
+3. Re-apply the profile after correcting AU config, then verify counters stabilize.
+
 ## External endpoint disconnects during runtime
 
 Cause:

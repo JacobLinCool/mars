@@ -51,11 +51,14 @@ scripts/bench/verify.sh --platform macos-15 \
   --bench-cmd "cargo bench -p mars-engine --bench engine -- engine/render_processor_block" \
   --bench-cmd "cargo bench -p mars-engine --bench engine -- engine/render_processor_chain_kind" \
   --bench-cmd "cargo bench -p mars-engine --bench engine -- engine/render_timeshift_depth" \
+  --bench-cmd "cargo bench -p mars-engine --bench plugin_host" \
   --benchmark-prefix "engine/render_chain_length/" \
   --benchmark-prefix "engine/render_param_updates/" \
   --benchmark-prefix "engine/render_processor_block/" \
   --benchmark-prefix "engine/render_processor_chain_kind/" \
-  --benchmark-prefix "engine/render_timeshift_depth/"
+  --benchmark-prefix "engine/render_timeshift_depth/" \
+  --benchmark-prefix "engine/au/ipc_overhead/" \
+  --benchmark-prefix "engine/au/plugin_latency/"
 ```
 
 ### Capture gate

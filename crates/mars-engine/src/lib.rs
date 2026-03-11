@@ -1445,13 +1445,12 @@ impl Engine {
             };
 
             if let Some(mix) = node.mix.as_ref() {
-                if matches!(mix.mode, MixMode::Average) {
-                    if contribution_count > 1 {
+                if matches!(mix.mode, MixMode::Average)
+                    && contribution_count > 1 {
                         for sample in buffer.iter_mut() {
                             *sample /= contribution_count as f32;
                         }
                     }
-                }
 
                 if mix.limiter {
                     apply_soft_limiter(buffer, mix.limit_dbfs);
