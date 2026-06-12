@@ -6,7 +6,8 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use mars_engine::{Engine, EngineSnapshot};
 use mars_graph::build_routing_graph;
 use mars_types::{
-    CaptureConfig, ProcessTap, ProcessTapSelector, Profile, Route, RouteMatrix, VirtualInputDevice,
+    CaptureConfig, ProcessTap, ProcessTapSelector, ProducerKind, Profile, Route, RouteMatrix,
+    VirtualInputDevice,
 };
 
 #[derive(Debug, Default)]
@@ -50,6 +51,7 @@ fn capture_profile(frames: u32, channels: u16) -> Profile {
         channels: Some(channels),
         uid: None,
         mix: None,
+        producer: ProducerKind::default(),
     });
     profile.captures = CaptureConfig {
         process_taps: vec![ProcessTap {

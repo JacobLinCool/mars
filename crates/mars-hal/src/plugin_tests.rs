@@ -597,3 +597,70 @@ fn zero_timestamp_tracks_monotonic_sample_time_and_seed() {
 
     remove_test_device(&uid);
 }
+
+#[test]
+fn nominal_sample_rate_is_locked_to_the_applied_rate() {
+    let _guard = TEST_LOCK.lock();
+    let uid = "test.rate-lock.uid".to_string();
+    let (device_id, _, _) = insert_test_device(&uid, "Rate Locked", "virtual_input", 1);
+
+    let rate_address = AudioObjectPropertyAddress {
+        m_selector: K_AUDIO_DEVICE_PROPERTY_NOMINAL_SAMPLE_RATE,
+        m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+        m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    };
+
+    // Available rates advertise a single-value range == the applied rate.
+    let mut range = AudioValueRange {
+        m_minimum: 0.0,
+        m_maximum: 0.0,
+    };
+    let range_address = AudioObjectPropertyAddress {
+        m_selector: K_AUDIO_DEVICE_PROPERTY_AVAILABLE_NOMINAL_SAMPLE_RATES,
+        m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+        m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    };
+    let mut out_size = 0_u32;
+    // SAFETY: valid pointers, test context.
+    let status = unsafe {
+        device_get_property(
+            device_id,
+            &range_address,
+            0,
+            core::ptr::null(),
+            std::mem::size_of::<AudioValueRange>() as UInt32,
+            &mut out_size,
+            (&mut range as *mut AudioValueRange).cast::<c_void>(),
+        )
+    };
+    assert_eq!(status, K_AUDIO_HARDWARE_NO_ERROR);
+    assert_eq!(range.m_minimum, range.m_maximum, "single rate advertised");
+    let applied_rate = range.m_minimum;
+
+    // Setting the applied rate is an accepted no-op.
+    // SAFETY: valid pointer and size for a Float64 payload.
+    let status = unsafe {
+        device_set_property(
+            device_id,
+            &rate_address,
+            std::mem::size_of::<Float64>() as UInt32,
+            (&applied_rate as *const Float64).cast::<c_void>(),
+        )
+    };
+    assert_eq!(status, K_AUDIO_HARDWARE_NO_ERROR);
+
+    // Any other rate fails cleanly.
+    let other_rate: Float64 = applied_rate + 4_100.0;
+    // SAFETY: valid pointer and size for a Float64 payload.
+    let status = unsafe {
+        device_set_property(
+            device_id,
+            &rate_address,
+            std::mem::size_of::<Float64>() as UInt32,
+            (&other_rate as *const Float64).cast::<c_void>(),
+        )
+    };
+    assert_eq!(status, K_AUDIO_HARDWARE_ILLEGAL_OPERATION_ERROR);
+
+    remove_test_device(&uid);
+}

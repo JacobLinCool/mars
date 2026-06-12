@@ -41,8 +41,9 @@ use mars_shm::{RingSpec, StreamDirection, global_registry, ring_token_for, strea
 use mars_types::{
     ApplyPlan, ApplyRequest, ApplyResult, CaptureRuntimeHealth, CaptureRuntimeStatus, DaemonStatus,
     DeviceDescriptor, DriverStatusSummary, ExitCode, ExternalRuntimeStatus, MANAGED_UID_PREFIX,
-    NodeKind, PlanChange, PlanChangeKind, PlanRequest, PluginHostRuntimeStatus, Profile,
-    RuntimeCounters, SinkRuntimeHealth, SinkRuntimeStatus,
+    NodeKind, PlanChange, PlanChangeKind, PlanRequest, PluginHostRuntimeStatus, ProducerKind,
+    ProducerState, Profile, RuntimeCounters, SinkRuntimeHealth, SinkRuntimeStatus,
+    VirtualInputProducerStatus,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -69,7 +70,20 @@ struct DaemonState {
     capture_runtime: CaptureRuntimeStatus,
     sink_runtime: SinkRuntimeStatus,
     plugin_runtime: PluginHostRuntimeStatus,
+    /// Last observed producer progress per app-owned virtual input uid,
+    /// used to classify producers as active vs stale between status calls.
+    producer_observations: HashMap<String, ProducerObservation>,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct ProducerObservation {
+    write_idx: u64,
+    underrun_count: u64,
+    last_progress: Instant,
+}
+
+/// A producer with no write progress for this long is reported stale.
+const PRODUCER_STALE_AFTER: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DriverAppliedState {
@@ -1075,6 +1089,7 @@ impl MarsDaemon {
         capture_runtime =
             enrich_capture_runtime_with_external_inputs(capture_runtime, &external_input_snapshots);
         self.state.lock().plugin_runtime = plugin_runtime.clone();
+        let virtual_input_producers = self.virtual_input_producer_statuses();
 
         DaemonStatus {
             running,
@@ -1091,8 +1106,111 @@ impl MarsDaemon {
             capture_runtime,
             sink_runtime,
             plugin_runtime,
+            virtual_input_producers,
             updated_at: Utc::now(),
         }
+    }
+
+    /// Observe producer health for app-owned (`producer: external_app`)
+    /// virtual inputs by reading their ring headers (#35).
+    ///
+    /// The daemon never writes these rings; it classifies producers from the
+    /// v2 header counters: `absent` until the first attach, `active` while
+    /// `write_idx` progresses, `underrunning` when the consumer underruns
+    /// despite progress, and `stale` once progress stops for
+    /// [`PRODUCER_STALE_AFTER`].
+    fn virtual_input_producer_statuses(&self) -> Vec<VirtualInputProducerStatus> {
+        let profile = { self.state.lock().current_profile.clone() };
+        let Some(profile) = profile else {
+            return Vec::new();
+        };
+
+        let sample_rate = profile.audio.sample_rate.as_value().unwrap_or(48_000);
+        let default_channels = profile.audio.channels.as_value().unwrap_or(2);
+        let mut statuses = Vec::new();
+
+        for input in profile
+            .virtual_devices
+            .inputs
+            .iter()
+            .filter(|input| input.producer == ProducerKind::ExternalApp)
+        {
+            let uid = input
+                .uid
+                .clone()
+                .unwrap_or_else(|| format!("{MANAGED_UID_PREFIX}vin.{}", input.id));
+            let spec = RingSpec {
+                sample_rate,
+                channels: input.channels.unwrap_or(default_channels),
+                capacity_frames: profile.audio.buffer_frames.saturating_mul(8),
+            };
+            let name = stream_name_tagged(StreamDirection::Vin, &uid, &ring_token_for(&uid));
+            let header = global_registry()
+                .create_or_open(&name, spec)
+                .ok()
+                .and_then(|handle| handle.lock().header().ok());
+
+            let Some(header) = header else {
+                statuses.push(VirtualInputProducerStatus {
+                    id: input.id.clone(),
+                    uid,
+                    kind: ProducerKind::ExternalApp,
+                    state: ProducerState::Absent,
+                    write_idx: 0,
+                    underrun_count: 0,
+                    attach_count: 0,
+                    generation: 0,
+                });
+                continue;
+            };
+
+            let now = Instant::now();
+            let (progressed, underrun_delta, stalled_for) =
+                {
+                    let mut state = self.state.lock();
+                    let observation = state.producer_observations.entry(uid.clone()).or_insert(
+                        ProducerObservation {
+                            write_idx: header.write_idx,
+                            underrun_count: header.underrun_count,
+                            last_progress: now,
+                        },
+                    );
+                    let progressed = header.write_idx > observation.write_idx;
+                    let underrun_delta = header
+                        .underrun_count
+                        .saturating_sub(observation.underrun_count);
+                    if progressed {
+                        observation.last_progress = now;
+                    }
+                    let stalled_for = now.duration_since(observation.last_progress);
+                    observation.write_idx = header.write_idx;
+                    observation.underrun_count = header.underrun_count;
+                    (progressed, underrun_delta, stalled_for)
+                };
+
+            let state = if header.producer_attach_count == 0 {
+                ProducerState::Absent
+            } else if progressed && underrun_delta > 0 {
+                ProducerState::Underrunning
+            } else if progressed || stalled_for <= PRODUCER_STALE_AFTER {
+                ProducerState::Active
+            } else {
+                ProducerState::Stale
+            };
+
+            statuses.push(VirtualInputProducerStatus {
+                id: input.id.clone(),
+                uid,
+                kind: ProducerKind::ExternalApp,
+                state,
+                write_idx: header.write_idx,
+                underrun_count: header.underrun_count,
+                attach_count: header.producer_attach_count,
+                generation: header.producer_generation,
+            });
+        }
+
+        statuses
     }
 
     fn logs_internal(&self, request: &LogRequest) -> Result<LogResponse, ApiError> {
@@ -1814,9 +1932,22 @@ fn render_runtime_config_from_state(
         .collect::<Vec<_>>();
     vout_sources.sort_by(|a, b| a.node_id.cmp(&b.node_id));
 
+    // App-owned virtual inputs are produced by an external app; the render
+    // loop must neither create nor write their rings (#35).
+    let app_owned_inputs: std::collections::BTreeSet<&str> = profile
+        .virtual_devices
+        .inputs
+        .iter()
+        .filter(|input| input.producer == mars_types::ProducerKind::ExternalApp)
+        .map(|input| input.id.as_str())
+        .collect();
+
     let mut vin_sinks = devices
         .iter()
-        .filter(|device| matches!(device.kind, NodeKind::VirtualInput))
+        .filter(|device| {
+            matches!(device.kind, NodeKind::VirtualInput)
+                && !app_owned_inputs.contains(device.id.as_str())
+        })
         .map(|device| RenderEndpoint {
             node_id: device.id.clone(),
             uid: device.uid.clone(),

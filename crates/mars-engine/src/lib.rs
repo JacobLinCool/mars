@@ -1445,12 +1445,11 @@ impl Engine {
             };
 
             if let Some(mix) = node.mix.as_ref() {
-                if matches!(mix.mode, MixMode::Average)
-                    && contribution_count > 1 {
-                        for sample in buffer.iter_mut() {
-                            *sample /= contribution_count as f32;
-                        }
+                if matches!(mix.mode, MixMode::Average) && contribution_count > 1 {
+                    for sample in buffer.iter_mut() {
+                        *sample /= contribution_count as f32;
                     }
+                }
 
                 if mix.limiter {
                     apply_soft_limiter(buffer, mix.limit_dbfs);
@@ -1643,8 +1642,8 @@ mod tests {
 
     use mars_graph::build_routing_graph;
     use mars_types::{
-        Bus, MixConfig, Pipe, ProcessorChain, ProcessorDefinition, ProcessorKind, Profile, Route,
-        RouteMatrix, VirtualInputDevice, VirtualOutputDevice,
+        Bus, MixConfig, Pipe, ProcessorChain, ProcessorDefinition, ProcessorKind, ProducerKind,
+        Profile, Route, RouteMatrix, VirtualInputDevice, VirtualOutputDevice,
     };
     use serde_json::json;
 
@@ -1669,6 +1668,7 @@ mod tests {
                 limit_dbfs: -1.0,
                 mode: mars_types::MixMode::Sum,
             }),
+            producer: ProducerKind::default(),
         });
         profile.pipes.push(Pipe {
             from: "app".to_string(),
@@ -1730,6 +1730,7 @@ mod tests {
                 channels: Some(2),
                 uid: None,
                 mix: None,
+                producer: ProducerKind::default(),
             });
         legacy_profile.pipes.push(Pipe {
             from: "app".to_string(),
@@ -1803,6 +1804,7 @@ mod tests {
             channels: Some(2),
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
         profile.processors.push(ProcessorDefinition {
             id: processor_id.to_string(),
@@ -1848,6 +1850,7 @@ mod tests {
             channels: Some(1),
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
         profile.processors.push(ProcessorDefinition {
             id: "proc-1".to_string(),
@@ -1991,6 +1994,7 @@ if __name__ == "__main__":
             channels: Some(2),
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
         profile.processors.push(ProcessorDefinition {
             id: processor_id.to_string(),
@@ -2322,6 +2326,7 @@ if __name__ == "__main__":
             channels: Some(1),
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
         profile.processors.push(ProcessorDefinition {
             id: "ts".to_string(),
@@ -2584,6 +2589,7 @@ if __name__ == "__main__":
             channels: Some(1),
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
         profile.pipes.push(Pipe {
             from: "app".to_string(),
@@ -2623,6 +2629,7 @@ if __name__ == "__main__":
             channels: Some(1),
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
         profile.pipes.push(Pipe {
             from: "osc".to_string(),
@@ -2687,6 +2694,7 @@ if __name__ == "__main__":
                 limit_dbfs: -1.0,
                 mode: mars_types::MixMode::Sum,
             }),
+            producer: ProducerKind::default(),
         });
         profile.pipes.push(Pipe {
             from: "loud".to_string(),
@@ -2756,6 +2764,7 @@ if __name__ == "__main__":
                 limit_dbfs: -1.0,
                 mode: mars_types::MixMode::Sum,
             }),
+            producer: ProducerKind::default(),
         });
         profile.virtual_devices.inputs.push(VirtualInputDevice {
             id: "monitor".to_string(),
@@ -2767,6 +2776,7 @@ if __name__ == "__main__":
                 limit_dbfs: -1.0,
                 mode: mars_types::MixMode::Average,
             }),
+            producer: ProducerKind::default(),
         });
 
         profile.pipes.push(Pipe {
@@ -2881,6 +2891,7 @@ if __name__ == "__main__":
             channels: Some(1),
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
 
         profile.pipes.push(Pipe {

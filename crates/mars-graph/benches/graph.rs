@@ -3,7 +3,8 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use mars_graph::build_routing_graph;
 use mars_types::{
-    Bus, MixConfig, MixMode, Profile, Route, RouteMatrix, VirtualInputDevice, VirtualOutputDevice,
+    Bus, MixConfig, MixMode, ProducerKind, Profile, Route, RouteMatrix, VirtualInputDevice,
+    VirtualOutputDevice,
 };
 
 fn identity_matrix(channels: u16) -> RouteMatrix {
@@ -34,6 +35,7 @@ fn small_profile() -> Profile {
         channels: Some(2),
         uid: None,
         mix: None,
+        producer: ProducerKind::default(),
     });
     p.routes.push(Route {
         id: "r-app-mix".into(),
@@ -81,6 +83,7 @@ fn medium_profile() -> Profile {
         channels: Some(2),
         uid: None,
         mix: None,
+        producer: ProducerKind::default(),
     });
     p.virtual_devices.inputs.push(VirtualInputDevice {
         id: "mix2".into(),
@@ -88,6 +91,7 @@ fn medium_profile() -> Profile {
         channels: Some(2),
         uid: None,
         mix: None,
+        producer: ProducerKind::default(),
     });
     p.routes.push(Route {
         id: "r-app1-bus1".into(),
@@ -169,6 +173,7 @@ fn large_profile() -> Profile {
             channels: Some(2),
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
     }
     // app -> bus

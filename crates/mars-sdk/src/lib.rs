@@ -336,6 +336,7 @@ mod tests {
                 capture_runtime: CaptureRuntimeStatus::default(),
                 sink_runtime: SinkRuntimeStatus::default(),
                 plugin_runtime: PluginHostRuntimeStatus::default(),
+                virtual_input_producers: Vec::new(),
                 updated_at: Utc::now(),
             })),
             Command::Status

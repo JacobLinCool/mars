@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use mars_engine::{Engine, EngineSnapshot};
 use mars_graph::build_routing_graph;
 use mars_shm::{RingSpec, StreamDirection, global_registry, ring_token_for, stream_name_tagged};
-use mars_types::{Pipe, Profile, VirtualInputDevice, VirtualOutputDevice};
+use mars_types::{Pipe, ProducerKind, Profile, VirtualInputDevice, VirtualOutputDevice};
 
 fn test_profile() -> Profile {
     let mut profile = Profile::default();
@@ -26,6 +26,7 @@ fn test_profile() -> Profile {
         channels: Some(2),
         uid: Some("com.mars.vin.mix".to_string()),
         mix: None,
+        producer: ProducerKind::default(),
     });
     profile.pipes.push(Pipe {
         from: "app".to_string(),

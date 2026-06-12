@@ -255,6 +255,7 @@ fn sample_status_payload() -> DaemonStatus {
                 last_error: None,
             }],
         },
+        virtual_input_producers: Vec::new(),
         updated_at: Utc::now(),
     }
 }

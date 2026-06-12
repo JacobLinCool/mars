@@ -7,8 +7,8 @@ use std::thread;
 use mars_engine::{Engine, EngineSnapshot, ProcessorControl, ProcessorSchedule, RenderOutput};
 use mars_graph::build_routing_graph;
 use mars_types::{
-    Bus, MixConfig, MixMode, Pipe, ProcessorChain, ProcessorDefinition, ProcessorKind, Profile,
-    Route, RouteMatrix, VirtualInputDevice, VirtualOutputDevice,
+    Bus, MixConfig, MixMode, Pipe, ProcessorChain, ProcessorDefinition, ProcessorKind,
+    ProducerKind, Profile, Route, RouteMatrix, VirtualInputDevice, VirtualOutputDevice,
 };
 use serde_json::json;
 
@@ -50,6 +50,7 @@ fn profile_variant(master_to_stream_delay_ms: f32, stream_limiter: bool) -> Prof
             limit_dbfs: -1.0,
             mode: MixMode::Sum,
         }),
+        producer: ProducerKind::default(),
     });
     profile.virtual_devices.inputs.push(VirtualInputDevice {
         id: "monitor".to_string(),
@@ -61,6 +62,7 @@ fn profile_variant(master_to_stream_delay_ms: f32, stream_limiter: bool) -> Prof
             limit_dbfs: -1.0,
             mode: MixMode::Average,
         }),
+        producer: ProducerKind::default(),
     });
     profile.virtual_devices.inputs.push(VirtualInputDevice {
         id: "record".to_string(),
@@ -72,6 +74,7 @@ fn profile_variant(master_to_stream_delay_ms: f32, stream_limiter: bool) -> Prof
             limit_dbfs: -1.0,
             mode: MixMode::Sum,
         }),
+        producer: ProducerKind::default(),
     });
 
     for source in ["app1", "app2", "app3"] {
@@ -204,6 +207,7 @@ fn processor_swap_profile(chain_id: &str, processor_id: &str) -> Profile {
             limit_dbfs: -1.0,
             mode: MixMode::Sum,
         }),
+        producer: ProducerKind::default(),
     });
     profile.processors.push(ProcessorDefinition {
         id: processor_id.to_string(),
@@ -390,6 +394,7 @@ fn soak_denoise_and_timeshift_keep_alignment_and_stability() {
         channels: Some(1),
         uid: None,
         mix: None,
+        producer: ProducerKind::default(),
     });
     profile.processors.push(ProcessorDefinition {
         id: "denoise".to_string(),

@@ -5,7 +5,9 @@ use std::time::Instant;
 
 use mars_engine::{Engine, EngineSnapshot};
 use mars_graph::build_routing_graph;
-use mars_types::{Bus, MixConfig, MixMode, Pipe, Profile, VirtualInputDevice, VirtualOutputDevice};
+use mars_types::{
+    Bus, MixConfig, MixMode, Pipe, ProducerKind, Profile, VirtualInputDevice, VirtualOutputDevice,
+};
 
 fn perf_profile() -> Profile {
     let mut profile = Profile::default();
@@ -45,6 +47,7 @@ fn perf_profile() -> Profile {
             limit_dbfs: -1.0,
             mode: MixMode::Sum,
         }),
+        producer: ProducerKind::default(),
     });
     profile.virtual_devices.inputs.push(VirtualInputDevice {
         id: "monitor".to_string(),
@@ -56,6 +59,7 @@ fn perf_profile() -> Profile {
             limit_dbfs: -1.0,
             mode: MixMode::Average,
         }),
+        producer: ProducerKind::default(),
     });
     profile.virtual_devices.inputs.push(VirtualInputDevice {
         id: "record".to_string(),
@@ -67,6 +71,7 @@ fn perf_profile() -> Profile {
             limit_dbfs: -1.0,
             mode: MixMode::Sum,
         }),
+        producer: ProducerKind::default(),
     });
 
     for source in ["app1", "app2", "app3"] {

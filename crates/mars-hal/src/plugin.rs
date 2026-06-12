@@ -1023,6 +1023,27 @@ unsafe fn device_set_property(
     data_size: UInt32,
     data: *const c_void,
 ) -> OSStatus {
+    // Virtual devices advertise exactly one nominal sample rate (the applied
+    // configuration), so a set is accepted only as a no-op for that rate.
+    // External producers (issue #48) depend on clients being unable to move
+    // the device to a different rate.
+    if addr.m_selector == K_AUDIO_DEVICE_PROPERTY_NOMINAL_SAMPLE_RATE {
+        if (data_size as usize) < size_of::<Float64>() {
+            return K_AUDIO_HARDWARE_ILLEGAL_OPERATION_ERROR;
+        }
+        // SAFETY: size checked above and caller guarantees readability.
+        let requested = unsafe { core::ptr::read_unaligned(data.cast::<Float64>()) };
+        let applied = {
+            let state = DRIVER_STATE.lock();
+            f64::from(state.applied_state.sample_rate)
+        };
+        return if (requested - applied).abs() < 0.5 {
+            K_AUDIO_HARDWARE_NO_ERROR
+        } else {
+            K_AUDIO_HARDWARE_ILLEGAL_OPERATION_ERROR
+        };
+    }
+
     if (data_size as usize) < size_of::<Float32>() {
         return K_AUDIO_HARDWARE_ILLEGAL_OPERATION_ERROR;
     }
