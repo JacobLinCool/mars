@@ -1222,15 +1222,23 @@ impl Drop for ExternalIoRuntime {
             let _ = handle.join();
         }
 
+        // Take each stream out under the lock but drop it after releasing the
+        // guard: cpal stream teardown can block for device buffer periods.
         for endpoint in self.input_endpoints.values() {
-            let mut runtime = endpoint.runtime.lock();
-            runtime.phase = EndpointPhase::Stopped;
-            runtime.stream = None;
+            let stale_stream = {
+                let mut runtime = endpoint.runtime.lock();
+                runtime.phase = EndpointPhase::Stopped;
+                runtime.stream.take()
+            };
+            drop(stale_stream);
         }
         for endpoint in self.output_endpoints.values() {
-            let mut runtime = endpoint.runtime.lock();
-            runtime.phase = EndpointPhase::Stopped;
-            runtime.stream = None;
+            let stale_stream = {
+                let mut runtime = endpoint.runtime.lock();
+                runtime.phase = EndpointPhase::Stopped;
+                runtime.stream.take()
+            };
+            drop(stale_stream);
         }
     }
 }
@@ -1631,12 +1639,18 @@ fn connect_input_endpoint(
         reason: error.to_string(),
     })?;
 
-    let mut runtime = endpoint.runtime.lock();
-    runtime.device_channels = device_channels;
-    runtime.phase = EndpointPhase::Connected;
-    runtime.attempts = 0;
-    runtime.next_retry_at = None;
-    runtime.stream = Some(stream);
+    // Swap the stream in under the lock but drop any stale stream after
+    // releasing the guard: cpal stream teardown can block for device buffer
+    // periods, which would stall the render loop waiting on this mutex.
+    let stale_stream = {
+        let mut runtime = endpoint.runtime.lock();
+        runtime.device_channels = device_channels;
+        runtime.phase = EndpointPhase::Connected;
+        runtime.attempts = 0;
+        runtime.next_retry_at = None;
+        runtime.stream.replace(stream)
+    };
+    drop(stale_stream);
     Ok(())
 }
 
@@ -1698,13 +1712,17 @@ fn connect_output_endpoint(
         reason: error.to_string(),
     })?;
 
-    let mut runtime = endpoint.runtime.lock();
-    runtime.device_channels = device_channels;
-    runtime.max_samples = max_samples;
-    runtime.phase = EndpointPhase::Connected;
-    runtime.attempts = 0;
-    runtime.next_retry_at = None;
-    runtime.stream = Some(stream);
+    // See connect_input_endpoint: drop any stale stream outside the lock.
+    let stale_stream = {
+        let mut runtime = endpoint.runtime.lock();
+        runtime.device_channels = device_channels;
+        runtime.max_samples = max_samples;
+        runtime.phase = EndpointPhase::Connected;
+        runtime.attempts = 0;
+        runtime.next_retry_at = None;
+        runtime.stream.replace(stream)
+    };
+    drop(stale_stream);
     Ok(())
 }
 
@@ -1719,8 +1737,11 @@ fn run_recovery_supervisor(recovery_rx: Receiver<RecoveryEvent>, context: Recove
                         .iter()
                         .find(|endpoint| endpoint.node_id == node_id)
                     {
-                        let mut runtime = endpoint.runtime.lock();
-                        mark_endpoint_degraded(&mut runtime, None);
+                        let stale_stream = {
+                            let mut runtime = endpoint.runtime.lock();
+                            mark_endpoint_degraded(&mut runtime, None)
+                        };
+                        drop(stale_stream);
                     }
                 }
                 EndpointKind::Output => {
@@ -1729,8 +1750,11 @@ fn run_recovery_supervisor(recovery_rx: Receiver<RecoveryEvent>, context: Recove
                         .iter()
                         .find(|endpoint| endpoint.node_id == node_id)
                     {
-                        let mut runtime = endpoint.runtime.lock();
-                        mark_output_endpoint_degraded(&mut runtime, None);
+                        let stale_stream = {
+                            let mut runtime = endpoint.runtime.lock();
+                            mark_output_endpoint_degraded(&mut runtime, None)
+                        };
+                        drop(stale_stream);
                     }
                 }
             },
@@ -1780,9 +1804,12 @@ fn run_recovery_supervisor(recovery_rx: Receiver<RecoveryEvent>, context: Recove
                     format!("reconnect failed for '{}': {error}", endpoint.uid),
                 );
                 endpoint.counters.xrun_count.fetch_add(1, Ordering::Relaxed);
-                let mut runtime = endpoint.runtime.lock();
-                let attempts = runtime.attempts.saturating_add(1);
-                mark_endpoint_degraded(&mut runtime, Some(attempts));
+                let stale_stream = {
+                    let mut runtime = endpoint.runtime.lock();
+                    let attempts = runtime.attempts.saturating_add(1);
+                    mark_endpoint_degraded(&mut runtime, Some(attempts))
+                };
+                drop(stale_stream);
             }
         }
 
@@ -1817,30 +1844,48 @@ fn run_recovery_supervisor(recovery_rx: Receiver<RecoveryEvent>, context: Recove
                         endpoint.uid
                     ),
                 );
-                let mut runtime = endpoint.runtime.lock();
-                let attempts = runtime.attempts.saturating_add(1);
-                mark_output_endpoint_degraded(&mut runtime, Some(attempts));
+                let stale_stream = {
+                    let mut runtime = endpoint.runtime.lock();
+                    let attempts = runtime.attempts.saturating_add(1);
+                    mark_output_endpoint_degraded(&mut runtime, Some(attempts))
+                };
+                drop(stale_stream);
             }
         }
     }
 }
 
-fn mark_endpoint_degraded(runtime: &mut InputEndpointRuntime, attempts: Option<u32>) {
+/// Marks the endpoint degraded and returns the stale stream, which the caller
+/// must drop only after releasing the runtime lock: cpal stream teardown can
+/// block for device buffer periods and would otherwise stall the render loop.
+#[must_use]
+fn mark_endpoint_degraded(
+    runtime: &mut InputEndpointRuntime,
+    attempts: Option<u32>,
+) -> Option<Stream> {
     runtime.phase = EndpointPhase::Degraded;
-    runtime.stream = None;
+    let stale_stream = runtime.stream.take();
     runtime.attempts = attempts
         .unwrap_or_else(|| runtime.attempts.saturating_add(1))
         .max(1);
     runtime.next_retry_at = Some(Instant::now() + reconnect_backoff(runtime.attempts));
+    stale_stream
 }
 
-fn mark_output_endpoint_degraded(runtime: &mut OutputEndpointRuntime, attempts: Option<u32>) {
+/// See [`mark_endpoint_degraded`]: the returned stream must be dropped only
+/// after releasing the runtime lock.
+#[must_use]
+fn mark_output_endpoint_degraded(
+    runtime: &mut OutputEndpointRuntime,
+    attempts: Option<u32>,
+) -> Option<Stream> {
     runtime.phase = EndpointPhase::Degraded;
-    runtime.stream = None;
+    let stale_stream = runtime.stream.take();
     runtime.attempts = attempts
         .unwrap_or_else(|| runtime.attempts.saturating_add(1))
         .max(1);
     runtime.next_retry_at = Some(Instant::now() + reconnect_backoff(runtime.attempts));
+    stale_stream
 }
 
 fn reconnect_backoff(attempts: u32) -> Duration {
