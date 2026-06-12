@@ -19,27 +19,25 @@ fn insert_test_device(
     let volume_control_id = (!kind.contains("input")).then(|| reg.allocate_id());
     reg.devices.insert(
         uid.to_string(),
-        DeviceObjectInfo {
+        DeviceObjectInfo::new(
             device_id,
             stream_id,
             volume_control_id,
-            uid: uid.to_string(),
-            name: name.to_string(),
-            kind: kind.to_string(),
+            uid.to_string(),
+            name.to_string(),
+            kind.to_string(),
             channels,
-            hidden: false,
-            volume_scalar: 1.0,
-            io_running: false,
-            sample_time_frames: 0,
-            zero_ts_seed: 0,
-        },
+            false,
+        ),
     );
+    publish_rt_snapshot(&reg);
     (device_id, stream_id, volume_control_id)
 }
 
 fn remove_test_device(uid: &str) {
     let mut reg = PLUGIN.object_registry.lock();
     reg.devices.remove(uid);
+    publish_rt_snapshot(&reg);
     let _ = global_registry().remove(&stream_name(StreamDirection::Vout, uid));
     let _ = global_registry().remove(&stream_name(StreamDirection::Vin, uid));
 }

@@ -868,6 +868,7 @@ dependencies = [
 name = "mars-hal"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "criterion",
  "dashmap",
  "nix",

@@ -5,11 +5,13 @@
 //! properties (`kMarsPropertyDesiredState`, etc.) and flow through the existing
 //! `DRIVER_STATE` machinery in `crate::lib`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use arc_swap::{ArcSwap, ArcSwapOption};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 
@@ -55,10 +57,109 @@ struct DeviceObjectInfo {
     kind: String,
     channels: u16,
     hidden: bool,
-    volume_scalar: Float32,
     io_running: bool,
-    sample_time_frames: u64,
-    zero_ts_seed: u64,
+    /// Realtime-shared state; the same `Arc` instance is published into
+    /// [`RT_DEVICES`] so realtime callbacks observe mutations made through the
+    /// registry without taking any lock.
+    rt: Arc<RtDeviceState>,
+}
+
+impl DeviceObjectInfo {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        device_id: AudioObjectID,
+        stream_id: AudioObjectID,
+        volume_control_id: Option<AudioObjectID>,
+        uid: String,
+        name: String,
+        kind: String,
+        channels: u16,
+        hidden: bool,
+    ) -> Self {
+        let rt = Arc::new(RtDeviceState::new(channels, &kind));
+        Self {
+            device_id,
+            stream_id,
+            volume_control_id,
+            uid,
+            name,
+            kind,
+            channels,
+            hidden,
+            io_running: false,
+            rt,
+        }
+    }
+
+    fn volume_scalar(&self) -> Float32 {
+        self.rt.volume_scalar()
+    }
+}
+
+/// Per-device state shared with the realtime IO path.
+///
+/// `plugin_do_io_operation` and `plugin_get_zero_time_stamp` run on
+/// coreaudiod's realtime thread and must not take blocking locks or allocate.
+/// They resolve the device through the lock-free [`RT_DEVICES`] snapshot and
+/// touch only the atomics (and the cached ring handle) below. Non-RT paths
+/// mutate the same `Arc`'d instance through the object registry.
+#[derive(Debug)]
+struct RtDeviceState {
+    channels: AtomicU16,
+    is_input: AtomicBool,
+    /// f32 bits of the device volume scalar.
+    volume_scalar_bits: AtomicU32,
+    sample_time_frames: AtomicU64,
+    zero_ts_seed: AtomicU64,
+    /// Ring handle cached by `plugin_start_io` so the realtime callback does
+    /// no name construction, hashing, or registry lookup.
+    ring: ArcSwapOption<Mutex<crate::shm_backend::SharedRing>>,
+}
+
+impl RtDeviceState {
+    fn new(channels: u16, kind: &str) -> Self {
+        Self {
+            channels: AtomicU16::new(channels),
+            is_input: AtomicBool::new(kind.contains("input")),
+            volume_scalar_bits: AtomicU32::new(1.0_f32.to_bits()),
+            sample_time_frames: AtomicU64::new(0),
+            zero_ts_seed: AtomicU64::new(0),
+            ring: ArcSwapOption::const_empty(),
+        }
+    }
+
+    fn volume_scalar(&self) -> Float32 {
+        Float32::from_bits(self.volume_scalar_bits.load(Ordering::Relaxed))
+    }
+
+    fn set_volume_scalar(&self, scalar: Float32) {
+        self.volume_scalar_bits
+            .store(scalar.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Reset the IO timeline. `sample_time_frames` is published before the
+    /// seed bump (Release) so a reader that observes the new seed (Acquire)
+    /// also observes the reset sample time.
+    fn reset_timeline(&self) {
+        self.sample_time_frames.store(0, Ordering::Relaxed);
+        self.zero_ts_seed.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Lock-free realtime view of the device registry, rebuilt by non-RT paths
+/// whenever the device set changes.
+static RT_DEVICES: Lazy<ArcSwap<HashMap<AudioObjectID, Arc<RtDeviceState>>>> =
+    Lazy::new(|| ArcSwap::from_pointee(HashMap::new()));
+
+/// Publish the realtime snapshot from the current registry contents. Callers
+/// must hold the `object_registry` lock so rebuilds cannot interleave.
+fn publish_rt_snapshot(reg: &ObjectRegistry) {
+    let map: HashMap<AudioObjectID, Arc<RtDeviceState>> = reg
+        .devices
+        .values()
+        .map(|device| (device.device_id, device.rt.clone()))
+        .collect();
+    RT_DEVICES.store(Arc::new(map));
 }
 
 impl Default for ObjectRegistry {
@@ -250,6 +351,7 @@ unsafe extern "C" fn plugin_destroy_device(
         .map(|(uid, _)| uid.clone());
     if let Some(uid) = uid_to_remove {
         reg.devices.remove(&uid);
+        publish_rt_snapshot(&reg);
         let _ = global_registry().remove(&stream_name(StreamDirection::Vout, &uid));
         let _ = global_registry().remove(&stream_name(StreamDirection::Vin, &uid));
     }
@@ -892,7 +994,7 @@ fn set_device_volume_scalar(
     let Some(control_id) = dev.volume_control_id else {
         return Err(K_AUDIO_HARDWARE_UNKNOWN_PROPERTY_ERROR);
     };
-    dev.volume_scalar = clamp_volume_scalar(new_scalar);
+    dev.rt.set_volume_scalar(clamp_volume_scalar(new_scalar));
     Ok((dev.device_id, control_id))
 }
 
@@ -907,7 +1009,7 @@ fn set_control_volume_scalar(
     let Some(control_id) = dev.volume_control_id else {
         return Err(K_AUDIO_HARDWARE_UNKNOWN_PROPERTY_ERROR);
     };
-    dev.volume_scalar = clamp_volume_scalar(new_scalar);
+    dev.rt.set_volume_scalar(clamp_volume_scalar(new_scalar));
     Ok((dev.device_id, control_id))
 }
 
@@ -977,12 +1079,17 @@ unsafe extern "C" fn plugin_start_io(
     // Read device info, then drop the registry lock before acquiring DRIVER_STATE
     // to maintain consistent lock ordering (DRIVER_STATE → object_registry) and
     // avoid deadlock with `sync_object_registry`.
-    let (uid, channels, is_input) = {
+    let (uid, channels, is_input, rt) = {
         let reg = PLUGIN.object_registry.lock();
         let Some(dev) = reg.find_device_by_object(device_object_id) else {
             return K_AUDIO_HARDWARE_BAD_OBJECT_ERROR;
         };
-        (dev.uid.clone(), dev.channels, dev.kind.contains("input"))
+        (
+            dev.uid.clone(),
+            dev.channels,
+            dev.kind.contains("input"),
+            dev.rt.clone(),
+        )
     };
 
     let spec = {
@@ -1001,16 +1108,19 @@ unsafe extern "C" fn plugin_start_io(
     };
     let name = stream_name(direction, &uid);
 
-    if global_registry().create_or_open(&name, spec).is_err() {
+    let Ok(ring_handle) = global_registry().create_or_open(&name, spec) else {
         return K_AUDIO_HARDWARE_ILLEGAL_OPERATION_ERROR;
-    }
+    };
+    // Cache the ring handle for the realtime callback: StartIO is the only
+    // point where the ring is guaranteed to exist, and caching here removes
+    // all name construction and registry lookups from the IO hot path.
+    rt.ring.store(Some(ring_handle));
+    rt.reset_timeline();
 
     // Re-acquire registry to set io_running.
     let mut reg = PLUGIN.object_registry.lock();
     if let Some(dev) = reg.find_device_by_object_mut(device_object_id) {
         dev.io_running = true;
-        dev.sample_time_frames = 0;
-        dev.zero_ts_seed = dev.zero_ts_seed.saturating_add(1);
     }
     K_AUDIO_HARDWARE_NO_ERROR
 }
@@ -1023,7 +1133,7 @@ unsafe extern "C" fn plugin_stop_io(
     let mut reg = PLUGIN.object_registry.lock();
     if let Some(dev) = reg.find_device_by_object_mut(device_object_id) {
         dev.io_running = false;
-        dev.zero_ts_seed = dev.zero_ts_seed.saturating_add(1);
+        dev.rt.zero_ts_seed.fetch_add(1, Ordering::Release);
     }
     K_AUDIO_HARDWARE_NO_ERROR
 }
@@ -1040,13 +1150,15 @@ unsafe extern "C" fn plugin_get_zero_time_stamp(
         return K_AUDIO_HARDWARE_ILLEGAL_OPERATION_ERROR;
     }
 
-    let (sample_time_frames, seed) = {
-        let reg = PLUGIN.object_registry.lock();
-        let Some(device) = reg.find_device_by_object(device_object_id) else {
-            return K_AUDIO_HARDWARE_BAD_OBJECT_ERROR;
-        };
-        (device.sample_time_frames, device.zero_ts_seed)
+    // Realtime context: resolve through the lock-free snapshot; never block.
+    let snapshot = RT_DEVICES.load();
+    let Some(device) = snapshot.get(&device_object_id) else {
+        return K_AUDIO_HARDWARE_BAD_OBJECT_ERROR;
     };
+    // Acquire on the seed pairs with the Release in `reset_timeline`: a reader
+    // observing a new seed also observes the reset sample time.
+    let seed = device.zero_ts_seed.load(Ordering::Acquire);
+    let sample_time_frames = device.sample_time_frames.load(Ordering::Relaxed);
 
     // Use mach_absolute_time for host time.
     // SAFETY: mach_absolute_time is always safe to call on macOS.
@@ -1107,22 +1219,16 @@ unsafe extern "C" fn plugin_do_io_operation(
     io_main_buffer: *mut c_void,
     _io_secondary_buffer: *mut c_void,
 ) -> OSStatus {
-    let reg = PLUGIN.object_registry.lock();
-    let Some(dev) = reg.find_device_by_object(device_object_id) else {
+    // Realtime context: no blocking locks, no allocation, no name hashing.
+    // The device is resolved through the lock-free snapshot and the ring
+    // handle was cached by `plugin_start_io`.
+    let snapshot = RT_DEVICES.load();
+    let Some(dev) = snapshot.get(&device_object_id) else {
         return K_AUDIO_HARDWARE_BAD_OBJECT_ERROR;
     };
-    let uid = dev.uid.clone();
-    let channels = dev.channels as usize;
-    let is_input = dev.kind.contains("input");
-    let volume_scalar = dev.volume_scalar;
-    drop(reg);
-
-    let direction = if is_input {
-        StreamDirection::Vin
-    } else {
-        StreamDirection::Vout
-    };
-    let name = stream_name(direction, &uid);
+    let channels = dev.channels.load(Ordering::Relaxed) as usize;
+    let is_input = dev.is_input.load(Ordering::Relaxed);
+    let volume_scalar = dev.volume_scalar();
 
     let total_samples = io_buffer_frame_size as usize * channels;
     // SAFETY: `io_main_buffer` points to `total_samples` f32 samples provided by the host.
@@ -1133,7 +1239,7 @@ unsafe extern "C" fn plugin_do_io_operation(
     let mut overrun_delta = 0_u64;
     let mut xrun_delta = 0_u64;
 
-    if let Some(ring_handle) = global_registry().open(&name) {
+    if let Some(ring_handle) = dev.ring.load_full() {
         if let Some(mut ring) = ring_handle.try_lock() {
             let before = ring.header().ok();
             if operation_id == K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_WRITE_MIX {
@@ -1211,12 +1317,8 @@ unsafe extern "C" fn plugin_do_io_operation(
     if operation_id == K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_WRITE_MIX
         || operation_id == K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_READ_INPUT
     {
-        let mut reg = PLUGIN.object_registry.lock();
-        if let Some(dev) = reg.find_device_by_object_mut(device_object_id) {
-            dev.sample_time_frames = dev
-                .sample_time_frames
-                .saturating_add(io_buffer_frame_size as u64);
-        }
+        dev.sample_time_frames
+            .fetch_add(io_buffer_frame_size as u64, Ordering::Relaxed);
     }
 
     K_AUDIO_HARDWARE_NO_ERROR
@@ -1633,7 +1735,7 @@ unsafe fn device_get_property(
             if !device_volume_address_matches(&dev, addr) {
                 return K_AUDIO_HARDWARE_UNKNOWN_PROPERTY_ERROR;
             }
-            unsafe { write_val::<Float32>(dev.volume_scalar, data_size, out_data_size, data) }
+            unsafe { write_val::<Float32>(dev.volume_scalar(), data_size, out_data_size, data) }
         }
         K_AUDIO_DEVICE_PROPERTY_VOLUME_DECIBELS => {
             if !device_volume_address_matches(&dev, addr) {
@@ -1641,7 +1743,7 @@ unsafe fn device_get_property(
             }
             unsafe {
                 write_val::<Float32>(
-                    volume_scalar_to_decibels(dev.volume_scalar),
+                    volume_scalar_to_decibels(dev.volume_scalar()),
                     data_size,
                     out_data_size,
                     data,
@@ -1809,11 +1911,11 @@ unsafe fn control_get_property(
             )
         },
         K_AUDIO_LEVEL_CONTROL_PROPERTY_SCALAR_VALUE => unsafe {
-            write_val::<Float32>(dev.volume_scalar, data_size, out_data_size, data)
+            write_val::<Float32>(dev.volume_scalar(), data_size, out_data_size, data)
         },
         K_AUDIO_LEVEL_CONTROL_PROPERTY_DECIBEL_VALUE => unsafe {
             write_val::<Float32>(
-                volume_scalar_to_decibels(dev.volume_scalar),
+                volume_scalar_to_decibels(dev.volume_scalar()),
                 data_size,
                 out_data_size,
                 data,
@@ -2090,32 +2192,43 @@ fn sync_object_registry() {
             let volume_control_id = (!device.kind.contains("input")).then(|| reg.allocate_id());
             reg.devices.insert(
                 device.uid.clone(),
-                DeviceObjectInfo {
+                DeviceObjectInfo::new(
                     device_id,
                     stream_id,
                     volume_control_id,
-                    uid: device.uid.clone(),
-                    name: device.name.clone(),
-                    kind: device.kind.clone(),
-                    channels: device.channels,
-                    hidden: device.hidden,
-                    volume_scalar: 1.0,
-                    io_running: false,
-                    sample_time_frames: 0,
-                    zero_ts_seed: 0,
-                },
+                    device.uid.clone(),
+                    device.name.clone(),
+                    device.kind.clone(),
+                    device.channels,
+                    device.hidden,
+                ),
             );
         } else if let Some(existing) = reg.devices.get_mut(&device.uid) {
             let volume_supported = !device.kind.contains("input");
             let needs_new_control = volume_supported && existing.volume_control_id.is_none();
             let removed_control = !volume_supported && existing.volume_control_id.is_some();
+            let shape_changed =
+                existing.channels != device.channels || existing.kind != device.kind;
             existing.name = device.name.clone();
             existing.kind = device.kind.clone();
             existing.channels = device.channels;
             existing.hidden = device.hidden;
+            existing
+                .rt
+                .channels
+                .store(device.channels, Ordering::Relaxed);
+            existing
+                .rt
+                .is_input
+                .store(device.kind.contains("input"), Ordering::Relaxed);
+            if shape_changed {
+                // The cached ring was created for the old shape; drop it so
+                // the next StartIO recreates it with the new spec.
+                existing.rt.ring.store(None);
+            }
             if removed_control {
                 existing.volume_control_id = None;
-                existing.volume_scalar = 1.0;
+                existing.rt.set_volume_scalar(1.0);
                 structure_changed_device_ids.push(existing.device_id);
             }
             if needs_new_control {
@@ -2141,6 +2254,7 @@ fn sync_object_registry() {
         }
     }
 
+    publish_rt_snapshot(&reg);
     drop(reg);
     drop(state);
 
