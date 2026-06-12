@@ -59,6 +59,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `MarsClient::logs()/logs_once()`
 - `MarsClient::doctor()`
 
+## Runtime install management
+
+The `mars_sdk::runtime` module manages the installed runtime itself
+(package verification, install/update/uninstall, and a read-only
+`runtime_status()` state machine). See
+[installer-embedding.md](installer-embedding.md) for the full embedding
+guide.
+
 ## Example
 
 Run the bundled example:
