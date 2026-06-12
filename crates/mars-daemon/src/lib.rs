@@ -1176,16 +1176,89 @@ impl MarsDaemon {
     }
 
     fn doctor_report_internal(&self) -> mars_types::DoctorReport {
+        const ENUMERATION_DEADLINE: Duration = Duration::from_secs(3);
+
+        struct EnumerationFindings {
+            driver_loaded: bool,
+            driver: DriverStatusSummary,
+            driver_version: Option<String>,
+            mic_permission: Option<bool>,
+            capture_tap_supported: bool,
+            capture_note: Option<String>,
+            stub_active: bool,
+        }
+
         let driver_installed = Path::new("/Library/Audio/Plug-Ins/HAL/mars.driver").exists();
         let daemon_reachable = true;
-        let driver_loaded = if driver_installed {
-            mars_hal_client::is_driver_loaded()
-        } else {
-            false
-        };
-        let driver = driver_status_summary();
         let daemon_version = env!("CARGO_PKG_VERSION").to_string();
-        let driver_version = read_driver_version();
+
+        // CoreAudio enumeration (driver plugin lookup, TCC probe, tap
+        // capability probe) can block indefinitely while coreaudiod restarts.
+        // Run it on a detached worker with a hard deadline so doctor always
+        // returns; on timeout the report carries an `enumeration_timed_out`
+        // marker instead of hanging.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("doctor-enumeration".to_string())
+            .spawn(move || {
+                let driver_loaded = if driver_installed {
+                    mars_hal_client::is_driver_loaded()
+                } else {
+                    false
+                };
+                let driver = driver_status_summary();
+                let driver_version = read_driver_version();
+                let mic_permission = detect_microphone_permission();
+                let (capture_tap_supported, capture_note) = match probe_capture_capability() {
+                    Ok(capability) => {
+                        let supported = capability.supported;
+                        let note = if supported {
+                            None
+                        } else {
+                            Some(capability.reason.unwrap_or_else(|| {
+                                "CoreAudio tap APIs are unavailable for process/system capture"
+                                    .to_string()
+                            }))
+                        };
+                        (supported, note)
+                    }
+                    Err(error) => (
+                        false,
+                        Some(format!("failed to probe capture tap capability: {error}")),
+                    ),
+                };
+                let stub_active = driver_stub_active();
+                let _ = sender.send(EnumerationFindings {
+                    driver_loaded,
+                    driver,
+                    driver_version,
+                    mic_permission,
+                    capture_tap_supported,
+                    capture_note,
+                    stub_active,
+                });
+            });
+        let findings = match spawned {
+            // Dropping the handle detaches the worker; a stuck enumeration
+            // thread must never block the IPC response.
+            Ok(_handle) => receiver.recv_timeout(ENUMERATION_DEADLINE).ok(),
+            Err(_) => None,
+        };
+        let enumeration_timed_out = findings.is_none();
+        let findings = findings.unwrap_or(EnumerationFindings {
+            driver_loaded: false,
+            driver: DriverStatusSummary::default(),
+            driver_version: None,
+            mic_permission: None,
+            capture_tap_supported: false,
+            capture_note: None,
+            stub_active: false,
+        });
+
+        let driver_loaded = findings.driver_loaded;
+        let driver = findings.driver;
+        let driver_version = findings.driver_version;
+        let capture_tap_supported = findings.capture_tap_supported;
         let driver_compatible = is_driver_compatible(
             driver_installed,
             driver_loaded,
@@ -1199,55 +1272,47 @@ impl MarsDaemon {
             .unwrap_or(false);
         let (microphone_permission_ok, mic_permission_source) = if env_assume_mic {
             (true, "env_override".to_string())
-        } else if let Some(status) = detect_microphone_permission() {
+        } else if let Some(status) = findings.mic_permission {
             (status, "tcc".to_string())
         } else {
             (false, "unknown".to_string())
         };
 
-        let capture_capability = probe_capture_capability();
-        let capture_tap_supported = capture_capability
-            .as_ref()
-            .map(|capability| capability.supported)
-            .unwrap_or(false);
-
         let mut notes = Vec::new();
         if !driver_installed {
             notes.push("driver not found at /Library/Audio/Plug-Ins/HAL/mars.driver".to_string());
         }
-        if driver_installed && !driver_loaded {
-            notes.push("mars.driver is installed but not loaded by coreaudiod; run: sudo killall -9 coreaudiod".to_string());
-        }
-        if !microphone_permission_ok {
-            notes.push(
-                "microphone permission is not granted or could not be verified; check System Settings > Privacy & Security > Microphone".to_string(),
-            );
-        }
-        if !driver_compatible {
+        if enumeration_timed_out {
             notes.push(format!(
-                "driver/daemon version mismatch: driver={:?}, daemon={}",
-                driver_version, daemon_version
+                "enumeration_timed_out: CoreAudio device enumeration did not complete within {}s; driver, microphone, and capture findings are unavailable",
+                ENUMERATION_DEADLINE.as_secs()
             ));
-        }
-        if driver_stub_active() {
-            notes.push(
-                "driver stub mode active: profile apply can proceed but virtual devices will not be registered in system audio".to_string(),
-            );
+        } else {
+            if driver_installed && !driver_loaded {
+                notes.push("mars.driver is installed but not loaded by coreaudiod; run: sudo killall -9 coreaudiod".to_string());
+            }
+            if !microphone_permission_ok {
+                notes.push(
+                    "microphone permission is not granted or could not be verified; check System Settings > Privacy & Security > Microphone".to_string(),
+                );
+            }
+            if !driver_compatible {
+                notes.push(format!(
+                    "driver/daemon version mismatch: driver={:?}, daemon={}",
+                    driver_version, daemon_version
+                ));
+            }
+            if findings.stub_active {
+                notes.push(
+                    "driver stub mode active: profile apply can proceed but virtual devices will not be registered in system audio".to_string(),
+                );
+            }
+            if let Some(note) = findings.capture_note {
+                notes.push(note);
+            }
         }
         if driver.pending_change {
             notes.push("driver has a pending configuration change".to_string());
-        }
-        match capture_capability {
-            Ok(capability) => {
-                if !capability.supported {
-                    notes.push(capability.reason.unwrap_or_else(|| {
-                        "CoreAudio tap APIs are unavailable for process/system capture".to_string()
-                    }));
-                }
-            }
-            Err(error) => {
-                notes.push(format!("failed to probe capture tap capability: {error}"));
-            }
         }
 
         let state = self.state.lock();
