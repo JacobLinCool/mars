@@ -1846,6 +1846,9 @@ fn driver_runtime_stats() -> Option<HalRuntimeStats> {
             overrun_count: stats.overrun_count,
             xrun_count: stats.xrun_count,
             last_callback_ns: stats.last_callback_ns,
+            start_io_count: stats.start_io_count,
+            zero_timestamp_count: stats.zero_timestamp_count,
+            do_io_count: stats.do_io_count,
         }),
         Err(error) => {
             warn!(error = %error, "failed to query driver runtime stats");

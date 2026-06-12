@@ -112,6 +112,20 @@ impl CaptureRuntime {
             return Err(format!("capture taps are unsupported: {reason}"));
         }
 
+        // Nothing to match against when no taps are configured — skip the
+        // process enumeration entirely so profiles without captures never
+        // depend on (or pay for) process-object discovery.
+        if configured_taps == 0 {
+            return Ok(Self {
+                backend,
+                active: Vec::new(),
+                status: CaptureRuntimeStatus {
+                    supported: true,
+                    ..CaptureRuntimeStatus::default()
+                },
+            });
+        }
+
         let mut processes = backend
             .list_processes()
             .map_err(|error| format!("failed to enumerate CoreAudio process objects: {error}"))?;

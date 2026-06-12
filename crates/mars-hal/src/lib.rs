@@ -46,6 +46,15 @@ pub struct RuntimeStats {
     pub overrun_count: u64,
     pub xrun_count: u64,
     pub last_callback_ns: u64,
+    /// Diagnostic: StartIO invocations in this plugin instance.
+    #[serde(default)]
+    pub start_io_count: u64,
+    /// Diagnostic: GetZeroTimeStamp invocations in this plugin instance.
+    #[serde(default)]
+    pub zero_timestamp_count: u64,
+    /// Diagnostic: DoIOOperation invocations in this plugin instance.
+    #[serde(default)]
+    pub do_io_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -150,6 +159,9 @@ pub(crate) struct AtomicRuntimeStats {
     pub(crate) overrun_count: AtomicU64,
     pub(crate) xrun_count: AtomicU64,
     pub(crate) last_callback_ns: AtomicU64,
+    pub(crate) start_io_count: AtomicU64,
+    pub(crate) zero_timestamp_count: AtomicU64,
+    pub(crate) do_io_count: AtomicU64,
 }
 
 impl AtomicRuntimeStats {
@@ -159,6 +171,9 @@ impl AtomicRuntimeStats {
             overrun_count: self.overrun_count.load(Ordering::Relaxed),
             xrun_count: self.xrun_count.load(Ordering::Relaxed),
             last_callback_ns: self.last_callback_ns.load(Ordering::Relaxed),
+            start_io_count: self.start_io_count.load(Ordering::Relaxed),
+            zero_timestamp_count: self.zero_timestamp_count.load(Ordering::Relaxed),
+            do_io_count: self.do_io_count.load(Ordering::Relaxed),
         }
     }
 }
@@ -168,6 +183,9 @@ pub(crate) static RUNTIME_STATS: AtomicRuntimeStats = AtomicRuntimeStats {
     overrun_count: AtomicU64::new(0),
     xrun_count: AtomicU64::new(0),
     last_callback_ns: AtomicU64::new(0),
+    start_io_count: AtomicU64::new(0),
+    zero_timestamp_count: AtomicU64::new(0),
+    do_io_count: AtomicU64::new(0),
 };
 
 impl Default for DriverState {

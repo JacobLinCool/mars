@@ -569,9 +569,42 @@ fn zero_timestamp_tracks_monotonic_sample_time_and_seed() {
         )
     };
     assert_eq!(ts_status, K_AUDIO_HARDWARE_NO_ERROR);
-    assert_eq!(sample_time, 2.0);
+    // The zero timestamp is derived from the host clock (the device is the
+    // clock source for its IO graph): sample_time is a whole number of
+    // periods and host_time is anchored, never zero.
+    assert!(sample_time >= 0.0);
+    assert_eq!(
+        sample_time % 1.0,
+        0.0,
+        "sample time sits on a period boundary"
+    );
     assert!(host_time > 0);
     assert!(seed_after_start >= 1);
+
+    // Real time elapsing must advance the zero timestamp even without IO —
+    // wait at least one period (256 frames @ 48kHz ≈ 5.3ms).
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let mut later_sample_time = -1.0_f64;
+    let mut later_host_time = 0_u64;
+    let mut later_seed = 0_u64;
+    // SAFETY: output pointers are valid.
+    let ts_status_later = unsafe {
+        plugin_get_zero_time_stamp(
+            core::ptr::null_mut(),
+            device_id,
+            1,
+            &mut later_sample_time,
+            &mut later_host_time,
+            &mut later_seed,
+        )
+    };
+    assert_eq!(ts_status_later, K_AUDIO_HARDWARE_NO_ERROR);
+    assert!(
+        later_sample_time > sample_time,
+        "device clock must advance with real time ({later_sample_time} <= {sample_time})"
+    );
+    assert!(later_host_time >= host_time);
+    let sample_time = later_sample_time;
 
     // SAFETY: test passes valid object id and ignores driver pointer.
     let stop_status = unsafe { plugin_stop_io(core::ptr::null_mut(), device_id, 1) };
@@ -592,7 +625,7 @@ fn zero_timestamp_tracks_monotonic_sample_time_and_seed() {
         )
     };
     assert_eq!(ts_status_after_stop, K_AUDIO_HARDWARE_NO_ERROR);
-    assert_eq!(sample_time_after_stop, sample_time);
+    assert!(sample_time_after_stop >= sample_time);
     assert!(seed_after_stop > seed_after_start);
 
     remove_test_device(&uid);

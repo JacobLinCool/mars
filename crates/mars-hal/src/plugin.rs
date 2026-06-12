@@ -115,6 +115,13 @@ struct RtDeviceState {
     volume_scalar_bits: AtomicU32,
     sample_time_frames: AtomicU64,
     zero_ts_seed: AtomicU64,
+    /// Host-clock anchor captured at StartIO; the zero timestamp is derived
+    /// from it so the device acts as a proper CoreAudio clock source.
+    anchor_host_time: AtomicU64,
+    /// Host ticks per zero-timestamp period (precomputed off the RT path).
+    host_ticks_per_period: AtomicU64,
+    /// Frames per zero-timestamp period.
+    frames_per_period: AtomicU64,
     /// Ring handle cached by `plugin_start_io` so the realtime callback does
     /// no name construction, hashing, or registry lookup.
     ring: ArcSwapOption<Mutex<crate::shm_backend::SharedRing>>,
@@ -128,6 +135,9 @@ impl RtDeviceState {
             volume_scalar_bits: AtomicU32::new(1.0_f32.to_bits()),
             sample_time_frames: AtomicU64::new(0),
             zero_ts_seed: AtomicU64::new(0),
+            anchor_host_time: AtomicU64::new(0),
+            host_ticks_per_period: AtomicU64::new(0),
+            frames_per_period: AtomicU64::new(0),
             ring: ArcSwapOption::const_empty(),
         }
     }
@@ -663,6 +673,7 @@ fn device_has_property_for(object_id: AudioObjectID, addr: &AudioObjectPropertyA
             | K_AUDIO_DEVICE_PROPERTY_CLOCK_DOMAIN
             | K_AUDIO_DEVICE_PROPERTY_IS_ALIVE
             | K_AUDIO_DEVICE_PROPERTY_IS_RUNNING
+            | K_AUDIO_DEVICE_PROPERTY_BUFFER_FRAME_SIZE_RANGE
             | K_AUDIO_DEVICE_PROPERTY_PREFERRED_CHANNELS_FOR_STEREO
     )
 }
@@ -1104,6 +1115,7 @@ unsafe extern "C" fn plugin_start_io(
     // Read device info, then drop the registry lock before acquiring DRIVER_STATE
     // to maintain consistent lock ordering (DRIVER_STATE → object_registry) and
     // avoid deadlock with `sync_object_registry`.
+    RUNTIME_STATS.start_io_count.fetch_add(1, Ordering::Relaxed);
     let (uid, ring_token, channels, is_input, rt) = {
         let reg = PLUGIN.object_registry.lock();
         let Some(dev) = reg.find_device_by_object(device_object_id) else {
@@ -1137,10 +1149,40 @@ unsafe extern "C" fn plugin_start_io(
     let Ok(ring_handle) = global_registry().create_or_open(&name, spec) else {
         return K_AUDIO_HARDWARE_ILLEGAL_OPERATION_ERROR;
     };
+    // Live-stream semantics for virtual inputs: a fresh IO session must not
+    // replay audio the producer wrote before the stream started, so the
+    // consumer drops any backlog at StartIO (non-RT path; lock is fine).
+    if is_input {
+        let dropped = ring_handle.lock().drop_backlog();
+        let _ = dropped;
+    }
+
     // Cache the ring handle for the realtime callback: StartIO is the only
     // point where the ring is guaranteed to exist, and caching here removes
     // all name construction and registry lookups from the IO hot path.
     rt.ring.store(Some(ring_handle));
+
+    // Arm the device clock: the zero timestamp must advance in real time from
+    // a host-clock anchor (the device IS the clock source for its IO graph);
+    // deriving it from processed-frame counts stalls the HAL IO engine and
+    // DoIOOperation is never invoked.
+    let mut timebase = MachTimebaseInfo::default();
+    // SAFETY: mach_timebase_info with a valid out pointer is always safe.
+    let _ = unsafe { mach_timebase_info(&mut timebase) };
+    let period_frames = u64::from(spec.capacity_frames / 8).max(1);
+    let period_ns =
+        period_frames.saturating_mul(1_000_000_000) / u64::from(spec.sample_rate.max(1));
+    let ticks_per_period = if timebase.numer == 0 {
+        period_ns
+    } else {
+        period_ns.saturating_mul(u64::from(timebase.denom)) / u64::from(timebase.numer.max(1))
+    };
+    rt.frames_per_period.store(period_frames, Ordering::Relaxed);
+    rt.host_ticks_per_period
+        .store(ticks_per_period.max(1), Ordering::Relaxed);
+    // SAFETY: mach_absolute_time is always safe to call on macOS.
+    rt.anchor_host_time
+        .store(unsafe { mach_absolute_time() }, Ordering::Relaxed);
     rt.reset_timeline();
 
     // Re-acquire registry to set io_running.
@@ -1177,21 +1219,37 @@ unsafe extern "C" fn plugin_get_zero_time_stamp(
     }
 
     // Realtime context: resolve through the lock-free snapshot; never block.
+    RUNTIME_STATS
+        .zero_timestamp_count
+        .fetch_add(1, Ordering::Relaxed);
     let snapshot = RT_DEVICES.load();
     let Some(device) = snapshot.get(&device_object_id) else {
         return K_AUDIO_HARDWARE_BAD_OBJECT_ERROR;
     };
     // Acquire on the seed pairs with the Release in `reset_timeline`: a reader
-    // observing a new seed also observes the reset sample time.
+    // observing a new seed also observes the armed clock fields.
     let seed = device.zero_ts_seed.load(Ordering::Acquire);
-    let sample_time_frames = device.sample_time_frames.load(Ordering::Relaxed);
+    let anchor = device.anchor_host_time.load(Ordering::Relaxed);
+    let ticks_per_period = device.host_ticks_per_period.load(Ordering::Relaxed);
+    let frames_per_period = device.frames_per_period.load(Ordering::Relaxed);
 
-    // Use mach_absolute_time for host time.
+    // The device is the clock source for its IO graph: report the most
+    // recent period boundary as a (sample_time, host_time) pair derived from
+    // the host clock. All loads are atomics — this path stays RT-safe.
     // SAFETY: mach_absolute_time is always safe to call on macOS.
-    let host_time = unsafe { mach_absolute_time() };
+    let now = unsafe { mach_absolute_time() };
+    let (sample_time, host_time) = if anchor == 0 || ticks_per_period == 0 {
+        (0.0, now)
+    } else {
+        let periods = now.saturating_sub(anchor) / ticks_per_period;
+        (
+            (periods.saturating_mul(frames_per_period)) as f64,
+            anchor.saturating_add(periods.saturating_mul(ticks_per_period)),
+        )
+    };
     // SAFETY: all output pointers verified non-null above.
     unsafe {
-        *out_sample_time = sample_time_frames as f64;
+        *out_sample_time = sample_time;
         *out_host_time = host_time;
         *out_seed = seed;
     }
@@ -1248,6 +1306,7 @@ unsafe extern "C" fn plugin_do_io_operation(
     // Realtime context: no blocking locks, no allocation, no name hashing.
     // The device is resolved through the lock-free snapshot and the ring
     // handle was cached by `plugin_start_io`.
+    RUNTIME_STATS.do_io_count.fetch_add(1, Ordering::Relaxed);
     let snapshot = RT_DEVICES.load();
     let Some(dev) = snapshot.get(&device_object_id) else {
         return K_AUDIO_HARDWARE_BAD_OBJECT_ERROR;
@@ -1599,9 +1658,8 @@ fn device_property_data_size(
         | K_AUDIO_DEVICE_PROPERTY_IS_RUNNING
         | K_AUDIO_DEVICE_PROPERTY_ZERO_TIME_STAMP_PERIOD => size_of::<UInt32>() as UInt32,
         K_AUDIO_DEVICE_PROPERTY_NOMINAL_SAMPLE_RATE => size_of::<Float64>() as UInt32,
-        K_AUDIO_DEVICE_PROPERTY_AVAILABLE_NOMINAL_SAMPLE_RATES => {
-            size_of::<AudioValueRange>() as UInt32
-        }
+        K_AUDIO_DEVICE_PROPERTY_AVAILABLE_NOMINAL_SAMPLE_RATES
+        | K_AUDIO_DEVICE_PROPERTY_BUFFER_FRAME_SIZE_RANGE => size_of::<AudioValueRange>() as UInt32,
         K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR
         | K_AUDIO_DEVICE_PROPERTY_VOLUME_DECIBELS
         | K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR_TO_DECIBELS
@@ -1753,6 +1811,18 @@ unsafe fn device_get_property(
         K_AUDIO_DEVICE_PROPERTY_ZERO_TIME_STAMP_PERIOD => unsafe {
             write_val::<UInt32>(buffer_frames, data_size, out_data_size, data)
         },
+        K_AUDIO_DEVICE_PROPERTY_BUFFER_FRAME_SIZE_RANGE => {
+            // Clients may use any IO size up to a quarter of the ring (the
+            // ring holds 8x the nominal buffer), so HAL-side reads can never
+            // outrun the producer at a supported size. Without this property
+            // CoreAudio synthesizes a bogus tiny range and standard clients
+            // (cpal, AVAudioEngine) fail to open the stream.
+            let range = AudioValueRange {
+                m_minimum: 16.0,
+                m_maximum: f64::from(buffer_frames.saturating_mul(4)),
+            };
+            unsafe { write_val::<AudioValueRange>(range, data_size, out_data_size, data) }
+        }
         K_AUDIO_DEVICE_PROPERTY_NOMINAL_SAMPLE_RATE => unsafe {
             write_val::<Float64>(sample_rate, data_size, out_data_size, data)
         },
@@ -2431,6 +2501,15 @@ unsafe extern "C" {
     fn CFDataGetLength(data: *const c_void) -> isize;
 
     fn mach_absolute_time() -> u64;
+
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
 }
 
 const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
