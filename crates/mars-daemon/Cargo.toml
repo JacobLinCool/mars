@@ -21,6 +21,7 @@ chrono.workspace = true
 clap.workspace = true
 crossbeam-queue.workspace = true
 dirs.workspace = true
+libc.workspace = true
 mars-coreaudio = { path = "../mars-coreaudio" }
 mars-audio-tap = { path = "../mars-audio-tap" }
 mars-engine = { path = "../mars-engine" }

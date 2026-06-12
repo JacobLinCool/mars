@@ -1,7 +1,10 @@
-#![forbid(unsafe_code)]
+// `deny` instead of `forbid` so the render QoS module can opt into the one
+// pthread FFI call it needs; everything else stays unsafe-free.
+#![deny(unsafe_code)]
 //! marsd daemon implementation.
 
 pub mod capture_runtime;
+mod render_qos;
 pub mod sink_runtime;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -224,6 +227,7 @@ impl RenderRuntime {
         let handle = std::thread::Builder::new()
             .name("marsd-render".to_string())
             .spawn(move || {
+                render_qos::promote_render_thread_qos();
                 run_render_loop(
                     engine,
                     thread_config,
@@ -325,6 +329,10 @@ fn run_render_loop(
         .iter()
         .map(|endpoint| (endpoint.clone(), None))
         .collect::<Vec<(RenderEndpoint, Option<mars_shm::SharedRingHandle>)>>();
+
+    // Absolute deadline of the next cycle start; stepped by `period` every
+    // cycle so sleep wake-up latency does not accumulate as drift.
+    let mut next_deadline = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
         let started = Instant::now();
@@ -452,13 +460,22 @@ fn run_render_loop(
         let cycle_ns = started.elapsed().as_nanos() as u64;
         metrics.last_cycle_ns.store(cycle_ns, Ordering::Relaxed);
         update_max_atomic(&metrics.max_cycle_ns, cycle_ns);
-        if cycle_ns > period.as_nanos() as u64 {
+
+        // Absolute-deadline pacing: sleep until `next_deadline` instead of
+        // `period - cycle` so wake-up latency is compensated on the next
+        // cycle. A deadline miss is a cycle that exceeded the period or a
+        // wake-up that landed past the absolute deadline.
+        next_deadline += period;
+        let now = Instant::now();
+        if cycle_ns > period.as_nanos() as u64 || now >= next_deadline {
             metrics.deadline_miss_count.fetch_add(1, Ordering::Relaxed);
+        }
+        if now < next_deadline {
+            std::thread::sleep(next_deadline - now);
         } else {
-            let remain = period.saturating_sub(Duration::from_nanos(cycle_ns));
-            if !remain.is_zero() {
-                std::thread::sleep(remain);
-            }
+            // Overrun: re-anchor one period ahead of now instead of chasing
+            // the missed deadlines with back-to-back cycles.
+            next_deadline = now + period;
         }
     }
 }

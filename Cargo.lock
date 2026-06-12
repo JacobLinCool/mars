@@ -827,6 +827,7 @@ dependencies = [
  "criterion",
  "crossbeam-queue",
  "dirs",
+ "libc",
  "mars-audio-tap",
  "mars-coreaudio",
  "mars-engine",
