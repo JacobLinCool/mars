@@ -29,9 +29,20 @@ thiserror.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true
+cpal.workspace = true
 tokio.workspace = true
 
 [[example]]
 name = "status"
 path = "examples/status.rs"
 required-features = ["default-socket-path"]
+
+[[example]]
+name = "virtual_mic_producer"
+path = "examples/virtual_mic_producer.rs"
+required-features = ["default-socket-path"]
+
+[[example]]
+name = "virtual_mic_reader"
+path = "examples/virtual_mic_reader.rs"
+
