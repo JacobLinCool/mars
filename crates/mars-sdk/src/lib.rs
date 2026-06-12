@@ -5,6 +5,7 @@
 //! matching the public daemon contract.
 
 pub mod runtime;
+pub mod virtual_input;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -12,11 +13,13 @@ use std::time::Duration;
 use mars_ipc::{Command, DaemonRequest, DaemonResponse, IpcClient};
 pub use mars_ipc::{IpcError, LogRequest, LogResponse};
 pub use mars_types::{
-    ApplyPlan, ApplyRequest, ApplyResult, CaptureProcessInfo, ClearRequest,
-    DEFAULT_SOCKET_PATH_RELATIVE, DaemonStatus, DeviceInventory, DoctorReport, ExitCode,
-    PlanRequest, ValidateRequest, ValidationReport,
+    AppVirtualInput, ApplyPlan, ApplyRequest, ApplyResult, CaptureProcessInfo, ClearRequest,
+    DEFAULT_SOCKET_PATH_RELATIVE, DaemonStatus, DeviceInventory, DoctorReport, EnsuredVirtualInput,
+    ExitCode, PlanRequest, ProducerKind, ProducerState, RemoveVirtualInputRequest, ValidateRequest,
+    ValidationReport, VirtualInputProducerStatus, VirtualInputStatusRequest,
 };
 use thiserror::Error;
+pub use virtual_input::{LiveWriter, VirtualMic};
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -51,6 +54,12 @@ pub enum MarsClientError {
 
     #[error("daemon returned unexpected response: expected {expected:?}, got {actual:?}")]
     UnexpectedResponse { expected: Command, actual: Command },
+
+    #[error("virtual input ring attach failed: {0}")]
+    RingAttachFailed(String),
+
+    #[error("live writer expects {expected} samples per frame group, got {actual}")]
+    SampleAlignment { expected: usize, actual: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +233,68 @@ impl MarsClient {
             other => Err(unexpected_response(Command::Doctor, &other)),
         }
     }
+
+    /// Ensure an app-owned virtual input exists and return a handle for
+    /// opening a live audio writer.
+    ///
+    /// The device is an app-scoped declarative lease: it persists across
+    /// daemon restarts, applies through the same atomic transaction as
+    /// profile changes, and conflicts (id/uid taken by the user profile or
+    /// another app) are rejected with a descriptive error. Idempotent per
+    /// `(app_id, id)`.
+    pub async fn ensure_virtual_input(
+        &self,
+        spec: AppVirtualInput,
+    ) -> Result<VirtualMic, MarsClientError> {
+        match self
+            .ipc
+            .send(DaemonRequest::EnsureVirtualInput(spec))
+            .await?
+        {
+            DaemonResponse::VirtualInputEnsured(ensured) => Ok(VirtualMic::new(ensured)),
+            other => Err(unexpected_response(Command::EnsureVirtualInput, &other)),
+        }
+    }
+
+    /// Remove an app-owned virtual input lease.
+    pub async fn remove_virtual_input(
+        &self,
+        app_id: &str,
+        id: &str,
+    ) -> Result<ApplyResult, MarsClientError> {
+        let request = RemoveVirtualInputRequest {
+            app_id: app_id.to_string(),
+            id: id.to_string(),
+        };
+        match self
+            .ipc
+            .send(DaemonRequest::RemoveVirtualInput(request))
+            .await?
+        {
+            DaemonResponse::VirtualInputRemoved(result) => Ok(result),
+            other => Err(unexpected_response(Command::RemoveVirtualInput, &other)),
+        }
+    }
+
+    /// Producer health for one app-owned virtual input.
+    pub async fn virtual_input_status(
+        &self,
+        app_id: &str,
+        id: &str,
+    ) -> Result<VirtualInputProducerStatus, MarsClientError> {
+        let request = VirtualInputStatusRequest {
+            app_id: app_id.to_string(),
+            id: id.to_string(),
+        };
+        match self
+            .ipc
+            .send(DaemonRequest::VirtualInputStatus(request))
+            .await?
+        {
+            DaemonResponse::VirtualInputStatus(status) => Ok(status),
+            other => Err(unexpected_response(Command::VirtualInputStatus, &other)),
+        }
+    }
 }
 
 fn path_to_utf8(path: &Path) -> Result<String, MarsClientError> {
@@ -251,6 +322,9 @@ const fn response_command(response: &DaemonResponse) -> Command {
         DaemonResponse::Processes(_) => Command::Processes,
         DaemonResponse::Logs(_) => Command::Logs,
         DaemonResponse::Doctor(_) => Command::Doctor,
+        DaemonResponse::VirtualInputEnsured(_) => Command::EnsureVirtualInput,
+        DaemonResponse::VirtualInputRemoved(_) => Command::RemoveVirtualInput,
+        DaemonResponse::VirtualInputStatus(_) => Command::VirtualInputStatus,
     }
 }
 

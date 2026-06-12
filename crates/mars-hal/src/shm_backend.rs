@@ -363,6 +363,32 @@ impl SharedRing {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Drop all unread frames (producer-side backlog clear).
+    ///
+    /// Advances `read_idx` to the current `write_idx` with compare-exchange
+    /// so a concurrent consumer advance is never rolled back. Returns the
+    /// number of frames dropped. Used by live writers on mode changes to
+    /// guarantee the consumer's next read starts at fresh audio.
+    pub fn drop_backlog(&self) -> u64 {
+        let read_atomic = self.atomic_u64(OFFSET_READ_IDX);
+        let write_idx = self.atomic_u64(OFFSET_WRITE_IDX).load(Ordering::Acquire);
+        let mut read_idx = read_atomic.load(Ordering::Acquire);
+        loop {
+            if read_idx >= write_idx {
+                return 0;
+            }
+            match read_atomic.compare_exchange(
+                read_idx,
+                write_idx,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return write_idx.wrapping_sub(read_idx),
+                Err(actual) => read_idx = actual,
+            }
+        }
+    }
+
     /// Write interleaved frames into the ring (producer side).
     ///
     /// Live drop-oldest semantics: when the ring is full the producer

@@ -961,6 +961,64 @@ pub struct DaemonStatus {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Downstream app request to ensure an app-owned virtual input exists.
+///
+/// Ensured devices live in an app-scoped declarative overlay merged into the
+/// effective configuration: each (app_id, id) pair is a lease the app owns,
+/// persisted across daemon restarts and applied through the same atomic
+/// transaction as profile changes.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct AppVirtualInput {
+    /// Owning application identifier (reverse-DNS recommended).
+    pub app_id: String,
+    /// Node id for this input (unique across the effective config).
+    pub id: String,
+    /// Human-visible device name.
+    pub name: String,
+    /// Stable device uid (drives ring naming and client device selection).
+    pub uid: String,
+    /// Sample rate; must match the effective audio configuration (48 kHz
+    /// today, see issue #48).
+    pub sample_rate: u32,
+    /// Interleaved channel count (mono first-class; multi-channel later).
+    pub channels: u16,
+    /// Producer ownership; `external_app` for downstream apps.
+    #[serde(default)]
+    pub producer: ProducerKind,
+}
+
+/// Request to remove an app-owned virtual input lease.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct RemoveVirtualInputRequest {
+    pub app_id: String,
+    pub id: String,
+}
+
+/// Request for the producer status of one app-owned virtual input.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct VirtualInputStatusRequest {
+    pub app_id: String,
+    pub id: String,
+}
+
+/// Result of ensuring an app-owned virtual input: everything an SDK writer
+/// needs to attach to the ring without knowing MARS naming internals.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct EnsuredVirtualInput {
+    /// Device uid.
+    pub uid: String,
+    /// Fully tagged logical ring name (encapsulates the capability token).
+    pub ring_name: String,
+    /// Ring sample rate.
+    pub sample_rate: u32,
+    /// Ring channel count.
+    pub channels: u16,
+    /// Ring capacity in frames.
+    pub capacity_frames: u32,
+    /// Producer health at ensure time.
+    pub producer: VirtualInputProducerStatus,
+}
+
 /// Health snapshot for an app-owned virtual input producer.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct VirtualInputProducerStatus {
