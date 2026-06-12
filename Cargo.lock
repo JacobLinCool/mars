@@ -938,6 +938,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "stats_alloc",
  "thiserror 2.0.18",
 ]
 

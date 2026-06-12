@@ -2461,3 +2461,69 @@ fn cfdata_create(bytes: &[u8]) -> *const c_void {
 #[allow(clippy::expect_used)]
 #[path = "plugin_tests.rs"]
 mod tests;
+
+/// Test-support probes for the realtime invariants integration test
+/// (`tests/rt_alloc_io.rs`). Hidden from docs; not part of the public API.
+#[doc(hidden)]
+pub mod rt_probe {
+    use std::ffi::c_void;
+
+    use super::*;
+
+    /// Insert a probe device, publish the RT snapshot, and run StartIO.
+    pub fn setup_probe_device(uid: &str, channels: u16) -> AudioObjectID {
+        let device_id = {
+            let mut reg = PLUGIN.object_registry.lock();
+            let device_id = reg.allocate_id();
+            let stream_id = reg.allocate_id();
+            reg.devices.insert(
+                uid.to_string(),
+                DeviceObjectInfo::new(
+                    device_id,
+                    stream_id,
+                    None,
+                    uid.to_string(),
+                    "RT Probe".to_string(),
+                    "virtual_output".to_string(),
+                    channels,
+                    false,
+                    String::new(),
+                ),
+            );
+            publish_rt_snapshot(&reg);
+            device_id
+        };
+        // SAFETY: test-only call with a valid device object id.
+        let status = unsafe { plugin_start_io(core::ptr::null_mut(), device_id, 1) };
+        assert_eq!(status, K_AUDIO_HARDWARE_NO_ERROR, "probe StartIO failed");
+        device_id
+    }
+
+    /// Run one WRITE_MIX IO cycle. Returns the callback status.
+    pub fn write_mix_cycle(device_id: AudioObjectID, buffer: &mut [f32], frames: u32) -> OSStatus {
+        // SAFETY: caller provides a buffer sized for `frames * channels`.
+        unsafe {
+            plugin_do_io_operation(
+                core::ptr::null_mut(),
+                device_id,
+                0,
+                0,
+                K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_WRITE_MIX,
+                frames,
+                core::ptr::null(),
+                buffer.as_mut_ptr().cast::<c_void>(),
+                core::ptr::null_mut(),
+            )
+        }
+    }
+
+    /// Remove the probe device and its rings.
+    pub fn teardown_probe_device(uid: &str) {
+        let mut reg = PLUGIN.object_registry.lock();
+        reg.devices.remove(uid);
+        publish_rt_snapshot(&reg);
+        drop(reg);
+        let _ = global_registry().remove(&stream_name_tagged(StreamDirection::Vout, uid, ""));
+        let _ = global_registry().remove(&stream_name_tagged(StreamDirection::Vin, uid, ""));
+    }
+}
