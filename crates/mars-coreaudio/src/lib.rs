@@ -1262,7 +1262,12 @@ impl ExternalIoRuntime {
         let mut output_endpoints = BTreeMap::new();
 
         for endpoint in inputs {
-            let queue = Arc::new(Mutex::new(VecDeque::<f32>::new()));
+            // Preallocate to the steady-state bound so push_samples never
+            // grows the queue inside the CoreAudio realtime callback.
+            let max_samples = buffer_frames as usize
+                * EXTERNAL_QUEUE_PERIODS
+                * usize::from(endpoint.channels).max(1);
+            let queue = Arc::new(Mutex::new(VecDeque::<f32>::with_capacity(max_samples + 1)));
             let runtime = Arc::new(Mutex::new(InputEndpointRuntime {
                 device_channels: endpoint.channels as usize,
                 phase: EndpointPhase::Degraded,
@@ -1294,12 +1299,15 @@ impl ExternalIoRuntime {
         }
 
         for endpoint in outputs {
-            let queue = Arc::new(Mutex::new(VecDeque::<f32>::new()));
+            // Preallocate to the steady-state bound so write_output_from never
+            // grows the queue while holding the lock shared with the callback.
+            let max_samples = buffer_frames as usize
+                * EXTERNAL_QUEUE_PERIODS
+                * usize::from(endpoint.channels).max(1);
+            let queue = Arc::new(Mutex::new(VecDeque::<f32>::with_capacity(max_samples + 1)));
             let runtime = Arc::new(Mutex::new(OutputEndpointRuntime {
                 device_channels: endpoint.channels as usize,
-                max_samples: buffer_frames as usize
-                    * EXTERNAL_QUEUE_PERIODS
-                    * usize::from(endpoint.channels).max(1),
+                max_samples,
                 phase: EndpointPhase::Degraded,
                 attempts: 0,
                 next_retry_at: None,
@@ -1388,49 +1396,46 @@ impl ExternalIoRuntime {
 
         match (device_channels, endpoint.node_channels) {
             (dc, nc) if dc == nc => {
-                for sample in out.iter_mut() {
-                    if let Some(value) = queue.pop_front() {
-                        *sample = value;
-                        ingested_frames = ingested_frames.saturating_add(1);
-                    } else {
-                        *sample = 0.0;
-                        had_missing = true;
-                    }
+                let taken = copy_front_samples(&mut queue, out);
+                if taken < out.len() {
+                    out[taken..].fill(0.0);
+                    had_missing = true;
                 }
-                ingested_frames /= endpoint.node_channels.max(1) as u64;
+                ingested_frames = (taken / endpoint.node_channels.max(1)) as u64;
             }
             (1, 2) => {
-                for frame in 0..frames {
-                    let value = if let Some(value) = queue.pop_front() {
-                        ingested_frames = ingested_frames.saturating_add(1);
-                        value
-                    } else {
-                        had_missing = true;
-                        0.0
-                    };
+                let taken = queue.len().min(frames);
+                for (frame, value) in queue.drain(0..taken).enumerate() {
                     out[frame * 2] = value;
                     out[frame * 2 + 1] = value;
                 }
+                if taken < frames {
+                    out[taken * 2..frames * 2].fill(0.0);
+                    had_missing = true;
+                }
+                ingested_frames = taken as u64;
             }
             (2, 1) => {
-                for sample in out.iter_mut().take(frames) {
-                    let left = if let Some(value) = queue.pop_front() {
-                        ingested_frames = ingested_frames.saturating_add(1);
-                        value
-                    } else {
-                        had_missing = true;
-                        0.0
-                    };
-                    let right = if let Some(value) = queue.pop_front() {
-                        ingested_frames = ingested_frames.saturating_add(1);
-                        value
-                    } else {
-                        had_missing = true;
-                        0.0
-                    };
+                let taken = queue.len().min(frames.saturating_mul(2));
+                let full_frames = taken / 2;
+                let mut drained = queue.drain(0..taken);
+                for sample in out.iter_mut().take(full_frames) {
+                    let left = drained.next().unwrap_or(0.0);
+                    let right = drained.next().unwrap_or(0.0);
                     *sample = (left + right) * 0.5;
                 }
-                ingested_frames /= 2;
+                if taken % 2 == 1 {
+                    // Odd trailing sample: treat the missing right channel as
+                    // silence, matching the previous per-sample behavior.
+                    let left = drained.next().unwrap_or(0.0);
+                    out[full_frames] = left * 0.5;
+                }
+                drop(drained);
+                if taken < frames.saturating_mul(2) {
+                    out[full_frames + taken % 2..frames].fill(0.0);
+                    had_missing = true;
+                }
+                ingested_frames = full_frames as u64;
             }
             _ => {
                 out.fill(0.0);
@@ -1473,34 +1478,49 @@ impl ExternalIoRuntime {
         let mut queue = endpoint.queue.lock();
         let mut overrun = false;
 
-        let mut push_sample = |sample: f32| {
-            queue.push_back(sample);
-            while queue.len() > max_samples {
-                let _ = queue.pop_front();
-                overrun = true;
-            }
+        // Compute the overflow once and drop the oldest queued samples up
+        // front, so the push paths below never need a per-sample length check
+        // while holding the lock shared with the CoreAudio callback.
+        let expanded_len = match (endpoint.node_channels, device_channels) {
+            (nc, dc) if nc == dc => data.len(),
+            (1, 2) => frames.saturating_mul(2),
+            (2, 1) => frames,
+            _ => 0,
         };
+        let needed = queue.len().saturating_add(expanded_len);
+        if needed > max_samples {
+            let excess = (needed - max_samples).min(queue.len());
+            queue.drain(0..excess);
+            overrun = true;
+        }
 
         match (endpoint.node_channels, device_channels) {
             (nc, dc) if nc == dc => {
-                for sample in data {
-                    push_sample(*sample);
-                }
+                queue.extend(data.iter().copied());
             }
             (1, 2) => {
                 for sample in data.iter().take(frames) {
-                    push_sample(*sample);
-                    push_sample(*sample);
+                    queue.push_back(*sample);
+                    queue.push_back(*sample);
                 }
             }
             (2, 1) => {
                 for frame in 0..frames {
                     let left = data.get(frame * 2).copied().unwrap_or(0.0);
                     let right = data.get(frame * 2 + 1).copied().unwrap_or(0.0);
-                    push_sample((left + right) * 0.5);
+                    queue.push_back((left + right) * 0.5);
                 }
             }
             _ => overrun = true,
+        }
+
+        // Defensive: a single block larger than the whole queue bound keeps
+        // only its newest samples (the pre-drain above cannot make room for
+        // more than max_samples).
+        if queue.len() > max_samples {
+            let excess = queue.len() - max_samples;
+            queue.drain(0..excess);
+            overrun = true;
         }
 
         if overrun {
@@ -2133,6 +2153,22 @@ fn build_output_stream_for_format(
     }
 }
 
+/// Copies up to `out.len()` samples from the front of `queue` into `out` and
+/// removes them, returning the number of samples copied. Bulk slice copies
+/// keep the lock hold time short and never allocate.
+fn copy_front_samples(queue: &mut VecDeque<f32>, out: &mut [f32]) -> usize {
+    let taken = queue.len().min(out.len());
+    let (front, back) = queue.as_slices();
+    if taken <= front.len() {
+        out[..taken].copy_from_slice(&front[..taken]);
+    } else {
+        out[..front.len()].copy_from_slice(front);
+        out[front.len()..taken].copy_from_slice(&back[..taken - front.len()]);
+    }
+    queue.drain(0..taken);
+    taken
+}
+
 fn push_samples(
     queue: &Arc<Mutex<VecDeque<f32>>>,
     samples: &[f32],
@@ -2142,13 +2178,22 @@ fn push_samples(
 ) -> bool {
     let mut overrun = false;
     if let Some(mut guard) = queue.try_lock() {
-        for sample in samples {
-            guard.push_back(*sample);
-            while guard.len() > max_samples {
-                let _ = guard.pop_front();
-                overrun = true;
-            }
+        // A single block larger than the whole queue bound keeps only its
+        // newest samples, matching the old push-then-trim policy.
+        let mut incoming = samples;
+        if incoming.len() > max_samples {
+            incoming = &incoming[incoming.len() - max_samples..];
+            overrun = true;
         }
+        // Compute the overflow once and drop the oldest queued samples before
+        // the bulk extend, so the queue never exceeds its preallocated
+        // capacity (no allocation inside the realtime callback).
+        let needed = guard.len().saturating_add(incoming.len());
+        if needed > max_samples {
+            guard.drain(0..needed - max_samples);
+            overrun = true;
+        }
+        guard.extend(incoming.iter().copied());
     } else {
         overrun = true;
     }
@@ -2167,13 +2212,10 @@ fn pop_samples(
 ) {
     let mut underrun = false;
     if let Some(mut guard) = queue.try_lock() {
-        for sample in out.iter_mut() {
-            if let Some(value) = guard.pop_front() {
-                *sample = value;
-            } else {
-                *sample = 0.0;
-                underrun = true;
-            }
+        let taken = copy_front_samples(&mut guard, out);
+        if taken < out.len() {
+            out[taken..].fill(0.0);
+            underrun = true;
         }
     } else {
         out.fill(0.0);
@@ -2188,9 +2230,19 @@ fn pop_samples(
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use mars_types::{DeviceMatch, ExternalDeviceInfo, TransportType};
+    use std::collections::VecDeque;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
 
-    use super::{build_probe_signal, estimate_latency_frames, find_match};
+    use mars_types::{DeviceMatch, ExternalDeviceInfo, TransportType};
+    use parking_lot::Mutex;
+
+    use super::{
+        build_probe_signal, copy_front_samples, estimate_latency_frames, find_match, pop_samples,
+        push_samples,
+    };
 
     fn candidate(
         uid: &str,
@@ -2310,5 +2362,76 @@ mod tests {
         let (offset, score) = estimate_latency_frames(&captured, &probe).expect("estimate");
         assert_eq!(offset, 177);
         assert!(score > 0.99, "score={score}");
+    }
+
+    #[test]
+    fn push_samples_drops_oldest_on_overflow() {
+        let queue = Arc::new(Mutex::new(VecDeque::with_capacity(5)));
+        let overrun = Arc::new(AtomicU64::new(0));
+        let xrun = Arc::new(AtomicU64::new(0));
+
+        assert!(!push_samples(&queue, &[1.0, 2.0, 3.0], 4, &overrun, &xrun));
+        assert!(push_samples(&queue, &[4.0, 5.0, 6.0], 4, &overrun, &xrun));
+
+        let contents = queue.lock().iter().copied().collect::<Vec<_>>();
+        assert_eq!(contents, vec![3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(overrun.load(Ordering::Relaxed), 1);
+        assert_eq!(xrun.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn push_samples_block_larger_than_bound_keeps_newest() {
+        let queue = Arc::new(Mutex::new(VecDeque::from([0.5])));
+        let overrun = Arc::new(AtomicU64::new(0));
+        let xrun = Arc::new(AtomicU64::new(0));
+
+        assert!(push_samples(
+            &queue,
+            &[1.0, 2.0, 3.0, 4.0, 5.0],
+            3,
+            &overrun,
+            &xrun
+        ));
+
+        let contents = queue.lock().iter().copied().collect::<Vec<_>>();
+        assert_eq!(contents, vec![3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn pop_samples_zero_fills_on_underrun() {
+        let queue = Arc::new(Mutex::new(VecDeque::from([1.0, 2.0])));
+        let underrun = Arc::new(AtomicU64::new(0));
+        let xrun = Arc::new(AtomicU64::new(0));
+        let mut out = [9.0_f32; 4];
+
+        pop_samples(&queue, &mut out, &underrun, &xrun);
+
+        assert_eq!(out, [1.0, 2.0, 0.0, 0.0]);
+        assert!(queue.lock().is_empty());
+        assert_eq!(underrun.load(Ordering::Relaxed), 1);
+        assert_eq!(xrun.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn copy_front_samples_handles_wrapped_queue() {
+        let mut queue = VecDeque::with_capacity(4);
+        let capacity = queue.capacity();
+        for index in 0..capacity {
+            queue.push_back(index as f32);
+        }
+        queue.pop_front();
+        queue.pop_front();
+        queue.push_back(100.0);
+        queue.push_back(101.0);
+        assert!(!queue.as_slices().1.is_empty(), "queue should wrap");
+
+        let mut expected = (2..capacity).map(|index| index as f32).collect::<Vec<_>>();
+        expected.extend([100.0, 101.0]);
+        let mut out = vec![0.0_f32; queue.len()];
+        let taken = copy_front_samples(&mut queue, &mut out);
+
+        assert_eq!(taken, expected.len());
+        assert_eq!(out, expected);
+        assert!(queue.is_empty());
     }
 }
