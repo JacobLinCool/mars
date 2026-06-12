@@ -521,7 +521,8 @@ pub fn measure_vin_ring_loopback_latency(
                     .write_interleaved(&output_interleaved[output_cursor..end])
                     .map_err(|error| CoreAudioError::Probe {
                         reason: format!("failed to write vout ring: {error}"),
-                    })?;
+                    })?
+                    .frames;
                 if written_frames > 0 {
                     output_cursor = output_cursor
                         .saturating_add(written_frames.saturating_mul(output_channels));
@@ -1000,7 +1001,8 @@ fn drain_ring(ring: &mars_shm::SharedRingHandle, channels: usize) -> Result<(), 
             .read_interleaved(&mut scratch)
             .map_err(|error| CoreAudioError::Probe {
                 reason: format!("failed to drain vin ring: {error}"),
-            })?;
+            })?
+            .frames;
         if read_frames == 0 {
             return Ok(());
         }
@@ -1025,7 +1027,8 @@ fn read_ring_samples(
         .read_interleaved(&mut scratch)
         .map_err(|error| CoreAudioError::Probe {
             reason: format!("failed to read vin ring: {error}"),
-        })?;
+        })?
+        .frames;
     let samples = read_frames.saturating_mul(channels.max(1));
     captured.extend_from_slice(&scratch[..samples.min(remaining)]);
     Ok(())
@@ -1061,8 +1064,7 @@ pub struct ExternalRuntimeSnapshot {
     pub input_endpoints: Vec<ExternalInputEndpointSnapshot>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ExternalEndpointHealth {
     Connected,
     Degraded,
@@ -1070,7 +1072,6 @@ pub enum ExternalEndpointHealth {
     #[default]
     Stopped,
 }
-
 
 #[derive(Debug, Clone, Default)]
 pub struct ExternalInputEndpointSnapshot {

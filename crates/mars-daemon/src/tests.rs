@@ -662,7 +662,8 @@ async fn daemon_ipc_shm_soak_survives_ring_churn_and_reports_deadline_pressure()
         let read_frames = vin
             .lock()
             .read_interleaved(&mut rendered)
-            .expect("read sink sample");
+            .expect("read sink sample")
+            .frames;
         if read_frames > 0 {
             saw_sink_frames = true;
         }

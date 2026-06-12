@@ -1241,7 +1241,6 @@ unsafe extern "C" fn plugin_do_io_operation(
 
     if let Some(ring_handle) = dev.ring.load_full() {
         if let Some(mut ring) = ring_handle.try_lock() {
-            let before = ring.header().ok();
             if operation_id == K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_WRITE_MIX {
                 // VOut: host wrote mixed audio into buffer -> push to SHM ring.
                 if !is_input && volume_scalar != 1.0 {
@@ -1249,25 +1248,32 @@ unsafe extern "C" fn plugin_do_io_operation(
                         *sample *= volume_scalar;
                     }
                 }
-                if ring.write_interleaved(buffer).is_err() {
-                    overrun_delta = overrun_delta.saturating_add(1);
-                    xrun_delta = xrun_delta.saturating_add(1);
+                // The transfer reports this call's xrun deltas directly, so
+                // the callback never re-reads the shared header (which would
+                // misattribute the peer process's xruns to this device).
+                match ring.write_interleaved(buffer) {
+                    Ok(transfer) => {
+                        overrun_delta = overrun_delta.saturating_add(transfer.overruns);
+                        xrun_delta = xrun_delta.saturating_add(transfer.overruns);
+                    }
+                    Err(_) => {
+                        overrun_delta = overrun_delta.saturating_add(1);
+                        xrun_delta = xrun_delta.saturating_add(1);
+                    }
                 }
             } else if operation_id == K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_READ_INPUT {
                 // VIn: pull audio from SHM ring -> host reads from buffer.
-                if ring.read_interleaved(buffer).is_err() {
-                    buffer.fill(0.0);
-                    underrun_delta = underrun_delta.saturating_add(1);
-                    xrun_delta = xrun_delta.saturating_add(1);
+                match ring.read_interleaved(buffer) {
+                    Ok(transfer) => {
+                        underrun_delta = underrun_delta.saturating_add(transfer.underruns);
+                        xrun_delta = xrun_delta.saturating_add(transfer.underruns);
+                    }
+                    Err(_) => {
+                        buffer.fill(0.0);
+                        underrun_delta = underrun_delta.saturating_add(1);
+                        xrun_delta = xrun_delta.saturating_add(1);
+                    }
                 }
-            }
-            let after = ring.header().ok();
-            if let (Some(before), Some(after)) = (before, after) {
-                let overrun = after.overrun_count.saturating_sub(before.overrun_count);
-                let underrun = after.underrun_count.saturating_sub(before.underrun_count);
-                overrun_delta = overrun_delta.saturating_add(overrun);
-                underrun_delta = underrun_delta.saturating_add(underrun);
-                xrun_delta = xrun_delta.saturating_add(overrun.saturating_add(underrun));
             }
         } else if operation_id == K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_WRITE_MIX {
             // Non-blocking policy: drop current frame on contention.

@@ -5,8 +5,8 @@
 //! all unsafe code remains centralized in `mars-hal`.
 
 pub use mars_hal::shm_backend::{
-    RING_MAGIC, RING_VERSION, RingError, RingHeader, RingRegistry, RingSpec, SharedRing,
-    SharedRingHandle, StreamDirection, global_registry, stream_name,
+    RING_MAGIC, RING_VERSION, RingError, RingHeader, RingRegistry, RingSpec, RingTransfer,
+    SharedRing, SharedRingHandle, StreamDirection, global_registry, stream_name,
 };
 
 #[cfg(test)]
@@ -44,7 +44,7 @@ mod tests {
             let mut out = [0.0_f32; 4];
             let mut reader = reader.lock();
             let got = reader.read_interleaved(&mut out).expect("read works");
-            assert_eq!(got, 2);
+            assert_eq!(got.frames, 2);
             assert_eq!(out, [0.1, 0.2, 0.3, 0.4]);
         }
 

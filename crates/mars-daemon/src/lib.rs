@@ -341,8 +341,8 @@ fn run_render_loop(
             if let Some(handle) = ring_handle {
                 let mut guard = handle.lock();
                 match guard.read_interleaved(samples) {
-                    Ok(read_frames) => {
-                        let keep = read_frames.saturating_mul(endpoint.channels as usize);
+                    Ok(transfer) => {
+                        let keep = transfer.frames.saturating_mul(endpoint.channels as usize);
                         if keep < samples.len() {
                             samples[keep..].fill(0.0);
                         }
