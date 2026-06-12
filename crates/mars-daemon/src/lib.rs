@@ -427,17 +427,19 @@ fn run_render_loop(
         }
 
         if let Some(external_runtime) = external_runtime.as_ref() {
-            let snapshot = external_runtime.snapshot();
-            *metrics.external_runtime.lock() = snapshot.status.clone();
+            // Counters-only fast path: reads three atomics without locks or
+            // allocation. The full status snapshot is assembled on demand by
+            // the IPC/status path instead of every render cycle.
+            let counters = external_runtime.counters();
             metrics
                 .external_underrun_count
-                .store(snapshot.counters.underrun_count, Ordering::Relaxed);
+                .store(counters.underrun_count, Ordering::Relaxed);
             metrics
                 .external_overrun_count
-                .store(snapshot.counters.overrun_count, Ordering::Relaxed);
+                .store(counters.overrun_count, Ordering::Relaxed);
             metrics
                 .external_xrun_count
-                .store(snapshot.counters.xrun_count, Ordering::Relaxed);
+                .store(counters.xrun_count, Ordering::Relaxed);
         }
 
         if inject_sleep_ms > 0 {
@@ -870,12 +872,15 @@ impl MarsDaemon {
             }
         }
 
-        if let Some(external_status) = self
-            .render_runtime
-            .lock()
-            .as_ref()
-            .map(|runtime| runtime.metrics.external_runtime.lock().clone())
-        {
+        if let Some(external_status) = self.render_runtime.lock().as_ref().map(|runtime| {
+            // The render loop no longer refreshes metrics.external_runtime
+            // every cycle; take a fresh status snapshot on this on-demand
+            // path instead.
+            runtime.external_runtime.as_ref().map_or_else(
+                || runtime.metrics.external_runtime.lock().clone(),
+                |external| external.snapshot().status,
+            )
+        }) {
             self.state.lock().external_runtime = external_status;
         }
         if let Some(sink_status) = self

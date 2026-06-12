@@ -1530,6 +1530,19 @@ impl ExternalIoRuntime {
         true
     }
 
+    /// Returns the global xrun counters by reading only atomics: no locks,
+    /// no allocation, safe to call from the render loop every cycle. Use
+    /// [`Self::snapshot`] for the full string-bearing status snapshot on the
+    /// IPC/status path.
+    #[must_use]
+    pub fn counters(&self) -> ExternalRuntimeCounters {
+        ExternalRuntimeCounters {
+            underrun_count: self.underrun_count.load(Ordering::Relaxed),
+            overrun_count: self.overrun_count.load(Ordering::Relaxed),
+            xrun_count: self.xrun_count.load(Ordering::Relaxed),
+        }
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> ExternalRuntimeSnapshot {
         let mut connected_inputs = 0usize;
