@@ -4,6 +4,7 @@
 //! Unsafe operations are intentionally concentrated in this crate.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use once_cell::sync::Lazy;
@@ -126,12 +127,43 @@ struct PendingChangeInternal {
 pub(crate) struct DriverState {
     pub(crate) desired_state: Option<DesiredState>,
     pub(crate) applied_state: AppliedState,
-    pub(crate) runtime: RuntimeStats,
     pub(crate) pending_change: Option<PendingChangeInternal>,
     pub(crate) current_generation: u64,
     pub(crate) request_count: u64,
     pub(crate) perform_count: u64,
 }
+
+/// Lock-free runtime counters updated from the realtime IO callback.
+///
+/// These live outside `DRIVER_STATE` so the realtime thread never blocks on
+/// the configuration mutex (which non-RT paths hold across serialization and
+/// syscalls). Monotonic counters need no lock; readers assemble a
+/// [`RuntimeStats`] snapshot from relaxed loads.
+#[derive(Debug)]
+pub(crate) struct AtomicRuntimeStats {
+    pub(crate) underrun_count: AtomicU64,
+    pub(crate) overrun_count: AtomicU64,
+    pub(crate) xrun_count: AtomicU64,
+    pub(crate) last_callback_ns: AtomicU64,
+}
+
+impl AtomicRuntimeStats {
+    pub(crate) fn snapshot(&self) -> RuntimeStats {
+        RuntimeStats {
+            underrun_count: self.underrun_count.load(Ordering::Relaxed),
+            overrun_count: self.overrun_count.load(Ordering::Relaxed),
+            xrun_count: self.xrun_count.load(Ordering::Relaxed),
+            last_callback_ns: self.last_callback_ns.load(Ordering::Relaxed),
+        }
+    }
+}
+
+pub(crate) static RUNTIME_STATS: AtomicRuntimeStats = AtomicRuntimeStats {
+    underrun_count: AtomicU64::new(0),
+    overrun_count: AtomicU64::new(0),
+    xrun_count: AtomicU64::new(0),
+    last_callback_ns: AtomicU64::new(0),
+};
 
 impl Default for DriverState {
     fn default() -> Self {
@@ -144,12 +176,6 @@ impl Default for DriverState {
                 buffer_frames: 256,
                 devices: Vec::new(),
                 shm_names: Vec::new(),
-            },
-            runtime: RuntimeStats {
-                underrun_count: 0,
-                overrun_count: 0,
-                xrun_count: 0,
-                last_callback_ns: 0,
             },
             pending_change: None,
             current_generation: 0,
@@ -255,13 +281,17 @@ pub fn configuration_summary_json() -> Result<String, HalError> {
 }
 
 pub fn applied_state_json() -> Result<String, HalError> {
-    let state = DRIVER_STATE.lock();
-    serde_json::to_string(&state.applied_state).map_err(HalError::Serialize)
+    // Clone under the lock, serialize outside: the realtime IO callback must
+    // never wait behind serde while this mutex is held.
+    let applied = {
+        let state = DRIVER_STATE.lock();
+        state.applied_state.clone()
+    };
+    serde_json::to_string(&applied).map_err(HalError::Serialize)
 }
 
 pub fn runtime_stats_json() -> Result<String, HalError> {
-    let state = DRIVER_STATE.lock();
-    serde_json::to_string(&state.runtime).map_err(HalError::Serialize)
+    serde_json::to_string(&RUNTIME_STATS.snapshot()).map_err(HalError::Serialize)
 }
 
 pub fn applied_devices() -> Vec<HalDevice> {

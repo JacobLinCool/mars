@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 use crate::coreaudio_types::*;
 use crate::shm_backend::{RingSpec, StreamDirection, global_registry, stream_name};
 use crate::{
-    DRIVER_STATE, applied_state_json, configuration_summary_json,
+    DRIVER_STATE, RUNTIME_STATS, applied_state_json, configuration_summary_json,
     perform_device_configuration_change, request_device_configuration_change, runtime_stats_json,
     set_desired_state_json,
 };
@@ -1184,16 +1184,29 @@ unsafe extern "C" fn plugin_do_io_operation(
         xrun_delta = xrun_delta.saturating_add(1);
     }
 
-    {
-        let mut state = DRIVER_STATE.lock();
-        state.runtime.underrun_count = state.runtime.underrun_count.saturating_add(underrun_delta);
-        state.runtime.overrun_count = state.runtime.overrun_count.saturating_add(overrun_delta);
-        state.runtime.xrun_count = state.runtime.xrun_count.saturating_add(xrun_delta);
-        let now_ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos() as u64);
-        state.runtime.last_callback_ns = now_ns;
+    // Lock-free stat updates: the realtime thread must never block behind the
+    // configuration mutex (held by non-RT paths across serialization/syscalls).
+    if underrun_delta > 0 {
+        RUNTIME_STATS
+            .underrun_count
+            .fetch_add(underrun_delta, Ordering::Relaxed);
     }
+    if overrun_delta > 0 {
+        RUNTIME_STATS
+            .overrun_count
+            .fetch_add(overrun_delta, Ordering::Relaxed);
+    }
+    if xrun_delta > 0 {
+        RUNTIME_STATS
+            .xrun_count
+            .fetch_add(xrun_delta, Ordering::Relaxed);
+    }
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+    RUNTIME_STATS
+        .last_callback_ns
+        .store(now_ns, Ordering::Relaxed);
 
     if operation_id == K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_WRITE_MIX
         || operation_id == K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_READ_INPUT
