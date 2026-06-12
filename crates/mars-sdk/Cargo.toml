@@ -21,6 +21,8 @@ workspace = true
 dirs = { workspace = true, optional = true }
 mars-ipc = { path = "../mars-ipc" }
 mars-types = { path = "../mars-types" }
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

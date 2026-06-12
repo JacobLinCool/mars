@@ -787,6 +787,7 @@ dependencies = [
  "mars-coreaudio",
  "mars-ipc",
  "mars-profile",
+ "mars-sdk",
  "mars-types",
  "serde",
  "serde_json",
@@ -935,6 +936,8 @@ dependencies = [
  "dirs",
  "mars-ipc",
  "mars-types",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
 ]

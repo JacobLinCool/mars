@@ -9,6 +9,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use mars_ipc::{DaemonRequest, DaemonResponse, IpcClient, LogRequest, LogResponse};
 use mars_profile::{TemplateKind, render_template};
+use mars_sdk::runtime;
 use mars_types::{
     ApplyRequest, CaptureProcessInfo, ClearRequest, DEFAULT_PROFILE_DIR_RELATIVE,
     DEFAULT_SOCKET_PATH_RELATIVE, DaemonStatus, DoctorReport, ExitCode, PlanRequest,
@@ -101,6 +102,17 @@ enum Commands {
         follow: bool,
     },
     Doctor,
+    /// Manage the installed MARS runtime (binaries, driver, LaunchAgent)
+    Runtime {
+        #[command(subcommand)]
+        command: RuntimeCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RuntimeCommands {
+    /// Report the installed runtime state without mutating anything
+    Status,
 }
 
 #[derive(Debug, Error)]
@@ -496,7 +508,46 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 ExitCode::DriverUnavailable
             })
         }
+        Commands::Runtime { command } => run_runtime_command(cli.json, command).await,
     }
+}
+
+async fn run_runtime_command(json: bool, command: RuntimeCommands) -> Result<ExitCode, CliError> {
+    let layout = runtime::RuntimeLayout::standard().map_err(|error| CliError::WithExit {
+        message: error.to_string(),
+        exit_code: ExitCode::InvalidInput,
+    })?;
+
+    match command {
+        RuntimeCommands::Status => {
+            let status = runtime::runtime_status(&layout, &runtime::StatusOptions::default()).await;
+            print_output(json, &status, || format_runtime_status(&status))?;
+            Ok(ExitCode::Success)
+        }
+    }
+}
+
+fn format_runtime_status(status: &runtime::RuntimeStatus) -> String {
+    let state = match status.state {
+        runtime::RuntimeState::Missing => "missing",
+        runtime::RuntimeState::InstalledNotRunning => "installed_not_running",
+        runtime::RuntimeState::Healthy => "healthy",
+        runtime::RuntimeState::Stale => "stale",
+        runtime::RuntimeState::Incompatible => "incompatible",
+    };
+    format!(
+        "state={} installed_version={} driver_version={} daemon_version={} protocol={} cli={} daemon_bin={} driver={} launch_agent={} responding={}",
+        state,
+        status.installed_version.as_deref().unwrap_or("<unknown>"),
+        status.driver_version.as_deref().unwrap_or("<unknown>"),
+        status.daemon_version.as_deref().unwrap_or("<unknown>"),
+        status.protocol_version,
+        status.cli_binary_installed,
+        status.daemon_binary_installed,
+        status.driver_bundle_installed,
+        status.launch_agent_installed,
+        status.daemon_responding
+    )
 }
 
 fn print_output<T>(json: bool, value: &T, human: impl FnOnce() -> String) -> Result<(), CliError>

@@ -4,6 +4,8 @@
 //! `MarsClient` wraps the low-level IPC transport and exposes typed operations
 //! matching the public daemon contract.
 
+pub mod runtime;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
