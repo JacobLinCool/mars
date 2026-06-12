@@ -206,8 +206,13 @@ impl RenderRuntime {
             None
         } else {
             Some(
-                SinkRuntime::start(config.sink_bindings.clone(), config.sample_rate, 256)
-                    .map_err(|error| format!("sink runtime startup failed: {error}"))?,
+                SinkRuntime::start(
+                    config.sink_bindings.clone(),
+                    config.sample_rate,
+                    config.buffer_frames as usize,
+                    256,
+                )
+                .map_err(|error| format!("sink runtime startup failed: {error}"))?,
             )
         };
         let sink_submitter = sink_runtime.as_ref().map(SinkRuntime::submitter);

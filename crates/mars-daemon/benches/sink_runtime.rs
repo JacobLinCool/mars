@@ -50,7 +50,7 @@ fn bench_sink_submit(c: &mut Criterion) {
             });
         }
 
-        let runtime = SinkRuntime::start(bindings, 48_000, 256).expect("sink runtime");
+        let runtime = SinkRuntime::start(bindings, 48_000, frames, 256).expect("sink runtime");
         let submitter = runtime.submitter();
         let rendered = rendered_sinks(sink_count, frames, channels);
 
@@ -90,7 +90,7 @@ fn bench_sink_backpressure(c: &mut Criterion) {
             format: FileSinkFormat::Wav,
         },
     }];
-    let runtime = SinkRuntime::start(bindings, 48_000, 4).expect("sink runtime");
+    let runtime = SinkRuntime::start(bindings, 48_000, frames, 4).expect("sink runtime");
     let submitter = runtime.submitter();
     let rendered = rendered_sinks(1, frames, channels);
 

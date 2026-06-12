@@ -7,6 +7,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use crossbeam_queue::ArrayQueue;
 use mars_types::{
     FileSinkFormat, SinkRuntimeHealth, SinkRuntimeKind, SinkRuntimeSinkStatus, SinkRuntimeStatus,
     StreamTransport,
@@ -14,6 +15,10 @@ use mars_types::{
 use parking_lot::Mutex;
 
 const WORKER_POLL_INTERVAL_MS: u64 = 25;
+/// Extra pooled buffers beyond the channel capacity: one buffer can be held
+/// by the render thread while composing a batch and one by the worker while
+/// writing, so `queue_capacity + 2` covers every in-flight buffer.
+const BUFFER_POOL_HEADROOM: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SinkBindingKind {
@@ -38,8 +43,12 @@ pub struct SinkBinding {
 
 #[derive(Debug)]
 struct SinkBatch {
-    sink_id: String,
+    /// Index into the bindings table resolved at submit time; the worker maps
+    /// it back to the sink id string for state bookkeeping.
+    sink_index: usize,
     frames: usize,
+    /// Buffer borrowed from the pool; its `len()` reflects the actual sample
+    /// count of this batch, the worker returns it to the pool after writing.
     samples: Vec<f32>,
 }
 
@@ -183,11 +192,14 @@ pub struct SinkRuntimeSubmitter {
     bindings: Vec<SinkBinding>,
     sender: SyncSender<SinkBatch>,
     state: Arc<Mutex<SinkRuntimeState>>,
+    /// Fixed-size freelist of pre-sized batch buffers shared with the worker;
+    /// pop/copy/send keeps the render-path submit free of heap allocation.
+    pool: Arc<ArrayQueue<Vec<f32>>>,
 }
 
 impl SinkRuntimeSubmitter {
     pub fn submit_rendered_sinks(&self, rendered_sinks: &HashMap<String, Vec<f32>>, frames: usize) {
-        for binding in &self.bindings {
+        for (sink_index, binding) in self.bindings.iter().enumerate() {
             let Some(data) = rendered_sinks.get(&binding.source) else {
                 self.state.lock().mark_sink_degraded(
                     &binding.id,
@@ -196,10 +208,20 @@ impl SinkRuntimeSubmitter {
                 continue;
             };
 
+            let Some(mut samples) = self.pool.pop() else {
+                // Pool exhaustion implies the channel is saturated as well
+                // (the pool covers channel capacity plus in-flight headroom),
+                // so account it like a queue-full drop.
+                self.state.lock().mark_drop(&binding.id, data.len());
+                continue;
+            };
+            samples.clear();
+            samples.extend_from_slice(data);
+
             let batch = SinkBatch {
-                sink_id: binding.id.clone(),
+                sink_index,
                 frames,
-                samples: data.clone(),
+                samples,
             };
             {
                 let mut state = self.state.lock();
@@ -208,15 +230,19 @@ impl SinkRuntimeSubmitter {
             match self.sender.try_send(batch) {
                 Ok(()) => {}
                 Err(TrySendError::Full(batch)) => {
+                    let dropped_samples = batch.samples.len();
+                    let _ = self.pool.push(batch.samples);
                     let mut state = self.state.lock();
                     state.queued_batches = state.queued_batches.saturating_sub(1);
-                    state.mark_drop(&binding.id, batch.samples.len());
+                    state.mark_drop(&binding.id, dropped_samples);
                 }
                 Err(TrySendError::Disconnected(batch)) => {
+                    let dropped_samples = batch.samples.len();
+                    let _ = self.pool.push(batch.samples);
                     let mut state = self.state.lock();
                     state.queued_batches = state.queued_batches.saturating_sub(1);
                     state.mark_sink_failed(&binding.id, "sink runtime worker disconnected");
-                    state.mark_drop(&binding.id, batch.samples.len());
+                    state.mark_drop(&binding.id, dropped_samples);
                 }
             }
         }
@@ -238,27 +264,44 @@ impl SinkRuntime {
     pub fn start(
         bindings: Vec<SinkBinding>,
         sample_rate: u32,
+        buffer_frames: usize,
         queue_capacity: usize,
     ) -> Result<Self, String> {
         let queue_capacity = queue_capacity.max(1);
         let state = Arc::new(Mutex::new(SinkRuntimeState::new(queue_capacity, &bindings)));
         let (sender, receiver) = sync_channel::<SinkBatch>(queue_capacity);
+
+        // Pre-size every pooled buffer to the largest per-cycle batch across
+        // bindings so steady-state submits never reallocate. The pool is
+        // rebuilt whenever the runtime restarts on reconfiguration.
+        let pool_buffer_samples = bindings
+            .iter()
+            .map(|binding| buffer_frames.saturating_mul(binding.channels as usize))
+            .max()
+            .unwrap_or(0);
+        let pool_capacity = queue_capacity.saturating_add(BUFFER_POOL_HEADROOM);
+        let pool = Arc::new(ArrayQueue::<Vec<f32>>::new(pool_capacity));
+        for _ in 0..pool_capacity {
+            let _ = pool.push(Vec::with_capacity(pool_buffer_samples));
+        }
+
         let submitter = Arc::new(SinkRuntimeSubmitter {
             bindings: bindings.clone(),
             sender,
             state: state.clone(),
+            pool: pool.clone(),
         });
-        let mut writers = HashMap::<String, Box<dyn SinkWriter>>::new();
+        let mut writers =
+            Vec::<(String, Option<Box<dyn SinkWriter>>)>::with_capacity(bindings.len());
 
         for binding in &bindings {
-            match &binding.kind {
+            let writer: Option<Box<dyn SinkWriter>> = match &binding.kind {
                 SinkBindingKind::File { path, format } => {
                     match FileSinkWriter::open(path, *format, sample_rate, binding.channels) {
-                        Ok(writer) => {
-                            writers.insert(binding.id.clone(), Box::new(writer));
-                        }
+                        Ok(writer) => Some(Box::new(writer)),
                         Err(error) => {
                             state.lock().mark_sink_failed(&binding.id, error);
+                            None
                         }
                     }
                 }
@@ -271,8 +314,10 @@ impl SinkRuntime {
                         "stream sink not implemented for transport={transport:?}, endpoint={endpoint}, options={options_json}"
                     );
                     state.lock().mark_sink_failed(&binding.id, message);
+                    None
                 }
-            }
+            };
+            writers.push((binding.id.clone(), writer));
         }
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -281,7 +326,7 @@ impl SinkRuntime {
         let handle = std::thread::Builder::new()
             .name("marsd-sink".to_string())
             .spawn(move || {
-                sink_worker_loop(receiver, writers, thread_state, thread_stop);
+                sink_worker_loop(receiver, writers, thread_state, thread_stop, pool);
             })
             .map_err(|error| format!("failed to spawn sink runtime thread: {error}"))?;
 
@@ -310,9 +355,10 @@ impl SinkRuntime {
 
 fn sink_worker_loop(
     receiver: Receiver<SinkBatch>,
-    mut writers: HashMap<String, Box<dyn SinkWriter>>,
+    mut writers: Vec<(String, Option<Box<dyn SinkWriter>>)>,
     state: Arc<Mutex<SinkRuntimeState>>,
     stop: Arc<AtomicBool>,
+    pool: Arc<ArrayQueue<Vec<f32>>>,
 ) {
     loop {
         match receiver.recv_timeout(Duration::from_millis(WORKER_POLL_INTERVAL_MS)) {
@@ -322,19 +368,22 @@ fn sink_worker_loop(
                     lock.queued_batches = lock.queued_batches.saturating_sub(1);
                 }
 
-                let Some(writer) = writers.get_mut(&batch.sink_id) else {
-                    state
+                match writers.get_mut(batch.sink_index) {
+                    Some((sink_id, Some(writer))) => {
+                        match writer.write_interleaved(&batch.samples, batch.frames) {
+                            Ok(()) => state.lock().mark_write_success(sink_id, batch.frames),
+                            Err(error) => state.lock().mark_write_error(sink_id, error),
+                        }
+                    }
+                    Some((sink_id, None)) => state
                         .lock()
-                        .mark_sink_failed(&batch.sink_id, "sink writer unavailable");
-                    continue;
-                };
-
-                match writer.write_interleaved(&batch.samples, batch.frames) {
-                    Ok(()) => state
-                        .lock()
-                        .mark_write_success(&batch.sink_id, batch.frames),
-                    Err(error) => state.lock().mark_write_error(&batch.sink_id, error),
+                        .mark_sink_failed(sink_id, "sink writer unavailable"),
+                    None => {}
                 }
+
+                // Return the buffer to the pool; a full pool only drops a
+                // recycled buffer, never samples.
+                let _ = pool.push(batch.samples);
             }
             Err(RecvTimeoutError::Timeout) => {
                 if stop.load(Ordering::Relaxed) {
@@ -346,8 +395,10 @@ fn sink_worker_loop(
     }
 
     for (sink_id, writer) in &mut writers {
-        if let Err(error) = writer.finalize() {
-            state.lock().mark_write_error(sink_id, error);
+        if let Some(writer) = writer.as_mut() {
+            if let Err(error) = writer.finalize() {
+                state.lock().mark_write_error(sink_id, error);
+            }
         }
     }
 }
@@ -683,6 +734,7 @@ mod tests {
                 },
             }],
             48_000,
+            256,
             2,
         )
         .expect("sink runtime");
@@ -716,6 +768,7 @@ mod tests {
                     },
                 }],
                 48_000,
+                128,
                 128,
             )
             .expect("sink runtime");
