@@ -24,7 +24,12 @@ struct Args {
     print_socket: bool,
 }
 
-#[tokio::main]
+// The async runtime only serves IPC requests and housekeeping; every audio
+// path runs on dedicated OS threads outside tokio (marsd-render, sink and
+// capture workers). The default worker count (one per core — 18 on larger
+// Apple Silicon machines) just burns thread stacks and per-thread malloc
+// magazines; two workers are ample.
+#[tokio::main(worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 

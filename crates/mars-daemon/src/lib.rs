@@ -2348,7 +2348,13 @@ pub fn setup_logging() -> anyhow::Result<tracing_appender::non_blocking::WorkerG
     fs::create_dir_all(&log_path).context("cannot create log directory")?;
 
     let file_appender = tracing_appender::rolling::never(log_path, "marsd.log");
-    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+    // The default buffered_lines_limit (128,000 slots × 32 B) preallocates a
+    // 4 MB channel — roughly half of marsd's idle footprint. 8K lines is
+    // generous for this daemon's log volume, and overflow stays lossy
+    // (never blocking) exactly as before.
+    let (non_blocking, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .buffered_lines_limit(8_192)
+        .finish(file_appender);
 
     tracing_subscriber::fmt()
         .with_writer(non_blocking)
