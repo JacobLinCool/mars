@@ -1061,8 +1061,7 @@ pub struct ExternalRuntimeSnapshot {
     pub input_endpoints: Vec<ExternalInputEndpointSnapshot>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ExternalEndpointHealth {
     Connected,
     Degraded,
@@ -1070,7 +1069,6 @@ pub enum ExternalEndpointHealth {
     #[default]
     Stopped,
 }
-
 
 #[derive(Debug, Clone, Default)]
 pub struct ExternalInputEndpointSnapshot {
