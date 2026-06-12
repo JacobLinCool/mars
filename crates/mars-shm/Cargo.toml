@@ -11,4 +11,9 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+dirs.workspace = true
 mars-hal = { path = "../mars-hal" }
+once_cell.workspace = true
+parking_lot.workspace = true
+serde_json.workspace = true
+uuid.workspace = true

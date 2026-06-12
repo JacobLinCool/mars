@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use mars_engine::{Engine, EngineSnapshot};
 use mars_graph::build_routing_graph;
-use mars_shm::{RingSpec, StreamDirection, global_registry, stream_name};
+use mars_shm::{RingSpec, StreamDirection, global_registry, ring_token_for, stream_name_tagged};
 use mars_types::{Pipe, Profile, VirtualInputDevice, VirtualOutputDevice};
 
 fn test_profile() -> Profile {
@@ -51,8 +51,8 @@ fn mock_ring_buffers_feed_engine_cycle() {
 
     let vout_uid = "com.mars.vout.app";
     let vin_uid = "com.mars.vin.mix";
-    let vout_name = stream_name(StreamDirection::Vout, vout_uid);
-    let vin_name = stream_name(StreamDirection::Vin, vin_uid);
+    let vout_name = stream_name_tagged(StreamDirection::Vout, vout_uid, &ring_token_for(vout_uid));
+    let vin_name = stream_name_tagged(StreamDirection::Vin, vin_uid, &ring_token_for(vin_uid));
     let spec = RingSpec {
         sample_rate: 48_000,
         channels: 2,
@@ -96,7 +96,11 @@ fn mock_ring_buffers_feed_engine_cycle() {
 
 #[test]
 fn mock_lifecycle_clear_and_reapply_recreates_rings() {
-    let vout_name = stream_name(StreamDirection::Vout, "lifecycle");
+    let vout_name = stream_name_tagged(
+        StreamDirection::Vout,
+        "lifecycle",
+        &ring_token_for("lifecycle"),
+    );
     let spec = RingSpec {
         sample_rate: 48_000,
         channels: 2,

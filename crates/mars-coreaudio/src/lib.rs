@@ -13,7 +13,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
-use mars_shm::{RingSpec, StreamDirection as RingStreamDirection, global_registry, stream_name};
+use mars_shm::{
+    RingSpec, StreamDirection as RingStreamDirection, global_registry, ring_token_for,
+    stream_name_tagged,
+};
 use mars_types::{
     DeviceInventory, ExternalDeviceInfo, ExternalRuntimeStatus, NodeKind, Profile,
     ResolvedExternalDevice,
@@ -474,7 +477,11 @@ pub fn measure_vin_ring_loopback_latency(
         channels: request.output_channels,
         capacity_frames: request.buffer_frames.saturating_mul(8),
     };
-    let vout_ring_name = stream_name(RingStreamDirection::Vout, &request.output_uid);
+    let vout_ring_name = stream_name_tagged(
+        RingStreamDirection::Vout,
+        &request.output_uid,
+        &ring_token_for(&request.output_uid),
+    );
     let vout_ring = global_registry()
         .create_or_open(&vout_ring_name, vout_ring_spec)
         .map_err(|error| CoreAudioError::Probe {
@@ -487,7 +494,11 @@ pub fn measure_vin_ring_loopback_latency(
         channels: request.vin_channels,
         capacity_frames: request.buffer_frames.saturating_mul(8),
     };
-    let vin_ring_name = stream_name(RingStreamDirection::Vin, &request.vin_uid);
+    let vin_ring_name = stream_name_tagged(
+        RingStreamDirection::Vin,
+        &request.vin_uid,
+        &ring_token_for(&request.vin_uid),
+    );
     let vin_ring = global_registry()
         .create_or_open(&vin_ring_name, vin_ring_spec)
         .map_err(|error| CoreAudioError::Probe {
@@ -599,7 +610,11 @@ pub fn monitor_vin_ring_signal(
         channels: request.vin_channels,
         capacity_frames: request.buffer_frames.saturating_mul(8),
     };
-    let vin_ring_name = stream_name(RingStreamDirection::Vin, &request.vin_uid);
+    let vin_ring_name = stream_name_tagged(
+        RingStreamDirection::Vin,
+        &request.vin_uid,
+        &ring_token_for(&request.vin_uid),
+    );
     let vin_ring = global_registry()
         .create_or_open(&vin_ring_name, vin_ring_spec)
         .map_err(|error| CoreAudioError::Probe {

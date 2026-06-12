@@ -16,7 +16,7 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 
 use crate::coreaudio_types::*;
-use crate::shm_backend::{RingSpec, StreamDirection, global_registry, stream_name};
+use crate::shm_backend::{RingSpec, StreamDirection, global_registry, stream_name_tagged};
 use crate::{
     DRIVER_STATE, RUNTIME_STATS, applied_state_json, configuration_summary_json,
     perform_device_configuration_change, request_device_configuration_change, runtime_stats_json,
@@ -58,6 +58,8 @@ struct DeviceObjectInfo {
     channels: u16,
     hidden: bool,
     io_running: bool,
+    /// Capability token for this device's ring names (from DesiredState).
+    ring_token: String,
     /// Realtime-shared state; the same `Arc` instance is published into
     /// [`RT_DEVICES`] so realtime callbacks observe mutations made through the
     /// registry without taking any lock.
@@ -75,6 +77,7 @@ impl DeviceObjectInfo {
         kind: String,
         channels: u16,
         hidden: bool,
+        ring_token: String,
     ) -> Self {
         let rt = Arc::new(RtDeviceState::new(channels, &kind));
         Self {
@@ -87,6 +90,7 @@ impl DeviceObjectInfo {
             channels,
             hidden,
             io_running: false,
+            ring_token,
             rt,
         }
     }
@@ -348,12 +352,12 @@ unsafe extern "C" fn plugin_destroy_device(
         .devices
         .iter()
         .find(|(_, info)| info.device_id == device_object_id)
-        .map(|(uid, _)| uid.clone());
-    if let Some(uid) = uid_to_remove {
+        .map(|(uid, info)| (uid.clone(), info.ring_token.clone()));
+    if let Some((uid, token)) = uid_to_remove {
         reg.devices.remove(&uid);
         publish_rt_snapshot(&reg);
-        let _ = global_registry().remove(&stream_name(StreamDirection::Vout, &uid));
-        let _ = global_registry().remove(&stream_name(StreamDirection::Vin, &uid));
+        let _ = global_registry().remove(&stream_name_tagged(StreamDirection::Vout, &uid, &token));
+        let _ = global_registry().remove(&stream_name_tagged(StreamDirection::Vin, &uid, &token));
     }
     K_AUDIO_HARDWARE_NO_ERROR
 }
@@ -1079,13 +1083,14 @@ unsafe extern "C" fn plugin_start_io(
     // Read device info, then drop the registry lock before acquiring DRIVER_STATE
     // to maintain consistent lock ordering (DRIVER_STATE → object_registry) and
     // avoid deadlock with `sync_object_registry`.
-    let (uid, channels, is_input, rt) = {
+    let (uid, ring_token, channels, is_input, rt) = {
         let reg = PLUGIN.object_registry.lock();
         let Some(dev) = reg.find_device_by_object(device_object_id) else {
             return K_AUDIO_HARDWARE_BAD_OBJECT_ERROR;
         };
         (
             dev.uid.clone(),
+            dev.ring_token.clone(),
             dev.channels,
             dev.kind.contains("input"),
             dev.rt.clone(),
@@ -1106,7 +1111,7 @@ unsafe extern "C" fn plugin_start_io(
     } else {
         StreamDirection::Vout
     };
-    let name = stream_name(direction, &uid);
+    let name = stream_name_tagged(direction, &uid, &ring_token);
 
     let Ok(ring_handle) = global_registry().create_or_open(&name, spec) else {
         return K_AUDIO_HARDWARE_ILLEGAL_OPERATION_ERROR;
@@ -2175,16 +2180,16 @@ fn sync_object_registry() {
     let mut structure_changed_device_ids = Vec::new();
 
     // Remove devices no longer in applied state.
-    let to_remove: Vec<String> = reg
+    let to_remove: Vec<(String, String)> = reg
         .devices
-        .keys()
-        .filter(|uid| !desired_uids.contains(uid.as_str()))
-        .cloned()
+        .iter()
+        .filter(|(uid, _)| !desired_uids.contains(uid.as_str()))
+        .map(|(uid, info)| (uid.clone(), info.ring_token.clone()))
         .collect();
-    for uid in to_remove {
+    for (uid, token) in to_remove {
         reg.devices.remove(&uid);
-        let _ = global_registry().remove(&stream_name(StreamDirection::Vout, &uid));
-        let _ = global_registry().remove(&stream_name(StreamDirection::Vin, &uid));
+        let _ = global_registry().remove(&stream_name_tagged(StreamDirection::Vout, &uid, &token));
+        let _ = global_registry().remove(&stream_name_tagged(StreamDirection::Vin, &uid, &token));
     }
     if applied.devices.is_empty() {
         let _ = global_registry().remove_namespace("mars.");
@@ -2207,18 +2212,21 @@ fn sync_object_registry() {
                     device.kind.clone(),
                     device.channels,
                     device.hidden,
+                    device.ring_token.clone(),
                 ),
             );
         } else if let Some(existing) = reg.devices.get_mut(&device.uid) {
             let volume_supported = !device.kind.contains("input");
             let needs_new_control = volume_supported && existing.volume_control_id.is_none();
             let removed_control = !volume_supported && existing.volume_control_id.is_some();
-            let shape_changed =
-                existing.channels != device.channels || existing.kind != device.kind;
+            let shape_changed = existing.channels != device.channels
+                || existing.kind != device.kind
+                || existing.ring_token != device.ring_token;
             existing.name = device.name.clone();
             existing.kind = device.kind.clone();
             existing.channels = device.channels;
             existing.hidden = device.hidden;
+            existing.ring_token = device.ring_token.clone();
             existing
                 .rt
                 .channels

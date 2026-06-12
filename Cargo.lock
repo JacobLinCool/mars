@@ -956,7 +956,12 @@ dependencies = [
 name = "mars-shm"
 version = "0.1.0"
 dependencies = [
+ "dirs",
  "mars-hal",
+ "once_cell",
+ "parking_lot",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]

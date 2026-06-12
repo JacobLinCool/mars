@@ -57,6 +57,11 @@ pub struct HalDevice {
     pub channels: u16,
     #[serde(default)]
     pub hidden: bool,
+    /// Capability token appended to this device's ring names (see
+    /// `shm_backend::stream_name_tagged`). Distributed by the daemon over
+    /// the DesiredState property channel; empty means legacy untagged names.
+    #[serde(default)]
+    pub ring_token: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -392,8 +397,16 @@ fn applied_from_desired(desired: &DesiredState) -> AppliedState {
             .iter()
             .flat_map(|device| {
                 [
-                    format!("mars.vout.{}", device.uid),
-                    format!("mars.vin.{}", device.uid),
+                    shm_backend::stream_name_tagged(
+                        shm_backend::StreamDirection::Vout,
+                        &device.uid,
+                        &device.ring_token,
+                    ),
+                    shm_backend::stream_name_tagged(
+                        shm_backend::StreamDirection::Vin,
+                        &device.uid,
+                        &device.ring_token,
+                    ),
                 ]
             })
             .collect(),

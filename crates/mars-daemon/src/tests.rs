@@ -9,7 +9,7 @@ use mars_coreaudio::{ExternalEndpointHealth, ExternalInputEndpointSnapshot};
 use mars_engine::{Engine, EngineSnapshot};
 use mars_graph::build_routing_graph;
 use mars_ipc::{DaemonRequest, DaemonResponse, IpcClient, LogRequest};
-use mars_shm::{RingSpec, StreamDirection, global_registry, stream_name};
+use mars_shm::{RingSpec, StreamDirection, global_registry, ring_token_for, stream_name_tagged};
 use mars_types::{
     AuPluginApi, AutoOrU32, CaptureRuntimeHealth, CaptureRuntimeKind, CaptureRuntimeStatus,
     CaptureRuntimeTapStatus, DeviceDescriptor, FileSink, FileSinkFormat, NodeKind, Pipe,
@@ -310,7 +310,11 @@ fn status_reports_sink_runtime_health_and_write_stats() {
     }
 
     daemon.sync_render_runtime().expect("start runtime");
-    let ring_name = stream_name(StreamDirection::Vout, "status-sink-vout");
+    let ring_name = stream_name_tagged(
+        StreamDirection::Vout,
+        "status-sink-vout",
+        &ring_token_for("status-sink-vout"),
+    );
     let ring_spec = RingSpec {
         sample_rate: 48_000,
         channels: 2,
@@ -636,8 +640,9 @@ async fn daemon_ipc_shm_soak_survives_ring_churn_and_reports_deadline_pressure()
         channels: 2,
         capacity_frames: 128,
     };
-    let vout_name = stream_name(StreamDirection::Vout, &vout_uid);
-    let vin_name = stream_name(StreamDirection::Vin, &vin_uid);
+    let vout_name =
+        stream_name_tagged(StreamDirection::Vout, &vout_uid, &ring_token_for(&vout_uid));
+    let vin_name = stream_name_tagged(StreamDirection::Vin, &vin_uid, &ring_token_for(&vin_uid));
 
     let mut saw_sink_frames = false;
     tokio::time::sleep(Duration::from_millis(30)).await;

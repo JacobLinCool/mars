@@ -10,7 +10,7 @@ use chrono::Utc;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use mars_daemon::MarsDaemon;
 use mars_ipc::{DaemonRequest, DaemonResponse, IpcClient, LogRequest};
-use mars_shm::{RingSpec, StreamDirection, global_registry, stream_name};
+use mars_shm::{RingSpec, StreamDirection, global_registry, ring_token_for, stream_name_tagged};
 use mars_types::{
     AuPluginApi, CaptureRuntimeHealth, CaptureRuntimeKind, CaptureRuntimeStatus,
     CaptureRuntimeTapStatus, DaemonStatus, DeviceDescriptor, DriverStatusSummary,
@@ -261,7 +261,7 @@ fn sample_status_payload() -> DaemonStatus {
 
 fn probe_shm_roundtrip(frames: usize, iterations: usize) -> (f64, f64) {
     let uid = shm_uid("d");
-    let name = stream_name(StreamDirection::Vout, &uid);
+    let name = stream_name_tagged(StreamDirection::Vout, &uid, &ring_token_for(&uid));
     let spec = RingSpec {
         sample_rate: 48_000,
         channels: 2,
@@ -380,7 +380,7 @@ fn bench_shm_roundtrip(c: &mut Criterion) {
             256 => "b",
             _ => "c",
         });
-        let name = stream_name(StreamDirection::Vout, &uid);
+        let name = stream_name_tagged(StreamDirection::Vout, &uid, &ring_token_for(&uid));
         let spec = RingSpec {
             sample_rate: 48_000,
             channels: 2,

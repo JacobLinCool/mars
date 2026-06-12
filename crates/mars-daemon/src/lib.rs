@@ -37,7 +37,7 @@ use mars_ipc::{
     ApiError, DaemonRequest, DaemonResponse, LogRequest, LogResponse, RequestHandler, serve,
 };
 use mars_profile::{ValidatedProfile, load_profile, validate_only};
-use mars_shm::{RingSpec, StreamDirection, global_registry, stream_name};
+use mars_shm::{RingSpec, StreamDirection, global_registry, ring_token_for, stream_name_tagged};
 use mars_types::{
     ApplyPlan, ApplyRequest, ApplyResult, CaptureRuntimeHealth, CaptureRuntimeStatus, DaemonStatus,
     DeviceDescriptor, DriverStatusSummary, ExitCode, ExternalRuntimeStatus, MANAGED_UID_PREFIX,
@@ -104,6 +104,7 @@ struct RenderEndpoint {
     node_id: String,
     uid: String,
     channels: u16,
+    ring_token: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -344,7 +345,8 @@ fn run_render_loop(
                     channels: endpoint.channels,
                     capacity_frames: config.buffer_frames.saturating_mul(8),
                 };
-                let name = stream_name(StreamDirection::Vout, &endpoint.uid);
+                let name =
+                    stream_name_tagged(StreamDirection::Vout, &endpoint.uid, &endpoint.ring_token);
                 *ring_handle = global_registry().create_or_open(&name, spec).ok();
             }
 
@@ -399,7 +401,11 @@ fn run_render_loop(
                         channels: endpoint.channels,
                         capacity_frames: config.buffer_frames.saturating_mul(8),
                     };
-                    let name = stream_name(StreamDirection::Vin, &endpoint.uid);
+                    let name = stream_name_tagged(
+                        StreamDirection::Vin,
+                        &endpoint.uid,
+                        &endpoint.ring_token,
+                    );
                     *ring_handle = global_registry().create_or_open(&name, spec).ok();
                 }
 
@@ -1738,6 +1744,7 @@ fn render_runtime_config_from_state(
             node_id: device.id.clone(),
             uid: device.uid.clone(),
             channels: device.channels,
+            ring_token: ring_token_for(&device.uid),
         })
         .collect::<Vec<_>>();
     vout_sources.sort_by(|a, b| a.node_id.cmp(&b.node_id));
@@ -1749,6 +1756,7 @@ fn render_runtime_config_from_state(
             node_id: device.id.clone(),
             uid: device.uid.clone(),
             channels: device.channels,
+            ring_token: ring_token_for(&device.uid),
         })
         .collect::<Vec<_>>();
     vin_sinks.sort_by(|a, b| a.node_id.cmp(&b.node_id));
@@ -1760,6 +1768,7 @@ fn render_runtime_config_from_state(
             node_id: device.id.clone(),
             uid: device.uid.clone(),
             channels: device.channels,
+            ring_token: ring_token_for(&device.uid),
         })
         .collect::<Vec<_>>();
     external_inputs.sort_by(|a, b| a.node_id.cmp(&b.node_id));
@@ -1771,6 +1780,7 @@ fn render_runtime_config_from_state(
             node_id: device.id.clone(),
             uid: device.uid.clone(),
             channels: device.channels,
+            ring_token: ring_token_for(&device.uid),
         })
         .collect::<Vec<_>>();
     external_outputs.sort_by(|a, b| a.node_id.cmp(&b.node_id));
@@ -2113,6 +2123,7 @@ fn hal_desired_from_driver_applied(state: &DriverAppliedState) -> HalDesiredStat
                 kind: node_kind_to_hal_kind(device.kind),
                 channels: device.channels,
                 hidden: device.hidden,
+                ring_token: ring_token_for(&device.uid),
             })
             .collect(),
     }
@@ -2215,6 +2226,7 @@ fn stage_driver_state(
         });
         hal_devices.push(HalDeviceState {
             id: output.id.clone(),
+            ring_token: ring_token_for(&uid),
             uid,
             name: output.name.clone(),
             kind: node_kind_to_hal_kind(NodeKind::VirtualOutput),
@@ -2240,6 +2252,7 @@ fn stage_driver_state(
         });
         hal_devices.push(HalDeviceState {
             id: input.id.clone(),
+            ring_token: ring_token_for(&uid),
             uid,
             name: input.name.clone(),
             kind: node_kind_to_hal_kind(NodeKind::VirtualInput),

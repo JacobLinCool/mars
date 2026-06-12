@@ -44,7 +44,7 @@ use dashmap::DashMap;
 use nix::errno::Errno;
 use nix::fcntl::OFlag;
 use nix::sys::mman::{MapFlags, ProtFlags, mmap, munmap, shm_open, shm_unlink};
-use nix::sys::stat::{Mode, fstat};
+use nix::sys::stat::{Mode, fstat, umask};
 use nix::unistd::ftruncate;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
@@ -730,6 +730,24 @@ pub fn stream_name(direction: StreamDirection, uid: &str) -> String {
     }
 }
 
+/// Build a stream name from direction + uid + capability token.
+///
+/// Ring objects are created with cross-user permissions so the HAL plug-in
+/// inside coreaudiod can open them; the unguessable token suffix is what
+/// gates access (POSIX SHM has no ACLs on macOS). The token is distributed
+/// only over trusted channels: the DesiredState property to the HAL and the
+/// per-user IPC socket to SDK clients. An empty token yields the legacy
+/// untagged name.
+#[must_use]
+pub fn stream_name_tagged(direction: StreamDirection, uid: &str, token: &str) -> String {
+    let base = stream_name(direction, uid);
+    if token.is_empty() {
+        base
+    } else {
+        format!("{base}.{token}")
+    }
+}
+
 fn register_name(name: &str) {
     NAME_REGISTRY.lock().insert(name.to_string());
 }
@@ -742,35 +760,74 @@ fn registered_names() -> Vec<String> {
     NAME_REGISTRY.lock().iter().cloned().collect()
 }
 
+/// Map a logical ring name to its POSIX SHM object name.
+///
+/// macOS limits POSIX SHM names to 31 bytes including the leading slash
+/// (`PSHMNAMLEN`). Logical names — `mars.vout.<uid>[.<token>]` — routinely
+/// exceed that (the previous scheme silently failed with ENAMETOOLONG for
+/// longer device uids), so the object name is a fixed-length digest of the
+/// logical name: `/mars.<fnv1a64 hex>` (22 bytes). Both the daemon and the
+/// HAL derive it from the same logical name, and a capability token in the
+/// logical name makes the digest unguessable to processes that never learned
+/// the token.
 fn to_posix_shm_name(public_name: &str) -> Result<String, RingError> {
     if public_name.is_empty() {
         return Err(RingError::InvalidName(public_name.to_string()));
     }
 
-    let mut out = String::with_capacity(public_name.len() + 1);
-    out.push('/');
-    for ch in public_name.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-' {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-
-    if out.len() < 2 {
-        return Err(RingError::InvalidName(public_name.to_string()));
-    }
-
-    Ok(out)
+    Ok(format!("/mars.{:016x}", fnv1a64(public_name.as_bytes())))
 }
 
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// Permission bits applied to newly created ring objects.
+///
+/// Rings cross user boundaries: the daemon/app runs as the logged-in user
+/// while the HAL plug-in runs inside coreaudiod (`_coreaudiod`), so 0o600
+/// objects are unreadable on the real audio path even though same-user unit
+/// tests pass. The default is world-rw — access control comes from the
+/// unguessable capability token in the ring name (see [`stream_name_tagged`]).
+/// Override with `MARS_SHM_MODE` (octal) for locked-down single-user setups.
+fn ring_mode_bits() -> u32 {
+    std::env::var("MARS_SHM_MODE")
+        .ok()
+        .and_then(|raw| u32::from_str_radix(raw.trim_start_matches("0o"), 8).ok())
+        .unwrap_or(0o666)
+}
+
+/// Serializes umask manipulation during ring creation.
+static UMASK_GUARD: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
 fn open_shm_fd(shm_name: &str) -> Result<(OwnedFd, bool), RingError> {
-    let mode = Mode::from_bits_truncate(0o600);
+    let mode_bits = ring_mode_bits();
+    let mode = Mode::from_bits_truncate(mode_bits as nix::libc::mode_t);
     let create_flags = OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_RDWR;
 
-    match shm_open(shm_name, create_flags, mode) {
+    // shm_open filters the mode through the process umask and macOS rejects
+    // fchmod on shm descriptors (EINVAL), so the only way to create the
+    // object with deterministic cross-user bits is to clear the umask for
+    // the duration of the call. The guard serializes creators within this
+    // process and keeps the window to the single shm_open syscall.
+    let created = {
+        let _guard = UMASK_GUARD.lock();
+        let previous = umask(Mode::empty());
+        let result = shm_open(shm_name, create_flags, mode);
+        let _ = umask(previous);
+        result
+    };
+
+    match created {
         Ok(fd) => Ok((fd, true)),
-        Err(Errno::EEXIST) => shm_open(shm_name, OFlag::O_RDWR, mode)
+        Err(Errno::EEXIST) => shm_open(shm_name, OFlag::O_RDWR, Mode::empty())
             .map(|fd| (fd, false))
             .map_err(|error| RingError::Shm(format!("shm_open {shm_name}: {error}"))),
         Err(error) => Err(RingError::Shm(format!("shm_open {shm_name}: {error}"))),
@@ -916,6 +973,72 @@ mod tests {
         }
 
         let _ = registry.remove(&name);
+    }
+
+    #[test]
+    fn created_rings_are_cross_user_readable_and_writable() {
+        let spec = RingSpec {
+            sample_rate: 48_000,
+            channels: 1,
+            capacity_frames: 4,
+        };
+        let name = stream_name(StreamDirection::Vin, "mode-bits");
+        let registry = RingRegistry::default();
+        let ring = registry.create_or_open(&name, spec).expect("create ring");
+
+        {
+            let guard = ring.lock();
+            let st = nix::sys::stat::fstat(guard._fd()).expect("fstat ring fd");
+            let mode = u32::from(st.st_mode) & 0o777;
+            assert_eq!(
+                mode, 0o666,
+                "ring objects must be cross-user accessible (got {mode:o})"
+            );
+        }
+
+        let _ = registry.remove(&name);
+    }
+
+    #[test]
+    fn tagged_stream_names_append_capability_token() {
+        use super::stream_name_tagged;
+        assert_eq!(
+            stream_name_tagged(StreamDirection::Vin, "uid", "abc123"),
+            "mars.vin.uid.abc123"
+        );
+        assert_eq!(
+            stream_name_tagged(StreamDirection::Vout, "uid", ""),
+            "mars.vout.uid"
+        );
+    }
+
+    #[test]
+    fn posix_names_fit_macos_pshmnamlen_for_any_logical_name() {
+        // macOS rejects POSIX SHM names longer than 31 bytes (incl. '/');
+        // logical names of any length must map to a fixed-size digest.
+        let long_uid = "com.mars.managed.vout.some-very-long-device-identifier";
+        let logical =
+            super::stream_name_tagged(StreamDirection::Vout, long_uid, "ff67b8c8d64a45e8");
+        let posix = super::to_posix_shm_name(&logical).expect("digest name");
+        assert!(posix.len() <= 31, "got {} bytes: {posix}", posix.len());
+        assert!(posix.starts_with("/mars."));
+        // Deterministic: both daemon and HAL must derive the same object name.
+        assert_eq!(posix, super::to_posix_shm_name(&logical).expect("again"));
+        // Token changes the object name entirely.
+        let other = super::stream_name_tagged(StreamDirection::Vout, long_uid, "0000000000000000");
+        assert_ne!(posix, super::to_posix_shm_name(&other).expect("other"));
+
+        // A ring with a long logical name actually opens (the v1 scheme
+        // failed here with ENAMETOOLONG and the failure was swallowed).
+        let spec = RingSpec {
+            sample_rate: 48_000,
+            channels: 1,
+            capacity_frames: 4,
+        };
+        let registry = RingRegistry::default();
+        let ring = registry.create_or_open(&logical, spec);
+        assert!(ring.is_ok(), "long logical names must open: {ring:?}");
+        let _ = registry.remove(&logical);
     }
 
     #[test]

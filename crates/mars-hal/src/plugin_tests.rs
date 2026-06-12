@@ -4,6 +4,7 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 
 use super::*;
+use crate::shm_backend::stream_name;
 
 static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
@@ -28,6 +29,7 @@ fn insert_test_device(
             kind.to_string(),
             channels,
             false,
+            String::new(),
         ),
     );
     publish_rt_snapshot(&reg);
