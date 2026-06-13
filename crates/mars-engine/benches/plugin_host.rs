@@ -8,7 +8,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use mars_engine::{Engine, EngineSnapshot};
 use mars_graph::build_routing_graph;
 use mars_types::{
-    ProcessorChain, ProcessorDefinition, ProcessorKind, Profile, Route, RouteMatrix,
+    ProcessorChain, ProcessorDefinition, ProcessorKind, ProducerKind, Profile, Route, RouteMatrix,
     VirtualInputDevice, VirtualOutputDevice,
 };
 use serde_json::json;
@@ -109,6 +109,7 @@ fn build_au_engine(script_path: &PathBuf, frames: u32) -> Engine {
         channels: Some(2),
         uid: None,
         mix: None,
+        producer: ProducerKind::default(),
     });
     profile.processors.push(ProcessorDefinition {
         id: "au-main".to_string(),

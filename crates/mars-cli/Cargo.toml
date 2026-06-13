@@ -20,6 +20,7 @@ dirs.workspace = true
 mars-coreaudio = { path = "../mars-coreaudio" }
 mars-ipc = { path = "../mars-ipc" }
 mars-profile = { path = "../mars-profile" }
+mars-sdk = { path = "../mars-sdk" }
 mars-types = { path = "../mars-types" }
 serde.workspace = true
 serde_json.workspace = true

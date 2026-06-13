@@ -7,8 +7,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use mars_types::{
-    ApplyPlan, ApplyRequest, ApplyResult, CaptureProcessInfo, ClearRequest, DaemonStatus,
-    DeviceInventory, DoctorReport, ExitCode, PlanRequest, ValidateRequest, ValidationReport,
+    AppVirtualInput, ApplyPlan, ApplyRequest, ApplyResult, CaptureProcessInfo, ClearRequest,
+    DaemonStatus, DeviceInventory, DoctorReport, EnsuredVirtualInput, ExitCode, PlanRequest,
+    RemoveVirtualInputRequest, ValidateRequest, ValidationReport, VirtualInputProducerStatus,
+    VirtualInputStatusRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -34,6 +36,9 @@ pub enum Command {
     Processes,
     Logs,
     Doctor,
+    EnsureVirtualInput,
+    RemoveVirtualInput,
+    VirtualInputStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -84,6 +89,9 @@ pub enum DaemonRequest {
     Processes,
     Logs(LogRequest),
     Doctor,
+    EnsureVirtualInput(AppVirtualInput),
+    RemoveVirtualInput(RemoveVirtualInputRequest),
+    VirtualInputStatus(VirtualInputStatusRequest),
 }
 
 impl DaemonRequest {
@@ -100,6 +108,9 @@ impl DaemonRequest {
             Self::Processes => Command::Processes,
             Self::Logs(_) => Command::Logs,
             Self::Doctor => Command::Doctor,
+            Self::EnsureVirtualInput(_) => Command::EnsureVirtualInput,
+            Self::RemoveVirtualInput(_) => Command::RemoveVirtualInput,
+            Self::VirtualInputStatus(_) => Command::VirtualInputStatus,
         }
     }
 
@@ -113,6 +124,15 @@ impl DaemonRequest {
             Self::Apply(payload) => serde_json::to_value(payload).map_err(IpcError::SerdeJson),
             Self::Clear(payload) => serde_json::to_value(payload).map_err(IpcError::SerdeJson),
             Self::Logs(payload) => serde_json::to_value(payload).map_err(IpcError::SerdeJson),
+            Self::EnsureVirtualInput(payload) => {
+                serde_json::to_value(payload).map_err(IpcError::SerdeJson)
+            }
+            Self::RemoveVirtualInput(payload) => {
+                serde_json::to_value(payload).map_err(IpcError::SerdeJson)
+            }
+            Self::VirtualInputStatus(payload) => {
+                serde_json::to_value(payload).map_err(IpcError::SerdeJson)
+            }
         }
     }
 }
@@ -129,6 +149,9 @@ pub enum DaemonResponse {
     Processes(Vec<CaptureProcessInfo>),
     Logs(LogResponse),
     Doctor(DoctorReport),
+    VirtualInputEnsured(EnsuredVirtualInput),
+    VirtualInputRemoved(ApplyResult),
+    VirtualInputStatus(VirtualInputProducerStatus),
 }
 
 impl DaemonResponse {
@@ -162,6 +185,15 @@ impl DaemonResponse {
             Command::Doctor => Ok(Self::Doctor(
                 serde_json::from_value(payload).map_err(IpcError::SerdeJson)?,
             )),
+            Command::EnsureVirtualInput => Ok(Self::VirtualInputEnsured(
+                serde_json::from_value(payload).map_err(IpcError::SerdeJson)?,
+            )),
+            Command::RemoveVirtualInput => Ok(Self::VirtualInputRemoved(
+                serde_json::from_value(payload).map_err(IpcError::SerdeJson)?,
+            )),
+            Command::VirtualInputStatus => Ok(Self::VirtualInputStatus(
+                serde_json::from_value(payload).map_err(IpcError::SerdeJson)?,
+            )),
         }
     }
 
@@ -177,6 +209,15 @@ impl DaemonResponse {
             Self::Processes(value) => serde_json::to_value(value).map_err(IpcError::SerdeJson),
             Self::Logs(value) => serde_json::to_value(value).map_err(IpcError::SerdeJson),
             Self::Doctor(value) => serde_json::to_value(value).map_err(IpcError::SerdeJson),
+            Self::VirtualInputEnsured(value) => {
+                serde_json::to_value(value).map_err(IpcError::SerdeJson)
+            }
+            Self::VirtualInputRemoved(value) => {
+                serde_json::to_value(value).map_err(IpcError::SerdeJson)
+            }
+            Self::VirtualInputStatus(value) => {
+                serde_json::to_value(value).map_err(IpcError::SerdeJson)
+            }
         }
     }
 }
@@ -405,6 +446,15 @@ fn deserialize_request(command: Command, payload: Value) -> Result<DaemonRequest
             .map(DaemonRequest::Logs)
             .map_err(|error| IpcError::InvalidRequestPayload(command, error)),
         Command::Doctor => Ok(DaemonRequest::Doctor),
+        Command::EnsureVirtualInput => serde_json::from_value(payload)
+            .map(DaemonRequest::EnsureVirtualInput)
+            .map_err(|error| IpcError::InvalidRequestPayload(command, error)),
+        Command::RemoveVirtualInput => serde_json::from_value(payload)
+            .map(DaemonRequest::RemoveVirtualInput)
+            .map_err(|error| IpcError::InvalidRequestPayload(command, error)),
+        Command::VirtualInputStatus => serde_json::from_value(payload)
+            .map(DaemonRequest::VirtualInputStatus)
+            .map_err(|error| IpcError::InvalidRequestPayload(command, error)),
     }
 }
 

@@ -358,9 +358,31 @@ struct BridgeProcessInfo {
     process_object_id: u32,
     pid: i32,
     bundle_id: String,
+    #[serde(deserialize_with = "bool_from_bool_or_int")]
     is_running: bool,
+    #[serde(deserialize_with = "bool_from_bool_or_int")]
     is_running_input: bool,
+    #[serde(deserialize_with = "bool_from_bool_or_int")]
     is_running_output: bool,
+}
+
+/// CoreAudio process properties are CFBooleans on some macOS releases and
+/// CFNumbers (0/1) on others; the bridge JSON mirrors whichever the OS
+/// returned, so accept both.
+fn bool_from_bool_or_int<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrInt {
+        Bool(bool),
+        Int(i64),
+    }
+    Ok(match BoolOrInt::deserialize(deserializer)? {
+        BoolOrInt::Bool(value) => value,
+        BoolOrInt::Int(value) => value != 0,
+    })
 }
 
 fn cstring(value: &str, field: &str) -> Result<CString, TapError> {

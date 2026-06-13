@@ -4,8 +4,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use mars_types::{
-    NodeDescriptor, NodeKind, PipeDescriptor, ProcessorKind, Profile, VirtualInputDevice,
-    VirtualOutputDevice,
+    NodeDescriptor, NodeKind, PipeDescriptor, ProcessorKind, ProducerKind, Profile,
+    VirtualInputDevice, VirtualOutputDevice,
 };
 use thiserror::Error;
 
@@ -97,6 +97,10 @@ pub enum GraphError {
     InvalidSourceType(String),
     #[error("node cannot be used as destination: {0}")]
     InvalidDestinationType(String),
+    #[error(
+        "virtual input '{0}' is app-owned (producer: external_app) and cannot be a route/pipe destination"
+    )]
+    ExternalProducerDestination(String),
     #[error("duplicate route id in compiled graph: {0}")]
     DuplicateRouteId(String),
     #[error("route '{route_id}' references unknown processor chain '{chain_id}'")]
@@ -247,6 +251,19 @@ pub fn build_routing_graph(profile: &Profile) -> Result<RoutingGraph, GraphError
     })
 }
 
+/// Virtual inputs whose audio is produced by an external app: the daemon
+/// render graph must never write them, so they cannot be route/pipe
+/// destinations.
+fn external_producer_inputs(profile: &Profile) -> BTreeSet<&str> {
+    profile
+        .virtual_devices
+        .inputs
+        .iter()
+        .filter(|input| input.producer == ProducerKind::ExternalApp)
+        .map(|input| input.id.as_str())
+        .collect()
+}
+
 fn compile_routes(
     profile: &Profile,
     nodes: &BTreeMap<String, NodeDescriptor>,
@@ -255,6 +272,7 @@ fn compile_routes(
     let mut edges = Vec::new();
     let mut routes = Vec::new();
     let mut seen_route_ids = BTreeSet::new();
+    let app_owned_inputs = external_producer_inputs(profile);
 
     for route in &profile.routes {
         if !route.enabled {
@@ -276,6 +294,11 @@ fn compile_routes(
         }
         if !destination.kind.is_sink() {
             return Err(GraphError::InvalidDestinationType(destination.id.clone()));
+        }
+        if app_owned_inputs.contains(destination.id.as_str()) {
+            return Err(GraphError::ExternalProducerDestination(
+                destination.id.clone(),
+            ));
         }
         if let Some(chain_id) = route.chain.as_deref() {
             if !processor_plan.chains.contains_key(chain_id) {
@@ -412,6 +435,7 @@ fn compile_legacy_pipes(
 ) -> Result<(Vec<PipeDescriptor>, Vec<CompiledRoute>), GraphError> {
     let mut edges = Vec::new();
     let mut routes = Vec::new();
+    let app_owned_inputs = external_producer_inputs(profile);
 
     for (index, pipe) in profile.pipes.iter().enumerate() {
         if !pipe.enabled {
@@ -434,6 +458,11 @@ fn compile_legacy_pipes(
         }
         if !destination.kind.is_sink() {
             return Err(GraphError::InvalidDestinationType(destination.id.clone()));
+        }
+        if app_owned_inputs.contains(destination.id.as_str()) {
+            return Err(GraphError::ExternalProducerDestination(
+                destination.id.clone(),
+            ));
         }
 
         if !channels_compatible(source.channels, destination.channels) {
@@ -586,8 +615,8 @@ fn node_from_vin(device: &VirtualInputDevice, default_channels: u16) -> NodeDesc
 mod tests {
     use mars_types::{
         Bus, CaptureConfig, Pipe, ProcessTap, ProcessTapSelector, ProcessorChain,
-        ProcessorDefinition, ProcessorKind, Profile, Route, RouteMatrix, VirtualInputDevice,
-        VirtualOutputDevice,
+        ProcessorDefinition, ProcessorKind, ProducerKind, Profile, Route, RouteMatrix,
+        VirtualInputDevice, VirtualOutputDevice,
     };
 
     use super::{GraphError, build_routing_graph};
@@ -608,6 +637,7 @@ mod tests {
             channels: None,
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
         profile.pipes.push(Pipe {
             from: "app".to_string(),
@@ -641,6 +671,7 @@ mod tests {
             channels: Some(2),
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
         profile.routes.push(Route {
             id: "route-main".to_string(),
@@ -677,6 +708,7 @@ mod tests {
             channels: Some(2),
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
         profile.captures = CaptureConfig {
             process_taps: vec![ProcessTap {
@@ -776,6 +808,7 @@ mod tests {
             channels: None,
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
         profile.pipes.push(Pipe {
             from: "missing".to_string(),
@@ -824,6 +857,7 @@ mod tests {
             channels: None,
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
         profile.buses.push(Bus {
             id: "bus".to_string(),
@@ -860,6 +894,7 @@ mod tests {
             channels: Some(4),
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
         profile.pipes.push(Pipe {
             from: "mono".to_string(),
@@ -917,6 +952,7 @@ mod tests {
             channels: Some(64),
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
 
         let mut coefficients = vec![vec![0.0_f32; 64]; 64];
@@ -962,6 +998,7 @@ mod tests {
             channels: Some(2),
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
         profile.processors.push(ProcessorDefinition {
             id: "proc-eq".to_string(),
@@ -1021,6 +1058,7 @@ mod tests {
             channels: Some(2),
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
         profile.routes.push(Route {
             id: "route-main".to_string(),
@@ -1063,6 +1101,7 @@ mod tests {
             channels: Some(2),
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
         profile.routes.push(Route {
             id: "bad-shape".to_string(),
@@ -1104,6 +1143,7 @@ mod tests {
             channels: Some(2),
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
         profile.routes.push(Route {
             id: "bad-channels".to_string(),
@@ -1145,6 +1185,7 @@ mod tests {
             channels: Some(1),
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
         profile.routes.push(Route {
             id: "bad-nan".to_string(),
@@ -1179,6 +1220,7 @@ mod tests {
             channels: Some(2),
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
         profile.routes.push(Route {
             id: "missing-src".to_string(),
@@ -1217,6 +1259,7 @@ mod tests {
             channels: None,
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
         profile.pipes.push(Pipe {
             from: "app".to_string(),
@@ -1250,6 +1293,7 @@ mod tests {
             channels: None,
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
         profile.pipes.push(Pipe {
             from: "app".to_string(),
@@ -1324,6 +1368,7 @@ mod tests {
             channels: Some(2),
             uid: None,
             mix: None,
+            producer: ProducerKind::default(),
         });
         profile.routes.push(Route {
             id: "ra".to_string(),
@@ -1366,5 +1411,47 @@ mod tests {
             first,
             vec!["a".to_string(), "b".to_string(), "mix".to_string()]
         );
+    }
+
+    #[test]
+    fn app_owned_virtual_input_cannot_be_route_destination() {
+        let mut profile = Profile::default();
+        profile.virtual_devices.outputs.push(VirtualOutputDevice {
+            id: "app".to_string(),
+            name: "App".to_string(),
+            channels: Some(1),
+            uid: None,
+            hidden: false,
+        });
+        profile.virtual_devices.inputs.push(VirtualInputDevice {
+            id: "app-mic".to_string(),
+            name: "App Mic".to_string(),
+            channels: Some(1),
+            uid: None,
+            mix: None,
+            producer: ProducerKind::ExternalApp,
+        });
+        profile.routes.push(Route {
+            id: "to-app-mic".to_string(),
+            from: "app".to_string(),
+            to: "app-mic".to_string(),
+            enabled: true,
+            matrix: RouteMatrix {
+                rows: 1,
+                cols: 1,
+                coefficients: vec![vec![1.0]],
+            },
+            chain: None,
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
+        });
+
+        let error = build_routing_graph(&profile).expect_err("must reject app-owned destination");
+        assert!(matches!(
+            error,
+            GraphError::ExternalProducerDestination(id) if id == "app-mic"
+        ));
     }
 }

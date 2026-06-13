@@ -9,14 +9,15 @@ use mars_coreaudio::{ExternalEndpointHealth, ExternalInputEndpointSnapshot};
 use mars_engine::{Engine, EngineSnapshot};
 use mars_graph::build_routing_graph;
 use mars_ipc::{DaemonRequest, DaemonResponse, IpcClient, LogRequest};
-use mars_shm::{RingSpec, StreamDirection, global_registry, stream_name};
+use mars_shm::{RingSpec, StreamDirection, global_registry, ring_token_for, stream_name_tagged};
 use mars_types::{
     AuPluginApi, AutoOrU32, CaptureRuntimeHealth, CaptureRuntimeKind, CaptureRuntimeStatus,
     CaptureRuntimeTapStatus, DeviceDescriptor, FileSink, FileSinkFormat, NodeKind, Pipe,
     PluginHostHealth, PluginHostInstanceStatus, PluginHostRuntimeStatus, ProcessTap,
-    ProcessTapSelector, ProcessorChain, ProcessorDefinition, ProcessorKind, Profile, Route,
-    RouteMatrix, SinkRuntimeHealth, SinkRuntimeKind, SinkRuntimeSinkStatus, SinkRuntimeStatus,
-    SystemTap, SystemTapMode, VirtualInputDevice, VirtualOutputDevice,
+    ProcessTapSelector, ProcessorChain, ProcessorDefinition, ProcessorKind, ProducerKind,
+    ProducerState, Profile, Route, RouteMatrix, SinkRuntimeHealth, SinkRuntimeKind,
+    SinkRuntimeSinkStatus, SinkRuntimeStatus, SystemTap, SystemTapMode, VirtualInputDevice,
+    VirtualOutputDevice,
 };
 
 use super::{
@@ -65,6 +66,7 @@ fn diff_detects_create_remove() {
         channels: Some(2),
         uid: None,
         mix: None,
+        producer: ProducerKind::default(),
     });
     after.pipes.push(Pipe {
         from: "new".to_string(),
@@ -251,6 +253,7 @@ fn status_reports_sink_runtime_health_and_write_stats() {
         channels: Some(2),
         uid: Some("status-sink-vin".to_string()),
         mix: None,
+        producer: ProducerKind::default(),
     });
     profile.pipes.push(Pipe {
         from: "app".to_string(),
@@ -310,7 +313,11 @@ fn status_reports_sink_runtime_health_and_write_stats() {
     }
 
     daemon.sync_render_runtime().expect("start runtime");
-    let ring_name = stream_name(StreamDirection::Vout, "status-sink-vout");
+    let ring_name = stream_name_tagged(
+        StreamDirection::Vout,
+        "status-sink-vout",
+        &ring_token_for("status-sink-vout"),
+    );
     let ring_spec = RingSpec {
         sample_rate: 48_000,
         channels: 2,
@@ -547,6 +554,7 @@ async fn daemon_ipc_shm_soak_survives_ring_churn_and_reports_deadline_pressure()
         channels: Some(2),
         uid: Some(vin_uid.clone()),
         mix: None,
+        producer: ProducerKind::default(),
     });
     profile.pipes.push(Pipe {
         from: "app".to_string(),
@@ -636,8 +644,9 @@ async fn daemon_ipc_shm_soak_survives_ring_churn_and_reports_deadline_pressure()
         channels: 2,
         capacity_frames: 128,
     };
-    let vout_name = stream_name(StreamDirection::Vout, &vout_uid);
-    let vin_name = stream_name(StreamDirection::Vin, &vin_uid);
+    let vout_name =
+        stream_name_tagged(StreamDirection::Vout, &vout_uid, &ring_token_for(&vout_uid));
+    let vin_name = stream_name_tagged(StreamDirection::Vin, &vin_uid, &ring_token_for(&vin_uid));
 
     let mut saw_sink_frames = false;
     tokio::time::sleep(Duration::from_millis(30)).await;
@@ -662,7 +671,8 @@ async fn daemon_ipc_shm_soak_survives_ring_churn_and_reports_deadline_pressure()
         let read_frames = vin
             .lock()
             .read_interleaved(&mut rendered)
-            .expect("read sink sample");
+            .expect("read sink sample")
+            .frames;
         if read_frames > 0 {
             saw_sink_frames = true;
         }
@@ -697,5 +707,191 @@ async fn daemon_ipc_shm_soak_survives_ring_churn_and_reports_deadline_pressure()
     let _ = global_registry().remove(&vout_name);
     let _ = global_registry().remove(&vin_name);
     let _ = fs::remove_file(&socket_path);
+    let _ = fs::remove_file(&log_path);
+}
+
+#[test]
+fn app_owned_virtual_input_skips_render_and_reports_producer_health() {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let vin_uid = format!("x{:x}", suffix % 0xFFFFF);
+
+    let mut profile = Profile::default();
+    profile.audio.buffer_frames = 16;
+    profile.virtual_devices.inputs.push(VirtualInputDevice {
+        id: "mic".to_string(),
+        name: "App Mic".to_string(),
+        channels: Some(1),
+        uid: Some(vin_uid.clone()),
+        mix: None,
+        producer: ProducerKind::ExternalApp,
+    });
+
+    let graph = build_routing_graph(&profile).expect("graph");
+    let sample_rate = profile.audio.sample_rate.as_value().unwrap_or(48_000);
+    let engine = Arc::new(Engine::new(EngineSnapshot {
+        graph: graph.clone(),
+        sample_rate,
+        buffer_frames: 16,
+    }));
+    let devices = vec![DeviceDescriptor {
+        id: "mic".to_string(),
+        name: "App Mic".to_string(),
+        uid: vin_uid.clone(),
+        kind: NodeKind::VirtualInput,
+        channels: 1,
+        managed: true,
+    }];
+
+    // The render config must not list the app-owned input as a sink ring.
+    let config =
+        super::render_runtime_config_from_state(Some(&profile), &devices).expect("render config");
+    assert!(
+        config.vin_sinks.is_empty(),
+        "external_app inputs must be skipped by the render loop"
+    );
+
+    let log_path = temp_log_path("producer-health");
+    fs::write(&log_path, "boot\n").expect("seed log file");
+    let daemon = MarsDaemon::new(log_path.clone());
+    {
+        let mut state = daemon.state.lock();
+        state.current_profile_path = Some("in-memory-profile".to_string());
+        state.current_profile = Some(profile.clone());
+        state.graph = Some(graph);
+        state.engine = Some(engine);
+        state.devices = devices;
+    }
+
+    // Absent until a producer attaches.
+    let status = daemon.status_internal();
+    let producer = status
+        .virtual_input_producers
+        .first()
+        .expect("producer status present");
+    assert_eq!(producer.uid, vin_uid);
+    assert_eq!(producer.state, ProducerState::Absent);
+    assert_eq!(producer.attach_count, 0);
+
+    // Attach + write like an SDK LiveWriter would.
+    let ring_name = stream_name_tagged(StreamDirection::Vin, &vin_uid, &ring_token_for(&vin_uid));
+    let spec = RingSpec {
+        sample_rate,
+        channels: 1,
+        capacity_frames: 16 * 8,
+    };
+    let ring = global_registry()
+        .create_or_open(&ring_name, spec)
+        .expect("open producer ring");
+    {
+        let mut guard = ring.lock();
+        guard.attach_producer();
+        let _ = guard.write_interleaved(&[0.5_f32; 32]).expect("write");
+    }
+
+    let status = daemon.status_internal();
+    let producer = status
+        .virtual_input_producers
+        .first()
+        .expect("producer status present");
+    assert_eq!(producer.state, ProducerState::Active);
+    assert_eq!(producer.attach_count, 1);
+    assert_eq!(producer.write_idx, 32);
+
+    let _ = global_registry().remove(&ring_name);
+    let _ = fs::remove_file(&log_path);
+}
+
+#[test]
+fn overlay_merge_adds_app_owned_inputs_and_rejects_conflicts() {
+    use mars_types::AppVirtualInput;
+
+    let overlay = AppVirtualInput {
+        app_id: "com.example.app".to_string(),
+        id: "primary-mic".to_string(),
+        name: "Virtual Mic".to_string(),
+        uid: "com.example.app.primary-mic".to_string(),
+        sample_rate: 48_000,
+        channels: 1,
+        producer: ProducerKind::ExternalApp,
+    };
+
+    // Clean merge into an empty profile.
+    let mut profile = Profile::default();
+    super::merge_overlay_inputs(&mut profile, std::slice::from_ref(&overlay)).expect("merge");
+    let merged = profile
+        .virtual_devices
+        .inputs
+        .iter()
+        .find(|input| input.id == "primary-mic")
+        .expect("overlay input present");
+    assert_eq!(merged.producer, ProducerKind::ExternalApp);
+    assert_eq!(merged.uid.as_deref(), Some("com.example.app.primary-mic"));
+    // Merged profiles must still build a valid graph.
+    build_routing_graph(&profile).expect("graph builds with overlay input");
+
+    // Conflicting id with the user profile is rejected, not silently won.
+    let mut conflicted = Profile::default();
+    conflicted.virtual_devices.inputs.push(VirtualInputDevice {
+        id: "primary-mic".to_string(),
+        name: "User Mic".to_string(),
+        channels: Some(2),
+        uid: None,
+        mix: None,
+        producer: ProducerKind::default(),
+    });
+    let error = super::merge_overlay_inputs(&mut conflicted, std::slice::from_ref(&overlay))
+        .expect_err("id conflict must fail");
+    assert!(error.contains("conflict"), "got: {error}");
+
+    // Sample-rate mismatch is rejected (issue #48 lock).
+    let mut wrong_rate = overlay.clone();
+    wrong_rate.sample_rate = 44_100;
+    wrong_rate.id = "other-mic".to_string();
+    wrong_rate.uid = "com.example.app.other".to_string();
+    let mut profile = Profile::default();
+    let error = super::merge_overlay_inputs(&mut profile, std::slice::from_ref(&wrong_rate))
+        .expect_err("rate mismatch must fail");
+    assert!(error.contains("48000"), "got: {error}");
+}
+
+#[test]
+fn ensure_virtual_input_validates_spec_before_touching_state() {
+    use mars_types::AppVirtualInput;
+
+    let log_path = temp_log_path("ensure-validate");
+    fs::write(&log_path, "boot\n").expect("seed log file");
+    let daemon = MarsDaemon::new(log_path.clone());
+
+    let mut spec = AppVirtualInput {
+        app_id: String::new(),
+        id: "mic".to_string(),
+        name: "Mic".to_string(),
+        uid: "u".to_string(),
+        sample_rate: 48_000,
+        channels: 1,
+        producer: ProducerKind::ExternalApp,
+    };
+    let error = daemon
+        .ensure_virtual_input_internal(spec.clone())
+        .expect_err("empty app_id rejected");
+    assert!(error.message.contains("non-empty"));
+
+    spec.app_id = "com.example.app".to_string();
+    spec.producer = ProducerKind::Daemon;
+    let error = daemon
+        .ensure_virtual_input_internal(spec.clone())
+        .expect_err("daemon producer rejected");
+    assert!(error.message.contains("external_app"));
+
+    spec.producer = ProducerKind::ExternalApp;
+    spec.channels = 8;
+    let error = daemon
+        .ensure_virtual_input_internal(spec)
+        .expect_err("channel count rejected");
+    assert!(error.message.contains("channel"));
+
     let _ = fs::remove_file(&log_path);
 }

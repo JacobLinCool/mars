@@ -117,6 +117,7 @@ pub const K_AUDIO_DEVICE_PROPERTY_STREAMS: UInt32 = fourcc(b"stm#");
 pub const K_AUDIO_DEVICE_PROPERTY_NOMINAL_SAMPLE_RATE: UInt32 = fourcc(b"nsrt");
 pub const K_AUDIO_DEVICE_PROPERTY_AVAILABLE_NOMINAL_SAMPLE_RATES: UInt32 = fourcc(b"nsr#");
 pub const K_AUDIO_DEVICE_PROPERTY_ZERO_TIME_STAMP_PERIOD: UInt32 = fourcc(b"ring");
+pub const K_AUDIO_DEVICE_PROPERTY_BUFFER_FRAME_SIZE_RANGE: UInt32 = fourcc(b"fsz#");
 pub const K_AUDIO_DEVICE_PROPERTY_SAFETY_OFFSET: UInt32 = fourcc(b"saft");
 pub const K_AUDIO_DEVICE_PROPERTY_CLOCK_DOMAIN: UInt32 = fourcc(b"clkd");
 pub const K_AUDIO_DEVICE_PROPERTY_IS_ALIVE: UInt32 = fourcc(b"livn");
@@ -569,7 +570,10 @@ pub type AudioServerPlugInDriverRef = *mut *const AudioServerPlugInDriverInterfa
 
 // IO operation IDs
 pub const K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_WRITE_MIX: UInt32 = fourcc(b"wmix");
-pub const K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_READ_INPUT: UInt32 = fourcc(b"rdin");
+// AudioServerPlugIn.h: kAudioServerPlugInIOOperationReadInput = 'read'.
+// (Was mistyped as 'rdin', so WillDoIOOperation rejected input cycles and
+// HAL virtual inputs never produced audio — caught by the issue #41 harness.)
+pub const K_AUDIO_SERVER_PLUG_IN_IO_OPERATION_READ_INPUT: UInt32 = fourcc(b"read");
 
 // ---------------------------------------------------------------------------
 // Bundle ID

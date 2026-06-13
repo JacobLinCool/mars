@@ -19,7 +19,9 @@ anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 clap.workspace = true
+crossbeam-queue.workspace = true
 dirs.workspace = true
+libc.workspace = true
 mars-coreaudio = { path = "../mars-coreaudio" }
 mars-audio-tap = { path = "../mars-audio-tap" }
 mars-engine = { path = "../mars-engine" }
@@ -34,6 +36,7 @@ once_cell.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -42,6 +45,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+stats_alloc = "0.1.10"
 
 [[bench]]
 name = "daemon_ipc_shm"

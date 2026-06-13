@@ -12,8 +12,8 @@ use mars_coreaudio::{
 use mars_ipc::{DaemonRequest, DaemonResponse, IpcClient};
 use mars_types::{
     ApplyRequest, AudioConfig, AutoOrU16, AutoOrU32, ClearRequest, ExitCode, ExternalDeviceInfo,
-    ExternalDevices, ExternalInput, ExternalOutput, Pipe, Policy, Profile, VirtualDevices,
-    VirtualInputDevice, VirtualOutputDevice,
+    ExternalDevices, ExternalInput, ExternalOutput, Pipe, Policy, ProducerKind, Profile,
+    VirtualDevices, VirtualInputDevice, VirtualOutputDevice,
 };
 use serde::Serialize;
 use tokio::time::sleep;
@@ -670,6 +670,7 @@ fn build_internal_test_profile(sample_rate: u32, buffer_frames: u32) -> Profile 
             channels: Some(2),
             uid: Some(TEST_VIRTUAL_INPUT_UID.to_string()),
             mix: None,
+            producer: ProducerKind::default(),
         }],
     };
     profile.external = ExternalDevices::default();
@@ -723,6 +724,7 @@ fn build_route_test_profile(
             channels: Some(microphone_channels),
             uid: Some(TEST_VIRTUAL_INPUT_UID.to_string()),
             mix: None,
+            producer: ProducerKind::default(),
         }],
     };
     profile.external = ExternalDevices::default();

@@ -22,3 +22,4 @@ bundles/mars.driver/Contents/MacOS/mars_hal
 .DS_Store
 sudo.secret
 notary.secret
+.claude/worktrees/

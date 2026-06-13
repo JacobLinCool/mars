@@ -4,6 +4,7 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 
 use super::*;
+use crate::shm_backend::stream_name;
 
 static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
@@ -19,27 +20,26 @@ fn insert_test_device(
     let volume_control_id = (!kind.contains("input")).then(|| reg.allocate_id());
     reg.devices.insert(
         uid.to_string(),
-        DeviceObjectInfo {
+        DeviceObjectInfo::new(
             device_id,
             stream_id,
             volume_control_id,
-            uid: uid.to_string(),
-            name: name.to_string(),
-            kind: kind.to_string(),
+            uid.to_string(),
+            name.to_string(),
+            kind.to_string(),
             channels,
-            hidden: false,
-            volume_scalar: 1.0,
-            io_running: false,
-            sample_time_frames: 0,
-            zero_ts_seed: 0,
-        },
+            false,
+            String::new(),
+        ),
     );
+    publish_rt_snapshot(&reg);
     (device_id, stream_id, volume_control_id)
 }
 
 fn remove_test_device(uid: &str) {
     let mut reg = PLUGIN.object_registry.lock();
     reg.devices.remove(uid);
+    publish_rt_snapshot(&reg);
     let _ = global_registry().remove(&stream_name(StreamDirection::Vout, uid));
     let _ = global_registry().remove(&stream_name(StreamDirection::Vin, uid));
 }
@@ -569,9 +569,42 @@ fn zero_timestamp_tracks_monotonic_sample_time_and_seed() {
         )
     };
     assert_eq!(ts_status, K_AUDIO_HARDWARE_NO_ERROR);
-    assert_eq!(sample_time, 2.0);
+    // The zero timestamp is derived from the host clock (the device is the
+    // clock source for its IO graph): sample_time is a whole number of
+    // periods and host_time is anchored, never zero.
+    assert!(sample_time >= 0.0);
+    assert_eq!(
+        sample_time % 1.0,
+        0.0,
+        "sample time sits on a period boundary"
+    );
     assert!(host_time > 0);
     assert!(seed_after_start >= 1);
+
+    // Real time elapsing must advance the zero timestamp even without IO —
+    // wait at least one period (256 frames @ 48kHz ≈ 5.3ms).
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let mut later_sample_time = -1.0_f64;
+    let mut later_host_time = 0_u64;
+    let mut later_seed = 0_u64;
+    // SAFETY: output pointers are valid.
+    let ts_status_later = unsafe {
+        plugin_get_zero_time_stamp(
+            core::ptr::null_mut(),
+            device_id,
+            1,
+            &mut later_sample_time,
+            &mut later_host_time,
+            &mut later_seed,
+        )
+    };
+    assert_eq!(ts_status_later, K_AUDIO_HARDWARE_NO_ERROR);
+    assert!(
+        later_sample_time > sample_time,
+        "device clock must advance with real time ({later_sample_time} <= {sample_time})"
+    );
+    assert!(later_host_time >= host_time);
+    let sample_time = later_sample_time;
 
     // SAFETY: test passes valid object id and ignores driver pointer.
     let stop_status = unsafe { plugin_stop_io(core::ptr::null_mut(), device_id, 1) };
@@ -592,8 +625,75 @@ fn zero_timestamp_tracks_monotonic_sample_time_and_seed() {
         )
     };
     assert_eq!(ts_status_after_stop, K_AUDIO_HARDWARE_NO_ERROR);
-    assert_eq!(sample_time_after_stop, sample_time);
+    assert!(sample_time_after_stop >= sample_time);
     assert!(seed_after_stop > seed_after_start);
+
+    remove_test_device(&uid);
+}
+
+#[test]
+fn nominal_sample_rate_is_locked_to_the_applied_rate() {
+    let _guard = TEST_LOCK.lock();
+    let uid = "test.rate-lock.uid".to_string();
+    let (device_id, _, _) = insert_test_device(&uid, "Rate Locked", "virtual_input", 1);
+
+    let rate_address = AudioObjectPropertyAddress {
+        m_selector: K_AUDIO_DEVICE_PROPERTY_NOMINAL_SAMPLE_RATE,
+        m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+        m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    };
+
+    // Available rates advertise a single-value range == the applied rate.
+    let mut range = AudioValueRange {
+        m_minimum: 0.0,
+        m_maximum: 0.0,
+    };
+    let range_address = AudioObjectPropertyAddress {
+        m_selector: K_AUDIO_DEVICE_PROPERTY_AVAILABLE_NOMINAL_SAMPLE_RATES,
+        m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+        m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    };
+    let mut out_size = 0_u32;
+    // SAFETY: valid pointers, test context.
+    let status = unsafe {
+        device_get_property(
+            device_id,
+            &range_address,
+            0,
+            core::ptr::null(),
+            std::mem::size_of::<AudioValueRange>() as UInt32,
+            &mut out_size,
+            (&mut range as *mut AudioValueRange).cast::<c_void>(),
+        )
+    };
+    assert_eq!(status, K_AUDIO_HARDWARE_NO_ERROR);
+    assert_eq!(range.m_minimum, range.m_maximum, "single rate advertised");
+    let applied_rate = range.m_minimum;
+
+    // Setting the applied rate is an accepted no-op.
+    // SAFETY: valid pointer and size for a Float64 payload.
+    let status = unsafe {
+        device_set_property(
+            device_id,
+            &rate_address,
+            std::mem::size_of::<Float64>() as UInt32,
+            (&applied_rate as *const Float64).cast::<c_void>(),
+        )
+    };
+    assert_eq!(status, K_AUDIO_HARDWARE_NO_ERROR);
+
+    // Any other rate fails cleanly.
+    let other_rate: Float64 = applied_rate + 4_100.0;
+    // SAFETY: valid pointer and size for a Float64 payload.
+    let status = unsafe {
+        device_set_property(
+            device_id,
+            &rate_address,
+            std::mem::size_of::<Float64>() as UInt32,
+            (&other_rate as *const Float64).cast::<c_void>(),
+        )
+    };
+    assert_eq!(status, K_AUDIO_HARDWARE_ILLEGAL_OPERATION_ERROR);
 
     remove_test_device(&uid);
 }

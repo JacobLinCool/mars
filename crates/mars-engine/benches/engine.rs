@@ -6,8 +6,8 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use mars_engine::{Engine, EngineSnapshot, ProcessorControl};
 use mars_graph::build_routing_graph;
 use mars_types::{
-    Bus, MixConfig, MixMode, Pipe, ProcessorChain, ProcessorDefinition, ProcessorKind, Profile,
-    Route, RouteMatrix, VirtualInputDevice, VirtualOutputDevice,
+    Bus, MixConfig, MixMode, Pipe, ProcessorChain, ProcessorDefinition, ProcessorKind,
+    ProducerKind, Profile, Route, RouteMatrix, VirtualInputDevice, VirtualOutputDevice,
 };
 use serde_json::json;
 
@@ -43,6 +43,7 @@ fn simple_profile() -> Profile {
             limit_dbfs: -1.0,
             mode: MixMode::Sum,
         }),
+        producer: ProducerKind::default(),
     });
     p.pipes.push(Pipe {
         from: "app".into(),
@@ -91,6 +92,7 @@ fn complex_profile() -> Profile {
             limit_dbfs: -1.0,
             mode: MixMode::Sum,
         }),
+        producer: ProducerKind::default(),
     });
     p.pipes.push(Pipe {
         from: "app1".into(),
@@ -137,6 +139,7 @@ fn delay_profile() -> Profile {
         channels: Some(2),
         uid: None,
         mix: None,
+        producer: ProducerKind::default(),
     });
     p.pipes.push(Pipe {
         from: "app".into(),
@@ -165,6 +168,7 @@ fn channel_conversion_profile() -> Profile {
         channels: Some(2),
         uid: None,
         mix: None,
+        producer: ProducerKind::default(),
     });
     p.pipes.push(Pipe {
         from: "mono-src".into(),
@@ -216,6 +220,7 @@ fn multisource_multioutput_profile() -> Profile {
             limit_dbfs: -1.0,
             mode: MixMode::Sum,
         }),
+        producer: ProducerKind::default(),
     });
     p.virtual_devices.inputs.push(VirtualInputDevice {
         id: "monitor".into(),
@@ -227,6 +232,7 @@ fn multisource_multioutput_profile() -> Profile {
             limit_dbfs: -1.0,
             mode: MixMode::Average,
         }),
+        producer: ProducerKind::default(),
     });
     p.virtual_devices.inputs.push(VirtualInputDevice {
         id: "record".into(),
@@ -238,6 +244,7 @@ fn multisource_multioutput_profile() -> Profile {
             limit_dbfs: -1.0,
             mode: MixMode::Sum,
         }),
+        producer: ProducerKind::default(),
     });
 
     for source in ["app1", "app2", "app3"] {
@@ -326,6 +333,7 @@ fn matrix_profile(channels: u16) -> Profile {
         channels: Some(channels),
         uid: None,
         mix: None,
+        producer: ProducerKind::default(),
     });
     p.routes.push(Route {
         id: "matrix-route".into(),
@@ -391,6 +399,7 @@ fn chain_profile(kinds: &[ProcessorKind]) -> Profile {
         channels: Some(2),
         uid: None,
         mix: None,
+        producer: ProducerKind::default(),
     });
 
     let mut processor_ids = Vec::with_capacity(kinds.len());
@@ -437,6 +446,7 @@ fn timeshift_profile(channels: u16, delay_ms: f32, max_delay_ms: f32) -> Profile
         channels: Some(channels),
         uid: None,
         mix: None,
+        producer: ProducerKind::default(),
     });
     p.processors.push(ProcessorDefinition {
         id: "ts-proc".into(),

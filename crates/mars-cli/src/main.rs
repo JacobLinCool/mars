@@ -9,6 +9,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use mars_ipc::{DaemonRequest, DaemonResponse, IpcClient, LogRequest, LogResponse};
 use mars_profile::{TemplateKind, render_template};
+use mars_sdk::runtime;
 use mars_types::{
     ApplyRequest, CaptureProcessInfo, ClearRequest, DEFAULT_PROFILE_DIR_RELATIVE,
     DEFAULT_SOCKET_PATH_RELATIVE, DaemonStatus, DoctorReport, ExitCode, PlanRequest,
@@ -101,6 +102,47 @@ enum Commands {
         follow: bool,
     },
     Doctor,
+    /// Manage the installed MARS runtime (binaries, driver, LaunchAgent)
+    Runtime {
+        #[command(subcommand)]
+        command: RuntimeCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RuntimeCommands {
+    /// Report the installed runtime state without mutating anything
+    Status,
+    /// Install a runtime package built by scripts/package-runtime.sh
+    Install {
+        /// Path to mars-runtime-<version>.tar.gz
+        #[arg(long)]
+        package: PathBuf,
+        /// Skip code-signature/notarization checks (development builds only)
+        #[arg(long)]
+        allow_unsigned: bool,
+        /// Run the privileged install script via sudo instead of printing it
+        #[arg(long)]
+        privileged_exec: bool,
+    },
+    /// Update an existing install (refuses downgrades)
+    Update {
+        /// Path to mars-runtime-<version>.tar.gz
+        #[arg(long)]
+        package: PathBuf,
+        /// Skip code-signature/notarization checks (development builds only)
+        #[arg(long)]
+        allow_unsigned: bool,
+        /// Run the privileged install script via sudo instead of printing it
+        #[arg(long)]
+        privileged_exec: bool,
+    },
+    /// Remove the runtime (idempotent)
+    Uninstall {
+        /// Run the privileged uninstall script via sudo instead of printing it
+        #[arg(long)]
+        privileged_exec: bool,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -496,7 +538,290 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 ExitCode::DriverUnavailable
             })
         }
+        Commands::Runtime { command } => run_runtime_command(cli.json, command).await,
     }
+}
+
+async fn run_runtime_command(json: bool, command: RuntimeCommands) -> Result<ExitCode, CliError> {
+    let layout = runtime::RuntimeLayout::standard().map_err(|error| CliError::WithExit {
+        message: error.to_string(),
+        exit_code: ExitCode::InvalidInput,
+    })?;
+
+    match command {
+        RuntimeCommands::Status => {
+            let status = runtime::runtime_status(&layout, &runtime::StatusOptions::default()).await;
+            print_output(json, &status, || format_runtime_status(&status))?;
+            Ok(ExitCode::Success)
+        }
+        RuntimeCommands::Install {
+            package,
+            allow_unsigned,
+            privileged_exec,
+        } => {
+            match runtime_install(&layout, &package, allow_unsigned, privileged_exec, false).await {
+                Ok(outcome) => {
+                    print_output(json, &outcome.payload, || outcome.human.clone())?;
+                    Ok(ExitCode::Success)
+                }
+                Err(error) => runtime_failure(json, &error),
+            }
+        }
+        RuntimeCommands::Update {
+            package,
+            allow_unsigned,
+            privileged_exec,
+        } => {
+            match runtime_install(&layout, &package, allow_unsigned, privileged_exec, true).await {
+                Ok(outcome) => {
+                    print_output(json, &outcome.payload, || outcome.human.clone())?;
+                    Ok(ExitCode::Success)
+                }
+                Err(error) => runtime_failure(json, &error),
+            }
+        }
+        RuntimeCommands::Uninstall { privileged_exec } => {
+            match runtime_uninstall(&layout, privileged_exec).await {
+                Ok(outcome) => {
+                    print_output(json, &outcome.payload, || outcome.human.clone())?;
+                    Ok(ExitCode::Success)
+                }
+                Err(error) => runtime_failure(json, &error),
+            }
+        }
+    }
+}
+
+struct RuntimeOutcome {
+    payload: serde_json::Value,
+    human: String,
+}
+
+async fn runtime_install(
+    layout: &runtime::RuntimeLayout,
+    package: &Path,
+    allow_unsigned: bool,
+    privileged_exec: bool,
+    is_update: bool,
+) -> Result<RuntimeOutcome, runtime::RuntimeError> {
+    let action = if is_update { "update" } else { "install" };
+
+    let staging = layout.home.join("Library/Caches/mars/runtime-staging");
+    let _ = fs::remove_dir_all(&staging);
+    let package_root = runtime::unpack_package(package, &staging)?;
+    let manifest =
+        runtime::verify_package(&package_root, &runtime::VerifyOptions { allow_unsigned })?;
+
+    if is_update {
+        let installed = runtime::read_receipt(&layout.receipt_path)
+            .map(|receipt| receipt.version)
+            .or_else(|| runtime::driver_bundle_version(&layout.driver_bundle_path));
+        let Some(installed) = installed else {
+            return Err(runtime::RuntimeError::NotInstalled);
+        };
+        match runtime::compare_versions(&manifest.version, &installed) {
+            std::cmp::Ordering::Less => {
+                return Err(runtime::RuntimeError::VersionDowngrade {
+                    installed,
+                    package: manifest.version.clone(),
+                });
+            }
+            std::cmp::Ordering::Equal => {
+                let payload = serde_json::json!({
+                    "ok": true,
+                    "action": action,
+                    "updated": false,
+                    "reason": "already_current",
+                    "version": manifest.version,
+                });
+                return Ok(RuntimeOutcome {
+                    human: format!("runtime {} is already installed", manifest.version),
+                    payload,
+                });
+            }
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+
+    let script_path = staging.join("mars-privileged-install.sh");
+    runtime::write_executable_script(
+        &script_path,
+        &runtime::render_privileged_install_script(&package_root),
+    )?;
+
+    // Drain the running daemon before binaries/driver are replaced so the
+    // privileged copy never races an active render loop.
+    let drained = runtime::bootout_daemon().unwrap_or(false);
+
+    let privileged_executed = if privileged_exec {
+        run_privileged_script(&script_path)?;
+        true
+    } else {
+        false
+    };
+
+    let user_report = runtime::install_user_components(layout, &package_root, &manifest)?;
+    let status = runtime::runtime_status(layout, &runtime::StatusOptions::default()).await;
+
+    let uid = runtime::current_uid()?;
+    let next_steps = if privileged_executed {
+        Vec::new()
+    } else {
+        vec![
+            format!("sudo {}", script_path.display()),
+            format!(
+                "launchctl kickstart -k gui/{uid}/{}",
+                runtime::LAUNCH_AGENT_LABEL
+            ),
+        ]
+    };
+
+    let human = if privileged_executed {
+        format!(
+            "runtime {} {action} complete (state={})",
+            manifest.version,
+            serde_json::to_value(status.state)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_default()
+        )
+    } else {
+        format!(
+            "runtime {} {action} prepared; finish with:\n  {}",
+            manifest.version,
+            next_steps.join("\n  ")
+        )
+    };
+
+    let payload = serde_json::json!({
+        "ok": true,
+        "action": action,
+        "version": manifest.version,
+        "package_root": package_root.display().to_string(),
+        "privileged_script": script_path.display().to_string(),
+        "privileged_executed": privileged_executed,
+        "daemon_drained": drained,
+        "next_steps": next_steps,
+        "user_install": user_report,
+        "status": status,
+    });
+    Ok(RuntimeOutcome { payload, human })
+}
+
+async fn runtime_uninstall(
+    layout: &runtime::RuntimeLayout,
+    privileged_exec: bool,
+) -> Result<RuntimeOutcome, runtime::RuntimeError> {
+    // The privileged script lives outside ~/Library/Caches/mars because the
+    // user-level cleanup below removes that directory.
+    let script_path = std::env::temp_dir().join("mars-privileged-uninstall.sh");
+    runtime::write_executable_script(&script_path, &runtime::render_privileged_uninstall_script())?;
+
+    let user_report = runtime::uninstall_user_components(layout)?;
+
+    let privileged_executed = if privileged_exec {
+        run_privileged_script(&script_path)?;
+        true
+    } else {
+        false
+    };
+
+    let status = runtime::runtime_status(layout, &runtime::StatusOptions::default()).await;
+    let next_steps = if privileged_executed {
+        Vec::new()
+    } else {
+        vec![format!("sudo {}", script_path.display())]
+    };
+
+    let human = if privileged_executed {
+        "runtime uninstalled".to_string()
+    } else {
+        format!(
+            "user-level runtime state removed; finish with:\n  {}",
+            next_steps.join("\n  ")
+        )
+    };
+
+    let payload = serde_json::json!({
+        "ok": true,
+        "action": "uninstall",
+        "privileged_script": script_path.display().to_string(),
+        "privileged_executed": privileged_executed,
+        "next_steps": next_steps,
+        "user_uninstall": user_report,
+        "status": status,
+    });
+    Ok(RuntimeOutcome { payload, human })
+}
+
+fn run_privileged_script(script_path: &Path) -> Result<(), runtime::RuntimeError> {
+    // Interactive: sudo may prompt for a password, so no output capture and
+    // no deadline here. Host apps should use their own elevation flow instead.
+    let status = Command::new("/usr/bin/sudo")
+        .arg(script_path)
+        .status()
+        .map_err(|error| runtime::RuntimeError::CommandFailed {
+            command: format!("sudo {}", script_path.display()),
+            detail: error.to_string(),
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(runtime::RuntimeError::CommandFailed {
+            command: format!("sudo {}", script_path.display()),
+            detail: format!("exit status {status}"),
+        })
+    }
+}
+
+fn runtime_failure(json: bool, error: &runtime::RuntimeError) -> Result<ExitCode, CliError> {
+    let exit_code = runtime_error_exit_code(error);
+    if json {
+        let payload = serde_json::json!({
+            "ok": false,
+            "code": error.code(),
+            "message": error.to_string(),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        Ok(exit_code)
+    } else {
+        Err(CliError::WithExit {
+            message: format!("{error} [{}]", error.code()),
+            exit_code,
+        })
+    }
+}
+
+fn runtime_error_exit_code(error: &runtime::RuntimeError) -> ExitCode {
+    match error.code() {
+        "command_failed" | "command_timed_out" | "io_error" | "home_unavailable" => {
+            ExitCode::ApplyFailed
+        }
+        _ => ExitCode::InvalidInput,
+    }
+}
+
+fn format_runtime_status(status: &runtime::RuntimeStatus) -> String {
+    let state = match status.state {
+        runtime::RuntimeState::Missing => "missing",
+        runtime::RuntimeState::InstalledNotRunning => "installed_not_running",
+        runtime::RuntimeState::Healthy => "healthy",
+        runtime::RuntimeState::Stale => "stale",
+        runtime::RuntimeState::Incompatible => "incompatible",
+    };
+    format!(
+        "state={} installed_version={} driver_version={} daemon_version={} protocol={} cli={} daemon_bin={} driver={} launch_agent={} responding={}",
+        state,
+        status.installed_version.as_deref().unwrap_or("<unknown>"),
+        status.driver_version.as_deref().unwrap_or("<unknown>"),
+        status.daemon_version.as_deref().unwrap_or("<unknown>"),
+        status.protocol_version,
+        status.cli_binary_installed,
+        status.daemon_binary_installed,
+        status.driver_bundle_installed,
+        status.launch_agent_installed,
+        status.daemon_responding
+    )
 }
 
 fn print_output<T>(json: bool, value: &T, human: impl FnOnce() -> String) -> Result<(), CliError>

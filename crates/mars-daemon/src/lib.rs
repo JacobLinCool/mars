@@ -1,7 +1,10 @@
-#![forbid(unsafe_code)]
+// `deny` instead of `forbid` so the render QoS module can opt into the one
+// pthread FFI call it needs; everything else stays unsafe-free.
+#![deny(unsafe_code)]
 //! marsd daemon implementation.
 
 pub mod capture_runtime;
+mod render_qos;
 pub mod sink_runtime;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -34,12 +37,14 @@ use mars_ipc::{
     ApiError, DaemonRequest, DaemonResponse, LogRequest, LogResponse, RequestHandler, serve,
 };
 use mars_profile::{ValidatedProfile, load_profile, validate_only};
-use mars_shm::{RingSpec, StreamDirection, global_registry, stream_name};
+use mars_shm::{RingSpec, StreamDirection, global_registry, ring_token_for, stream_name_tagged};
 use mars_types::{
-    ApplyPlan, ApplyRequest, ApplyResult, CaptureRuntimeHealth, CaptureRuntimeStatus, DaemonStatus,
-    DeviceDescriptor, DriverStatusSummary, ExitCode, ExternalRuntimeStatus, MANAGED_UID_PREFIX,
-    NodeKind, PlanChange, PlanChangeKind, PlanRequest, PluginHostRuntimeStatus, Profile,
-    RuntimeCounters, SinkRuntimeHealth, SinkRuntimeStatus,
+    AppVirtualInput, ApplyPlan, ApplyRequest, ApplyResult, CaptureRuntimeHealth,
+    CaptureRuntimeStatus, DaemonStatus, DeviceDescriptor, DriverStatusSummary, EnsuredVirtualInput,
+    ExitCode, ExternalRuntimeStatus, MANAGED_UID_PREFIX, NodeKind, PlanChange, PlanChangeKind,
+    PlanRequest, PluginHostRuntimeStatus, ProducerKind, ProducerState, Profile,
+    RemoveVirtualInputRequest, RuntimeCounters, SinkRuntimeHealth, SinkRuntimeStatus,
+    VirtualInputDevice, VirtualInputProducerStatus, VirtualInputStatusRequest,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -66,7 +71,20 @@ struct DaemonState {
     capture_runtime: CaptureRuntimeStatus,
     sink_runtime: SinkRuntimeStatus,
     plugin_runtime: PluginHostRuntimeStatus,
+    /// Last observed producer progress per app-owned virtual input uid,
+    /// used to classify producers as active vs stale between status calls.
+    producer_observations: HashMap<String, ProducerObservation>,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct ProducerObservation {
+    write_idx: u64,
+    underrun_count: u64,
+    last_progress: Instant,
+}
+
+/// A producer with no write progress for this long is reported stale.
+const PRODUCER_STALE_AFTER: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DriverAppliedState {
@@ -101,6 +119,7 @@ struct RenderEndpoint {
     node_id: String,
     uid: String,
     channels: u16,
+    ring_token: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,8 +225,13 @@ impl RenderRuntime {
             None
         } else {
             Some(
-                SinkRuntime::start(config.sink_bindings.clone(), config.sample_rate, 256)
-                    .map_err(|error| format!("sink runtime startup failed: {error}"))?,
+                SinkRuntime::start(
+                    config.sink_bindings.clone(),
+                    config.sample_rate,
+                    config.buffer_frames as usize,
+                    256,
+                )
+                .map_err(|error| format!("sink runtime startup failed: {error}"))?,
             )
         };
         let sink_submitter = sink_runtime.as_ref().map(SinkRuntime::submitter);
@@ -219,6 +243,7 @@ impl RenderRuntime {
         let handle = std::thread::Builder::new()
             .name("marsd-render".to_string())
             .spawn(move || {
+                render_qos::promote_render_thread_qos();
                 run_render_loop(
                     engine,
                     thread_config,
@@ -321,6 +346,10 @@ fn run_render_loop(
         .map(|endpoint| (endpoint.clone(), None))
         .collect::<Vec<(RenderEndpoint, Option<mars_shm::SharedRingHandle>)>>();
 
+    // Absolute deadline of the next cycle start; stepped by `period` every
+    // cycle so sleep wake-up latency does not accumulate as drift.
+    let mut next_deadline = Instant::now();
+
     while !stop.load(Ordering::Relaxed) {
         let started = Instant::now();
 
@@ -331,7 +360,8 @@ fn run_render_loop(
                     channels: endpoint.channels,
                     capacity_frames: config.buffer_frames.saturating_mul(8),
                 };
-                let name = stream_name(StreamDirection::Vout, &endpoint.uid);
+                let name =
+                    stream_name_tagged(StreamDirection::Vout, &endpoint.uid, &endpoint.ring_token);
                 *ring_handle = global_registry().create_or_open(&name, spec).ok();
             }
 
@@ -341,8 +371,8 @@ fn run_render_loop(
             if let Some(handle) = ring_handle {
                 let mut guard = handle.lock();
                 match guard.read_interleaved(samples) {
-                    Ok(read_frames) => {
-                        let keep = read_frames.saturating_mul(endpoint.channels as usize);
+                    Ok(transfer) => {
+                        let keep = transfer.frames.saturating_mul(endpoint.channels as usize);
                         if keep < samples.len() {
                             samples[keep..].fill(0.0);
                         }
@@ -386,7 +416,11 @@ fn run_render_loop(
                         channels: endpoint.channels,
                         capacity_frames: config.buffer_frames.saturating_mul(8),
                     };
-                    let name = stream_name(StreamDirection::Vin, &endpoint.uid);
+                    let name = stream_name_tagged(
+                        StreamDirection::Vin,
+                        &endpoint.uid,
+                        &endpoint.ring_token,
+                    );
                     *ring_handle = global_registry().create_or_open(&name, spec).ok();
                 }
 
@@ -427,17 +461,19 @@ fn run_render_loop(
         }
 
         if let Some(external_runtime) = external_runtime.as_ref() {
-            let snapshot = external_runtime.snapshot();
-            *metrics.external_runtime.lock() = snapshot.status.clone();
+            // Counters-only fast path: reads three atomics without locks or
+            // allocation. The full status snapshot is assembled on demand by
+            // the IPC/status path instead of every render cycle.
+            let counters = external_runtime.counters();
             metrics
                 .external_underrun_count
-                .store(snapshot.counters.underrun_count, Ordering::Relaxed);
+                .store(counters.underrun_count, Ordering::Relaxed);
             metrics
                 .external_overrun_count
-                .store(snapshot.counters.overrun_count, Ordering::Relaxed);
+                .store(counters.overrun_count, Ordering::Relaxed);
             metrics
                 .external_xrun_count
-                .store(snapshot.counters.xrun_count, Ordering::Relaxed);
+                .store(counters.xrun_count, Ordering::Relaxed);
         }
 
         if inject_sleep_ms > 0 {
@@ -447,13 +483,22 @@ fn run_render_loop(
         let cycle_ns = started.elapsed().as_nanos() as u64;
         metrics.last_cycle_ns.store(cycle_ns, Ordering::Relaxed);
         update_max_atomic(&metrics.max_cycle_ns, cycle_ns);
-        if cycle_ns > period.as_nanos() as u64 {
+
+        // Absolute-deadline pacing: sleep until `next_deadline` instead of
+        // `period - cycle` so wake-up latency is compensated on the next
+        // cycle. A deadline miss is a cycle that exceeded the period or a
+        // wake-up that landed past the absolute deadline.
+        next_deadline += period;
+        let now = Instant::now();
+        if cycle_ns > period.as_nanos() as u64 || now >= next_deadline {
             metrics.deadline_miss_count.fetch_add(1, Ordering::Relaxed);
+        }
+        if now < next_deadline {
+            std::thread::sleep(next_deadline - now);
         } else {
-            let remain = period.saturating_sub(Duration::from_nanos(cycle_ns));
-            if !remain.is_zero() {
-                std::thread::sleep(remain);
-            }
+            // Overrun: re-anchor one period ahead of now instead of chasing
+            // the missed deadlines with back-to-back cycles.
+            next_deadline = now + period;
         }
     }
 }
@@ -650,7 +695,7 @@ impl MarsDaemon {
         let deadline = Self::apply_deadline(request.timeout_ms);
         Self::ensure_within_deadline(deadline, "profile-validate")?;
 
-        let validated = load_profile(Path::new(&request.profile_path)).map_err(|error| {
+        let mut validated = load_profile(Path::new(&request.profile_path)).map_err(|error| {
             ApiError::new(
                 format!(
                     "profile validation failed (strict policy requires apply_mode=atomic and on_missing_external=error): {error}"
@@ -658,6 +703,8 @@ impl MarsDaemon {
                 ExitCode::InvalidInput,
             )
         })?;
+        merge_overlay_inputs(&mut validated.profile, &load_virtual_input_overlays())
+            .map_err(|error| ApiError::new(error, ExitCode::InvalidInput))?;
 
         let plan_request = PlanRequest {
             profile_path: request.profile_path.clone(),
@@ -870,12 +917,15 @@ impl MarsDaemon {
             }
         }
 
-        if let Some(external_status) = self
-            .render_runtime
-            .lock()
-            .as_ref()
-            .map(|runtime| runtime.metrics.external_runtime.lock().clone())
-        {
+        if let Some(external_status) = self.render_runtime.lock().as_ref().map(|runtime| {
+            // The render loop no longer refreshes metrics.external_runtime
+            // every cycle; take a fresh status snapshot on this on-demand
+            // path instead.
+            runtime.external_runtime.as_ref().map_or_else(
+                || runtime.metrics.external_runtime.lock().clone(),
+                |external| external.snapshot().status,
+            )
+        }) {
             self.state.lock().external_runtime = external_status;
         }
         if let Some(sink_status) = self
@@ -1042,6 +1092,7 @@ impl MarsDaemon {
         capture_runtime =
             enrich_capture_runtime_with_external_inputs(capture_runtime, &external_input_snapshots);
         self.state.lock().plugin_runtime = plugin_runtime.clone();
+        let virtual_input_producers = self.virtual_input_producer_statuses();
 
         DaemonStatus {
             running,
@@ -1058,7 +1109,279 @@ impl MarsDaemon {
             capture_runtime,
             sink_runtime,
             plugin_runtime,
+            virtual_input_producers,
             updated_at: Utc::now(),
+        }
+    }
+
+    /// Observe producer health for app-owned (`producer: external_app`)
+    /// virtual inputs by reading their ring headers (#35).
+    ///
+    /// The daemon never writes these rings; it classifies producers from the
+    /// v2 header counters: `absent` until the first attach, `active` while
+    /// `write_idx` progresses, `underrunning` when the consumer underruns
+    /// despite progress, and `stale` once progress stops for
+    /// [`PRODUCER_STALE_AFTER`].
+    fn virtual_input_producer_statuses(&self) -> Vec<VirtualInputProducerStatus> {
+        let profile = { self.state.lock().current_profile.clone() };
+        let Some(profile) = profile else {
+            return Vec::new();
+        };
+
+        let sample_rate = profile.audio.sample_rate.as_value().unwrap_or(48_000);
+        let default_channels = profile.audio.channels.as_value().unwrap_or(2);
+        let mut statuses = Vec::new();
+
+        for input in profile
+            .virtual_devices
+            .inputs
+            .iter()
+            .filter(|input| input.producer == ProducerKind::ExternalApp)
+        {
+            let uid = input
+                .uid
+                .clone()
+                .unwrap_or_else(|| format!("{MANAGED_UID_PREFIX}vin.{}", input.id));
+            let spec = RingSpec {
+                sample_rate,
+                channels: input.channels.unwrap_or(default_channels),
+                capacity_frames: profile.audio.buffer_frames.saturating_mul(8),
+            };
+            let name = stream_name_tagged(StreamDirection::Vin, &uid, &ring_token_for(&uid));
+            let header = global_registry()
+                .create_or_open(&name, spec)
+                .ok()
+                .and_then(|handle| handle.lock().header().ok());
+
+            let Some(header) = header else {
+                statuses.push(VirtualInputProducerStatus {
+                    id: input.id.clone(),
+                    uid,
+                    kind: ProducerKind::ExternalApp,
+                    state: ProducerState::Absent,
+                    write_idx: 0,
+                    underrun_count: 0,
+                    attach_count: 0,
+                    generation: 0,
+                });
+                continue;
+            };
+
+            let now = Instant::now();
+            let (progressed, underrun_delta, stalled_for) =
+                {
+                    let mut state = self.state.lock();
+                    let observation = state.producer_observations.entry(uid.clone()).or_insert(
+                        ProducerObservation {
+                            write_idx: header.write_idx,
+                            underrun_count: header.underrun_count,
+                            last_progress: now,
+                        },
+                    );
+                    let progressed = header.write_idx > observation.write_idx;
+                    let underrun_delta = header
+                        .underrun_count
+                        .saturating_sub(observation.underrun_count);
+                    if progressed {
+                        observation.last_progress = now;
+                    }
+                    let stalled_for = now.duration_since(observation.last_progress);
+                    observation.write_idx = header.write_idx;
+                    observation.underrun_count = header.underrun_count;
+                    (progressed, underrun_delta, stalled_for)
+                };
+
+            let state = if header.producer_attach_count == 0 {
+                ProducerState::Absent
+            } else if progressed && underrun_delta > 0 {
+                ProducerState::Underrunning
+            } else if progressed || stalled_for <= PRODUCER_STALE_AFTER {
+                ProducerState::Active
+            } else {
+                ProducerState::Stale
+            };
+
+            statuses.push(VirtualInputProducerStatus {
+                id: input.id.clone(),
+                uid,
+                kind: ProducerKind::ExternalApp,
+                state,
+                write_idx: header.write_idx,
+                underrun_count: header.underrun_count,
+                attach_count: header.producer_attach_count,
+                generation: header.producer_generation,
+            });
+        }
+
+        statuses
+    }
+
+    /// Ensure an app-owned virtual input exists (issue #40).
+    ///
+    /// The spec becomes an app-scoped overlay lease persisted across daemon
+    /// restarts; the effective configuration is re-applied through the
+    /// normal atomic transaction. Idempotent per (app_id, id).
+    fn ensure_virtual_input_internal(
+        &self,
+        spec: AppVirtualInput,
+    ) -> Result<EnsuredVirtualInput, ApiError> {
+        if spec.app_id.is_empty() || spec.id.is_empty() || spec.uid.is_empty() {
+            return Err(ApiError::new(
+                "app_id, id, and uid must be non-empty",
+                ExitCode::InvalidInput,
+            ));
+        }
+        if spec.producer != ProducerKind::ExternalApp {
+            return Err(ApiError::new(
+                "ensure_virtual_input only supports producer: external_app",
+                ExitCode::InvalidInput,
+            ));
+        }
+        if !(1..=2).contains(&spec.channels) {
+            return Err(ApiError::new(
+                format!(
+                    "unsupported channel count {} (mono is first-class; stereo accepted)",
+                    spec.channels
+                ),
+                ExitCode::InvalidInput,
+            ));
+        }
+
+        let mut overlays = load_virtual_input_overlays();
+        for other in overlays
+            .iter()
+            .filter(|other| !(other.app_id == spec.app_id && other.id == spec.id))
+        {
+            if other.id == spec.id || other.uid == spec.uid {
+                return Err(ApiError::new(
+                    format!(
+                        "virtual input conflict: '{}' / uid '{}' is leased by app '{}'",
+                        spec.id, spec.uid, other.app_id
+                    ),
+                    ExitCode::InvalidInput,
+                ));
+            }
+        }
+        overlays.retain(|other| !(other.app_id == spec.app_id && other.id == spec.id));
+        overlays.push(spec.clone());
+        persist_virtual_input_overlays(&overlays)
+            .map_err(|error| ApiError::new(error, ExitCode::InvalidInput))?;
+
+        self.reapply_effective_profile()?;
+
+        Ok(self.ensured_virtual_input_response(&spec))
+    }
+
+    /// Remove an app-owned virtual input lease and re-apply (issue #40).
+    fn remove_virtual_input_internal(
+        &self,
+        request: &RemoveVirtualInputRequest,
+    ) -> Result<ApplyResult, ApiError> {
+        let mut overlays = load_virtual_input_overlays();
+        let before = overlays.len();
+        overlays.retain(|other| !(other.app_id == request.app_id && other.id == request.id));
+        if overlays.len() == before {
+            return Err(ApiError::new(
+                format!(
+                    "no virtual input lease for app '{}' id '{}'",
+                    request.app_id, request.id
+                ),
+                ExitCode::InvalidInput,
+            ));
+        }
+        persist_virtual_input_overlays(&overlays)
+            .map_err(|error| ApiError::new(error, ExitCode::InvalidInput))?;
+        self.reapply_effective_profile()
+    }
+
+    /// Producer status for one leased virtual input (issue #40).
+    fn virtual_input_status_internal(
+        &self,
+        request: &VirtualInputStatusRequest,
+    ) -> Result<VirtualInputProducerStatus, ApiError> {
+        let overlays = load_virtual_input_overlays();
+        let Some(lease) = overlays
+            .iter()
+            .find(|other| other.app_id == request.app_id && other.id == request.id)
+        else {
+            return Err(ApiError::new(
+                format!(
+                    "no virtual input lease for app '{}' id '{}'",
+                    request.app_id, request.id
+                ),
+                ExitCode::InvalidInput,
+            ));
+        };
+        let statuses = self.virtual_input_producer_statuses();
+        Ok(statuses
+            .into_iter()
+            .find(|status| status.uid == lease.uid)
+            .unwrap_or(VirtualInputProducerStatus {
+                id: lease.id.clone(),
+                uid: lease.uid.clone(),
+                kind: ProducerKind::ExternalApp,
+                state: ProducerState::Absent,
+                write_idx: 0,
+                underrun_count: 0,
+                attach_count: 0,
+                generation: 0,
+            }))
+    }
+
+    /// Re-apply the current profile (or the synthetic overlay base when no
+    /// profile is applied) so persisted overlays take effect atomically.
+    fn reapply_effective_profile(&self) -> Result<ApplyResult, ApiError> {
+        let current_path = { self.state.lock().current_profile_path.clone() };
+        let profile_path = match current_path {
+            Some(path) if Path::new(&path).exists() => path,
+            _ => overlay_base_profile_path()
+                .map_err(|error| ApiError::new(error, ExitCode::InvalidInput))?
+                .display()
+                .to_string(),
+        };
+        self.apply_internal(ApplyRequest {
+            profile_path,
+            no_delete: false,
+            dry_run: false,
+            timeout_ms: 30_000,
+        })
+    }
+
+    fn ensured_virtual_input_response(&self, spec: &AppVirtualInput) -> EnsuredVirtualInput {
+        let buffer_frames = {
+            let state = self.state.lock();
+            state
+                .current_profile
+                .as_ref()
+                .map_or(default_driver_buffer_frames(), |profile| {
+                    profile.audio.buffer_frames
+                })
+        };
+        let producer = self
+            .virtual_input_producer_statuses()
+            .into_iter()
+            .find(|status| status.uid == spec.uid)
+            .unwrap_or(VirtualInputProducerStatus {
+                id: spec.id.clone(),
+                uid: spec.uid.clone(),
+                kind: ProducerKind::ExternalApp,
+                state: ProducerState::Absent,
+                write_idx: 0,
+                underrun_count: 0,
+                attach_count: 0,
+                generation: 0,
+            });
+        EnsuredVirtualInput {
+            uid: spec.uid.clone(),
+            ring_name: stream_name_tagged(
+                StreamDirection::Vin,
+                &spec.uid,
+                &ring_token_for(&spec.uid),
+            ),
+            sample_rate: spec.sample_rate,
+            channels: spec.channels,
+            capacity_frames: buffer_frames.saturating_mul(8),
+            producer,
         }
     }
 
@@ -1143,16 +1466,89 @@ impl MarsDaemon {
     }
 
     fn doctor_report_internal(&self) -> mars_types::DoctorReport {
+        const ENUMERATION_DEADLINE: Duration = Duration::from_secs(3);
+
+        struct EnumerationFindings {
+            driver_loaded: bool,
+            driver: DriverStatusSummary,
+            driver_version: Option<String>,
+            mic_permission: Option<bool>,
+            capture_tap_supported: bool,
+            capture_note: Option<String>,
+            stub_active: bool,
+        }
+
         let driver_installed = Path::new("/Library/Audio/Plug-Ins/HAL/mars.driver").exists();
         let daemon_reachable = true;
-        let driver_loaded = if driver_installed {
-            mars_hal_client::is_driver_loaded()
-        } else {
-            false
-        };
-        let driver = driver_status_summary();
         let daemon_version = env!("CARGO_PKG_VERSION").to_string();
-        let driver_version = read_driver_version();
+
+        // CoreAudio enumeration (driver plugin lookup, TCC probe, tap
+        // capability probe) can block indefinitely while coreaudiod restarts.
+        // Run it on a detached worker with a hard deadline so doctor always
+        // returns; on timeout the report carries an `enumeration_timed_out`
+        // marker instead of hanging.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("doctor-enumeration".to_string())
+            .spawn(move || {
+                let driver_loaded = if driver_installed {
+                    mars_hal_client::is_driver_loaded()
+                } else {
+                    false
+                };
+                let driver = driver_status_summary();
+                let driver_version = read_driver_version();
+                let mic_permission = detect_microphone_permission();
+                let (capture_tap_supported, capture_note) = match probe_capture_capability() {
+                    Ok(capability) => {
+                        let supported = capability.supported;
+                        let note = if supported {
+                            None
+                        } else {
+                            Some(capability.reason.unwrap_or_else(|| {
+                                "CoreAudio tap APIs are unavailable for process/system capture"
+                                    .to_string()
+                            }))
+                        };
+                        (supported, note)
+                    }
+                    Err(error) => (
+                        false,
+                        Some(format!("failed to probe capture tap capability: {error}")),
+                    ),
+                };
+                let stub_active = driver_stub_active();
+                let _ = sender.send(EnumerationFindings {
+                    driver_loaded,
+                    driver,
+                    driver_version,
+                    mic_permission,
+                    capture_tap_supported,
+                    capture_note,
+                    stub_active,
+                });
+            });
+        let findings = match spawned {
+            // Dropping the handle detaches the worker; a stuck enumeration
+            // thread must never block the IPC response.
+            Ok(_handle) => receiver.recv_timeout(ENUMERATION_DEADLINE).ok(),
+            Err(_) => None,
+        };
+        let enumeration_timed_out = findings.is_none();
+        let findings = findings.unwrap_or(EnumerationFindings {
+            driver_loaded: false,
+            driver: DriverStatusSummary::default(),
+            driver_version: None,
+            mic_permission: None,
+            capture_tap_supported: false,
+            capture_note: None,
+            stub_active: false,
+        });
+
+        let driver_loaded = findings.driver_loaded;
+        let driver = findings.driver;
+        let driver_version = findings.driver_version;
+        let capture_tap_supported = findings.capture_tap_supported;
         let driver_compatible = is_driver_compatible(
             driver_installed,
             driver_loaded,
@@ -1166,55 +1562,47 @@ impl MarsDaemon {
             .unwrap_or(false);
         let (microphone_permission_ok, mic_permission_source) = if env_assume_mic {
             (true, "env_override".to_string())
-        } else if let Some(status) = detect_microphone_permission() {
+        } else if let Some(status) = findings.mic_permission {
             (status, "tcc".to_string())
         } else {
             (false, "unknown".to_string())
         };
 
-        let capture_capability = probe_capture_capability();
-        let capture_tap_supported = capture_capability
-            .as_ref()
-            .map(|capability| capability.supported)
-            .unwrap_or(false);
-
         let mut notes = Vec::new();
         if !driver_installed {
             notes.push("driver not found at /Library/Audio/Plug-Ins/HAL/mars.driver".to_string());
         }
-        if driver_installed && !driver_loaded {
-            notes.push("mars.driver is installed but not loaded by coreaudiod; run: sudo killall -9 coreaudiod".to_string());
-        }
-        if !microphone_permission_ok {
-            notes.push(
-                "microphone permission is not granted or could not be verified; check System Settings > Privacy & Security > Microphone".to_string(),
-            );
-        }
-        if !driver_compatible {
+        if enumeration_timed_out {
             notes.push(format!(
-                "driver/daemon version mismatch: driver={:?}, daemon={}",
-                driver_version, daemon_version
+                "enumeration_timed_out: CoreAudio device enumeration did not complete within {}s; driver, microphone, and capture findings are unavailable",
+                ENUMERATION_DEADLINE.as_secs()
             ));
-        }
-        if driver_stub_active() {
-            notes.push(
-                "driver stub mode active: profile apply can proceed but virtual devices will not be registered in system audio".to_string(),
-            );
+        } else {
+            if driver_installed && !driver_loaded {
+                notes.push("mars.driver is installed but not loaded by coreaudiod; run: sudo killall -9 coreaudiod".to_string());
+            }
+            if !microphone_permission_ok {
+                notes.push(
+                    "microphone permission is not granted or could not be verified; check System Settings > Privacy & Security > Microphone".to_string(),
+                );
+            }
+            if !driver_compatible {
+                notes.push(format!(
+                    "driver/daemon version mismatch: driver={:?}, daemon={}",
+                    driver_version, daemon_version
+                ));
+            }
+            if findings.stub_active {
+                notes.push(
+                    "driver stub mode active: profile apply can proceed but virtual devices will not be registered in system audio".to_string(),
+                );
+            }
+            if let Some(note) = findings.capture_note {
+                notes.push(note);
+            }
         }
         if driver.pending_change {
             notes.push("driver has a pending configuration change".to_string());
-        }
-        match capture_capability {
-            Ok(capability) => {
-                if !capability.supported {
-                    notes.push(capability.reason.unwrap_or_else(|| {
-                        "CoreAudio tap APIs are unavailable for process/system capture".to_string()
-                    }));
-                }
-            }
-            Err(error) => {
-                notes.push(format!("failed to probe capture tap capability: {error}"));
-            }
         }
 
         let state = self.state.lock();
@@ -1296,7 +1684,7 @@ impl RequestHandler for MarsDaemon {
                 Ok(DaemonResponse::Validate(report))
             }
             DaemonRequest::Plan(request) => {
-                let validated =
+                let mut validated =
                     load_profile(Path::new(&request.profile_path)).map_err(|error| {
                         ApiError::new(
                             format!(
@@ -1305,6 +1693,8 @@ impl RequestHandler for MarsDaemon {
                             ExitCode::InvalidInput,
                         )
                     })?;
+                merge_overlay_inputs(&mut validated.profile, &load_virtual_input_overlays())
+                    .map_err(|error| ApiError::new(error, ExitCode::InvalidInput))?;
                 let plan = self.plan_internal(&request, &validated)?;
                 Ok(DaemonResponse::Plan(plan))
             }
@@ -1330,6 +1720,15 @@ impl RequestHandler for MarsDaemon {
             }
             DaemonRequest::Logs(request) => self.logs_internal(&request).map(DaemonResponse::Logs),
             DaemonRequest::Doctor => Ok(DaemonResponse::Doctor(self.doctor_report_internal())),
+            DaemonRequest::EnsureVirtualInput(spec) => self
+                .ensure_virtual_input_internal(spec)
+                .map(DaemonResponse::VirtualInputEnsured),
+            DaemonRequest::RemoveVirtualInput(request) => self
+                .remove_virtual_input_internal(&request)
+                .map(DaemonResponse::VirtualInputRemoved),
+            DaemonRequest::VirtualInputStatus(request) => self
+                .virtual_input_status_internal(&request)
+                .map(DaemonResponse::VirtualInputStatus),
         }
     }
 }
@@ -1447,6 +1846,9 @@ fn driver_runtime_stats() -> Option<HalRuntimeStats> {
             overrun_count: stats.overrun_count,
             xrun_count: stats.xrun_count,
             last_callback_ns: stats.last_callback_ns,
+            start_io_count: stats.start_io_count,
+            zero_timestamp_count: stats.zero_timestamp_count,
+            do_io_count: stats.do_io_count,
         }),
         Err(error) => {
             warn!(error = %error, "failed to query driver runtime stats");
@@ -1711,17 +2113,32 @@ fn render_runtime_config_from_state(
             node_id: device.id.clone(),
             uid: device.uid.clone(),
             channels: device.channels,
+            ring_token: ring_token_for(&device.uid),
         })
         .collect::<Vec<_>>();
     vout_sources.sort_by(|a, b| a.node_id.cmp(&b.node_id));
 
+    // App-owned virtual inputs are produced by an external app; the render
+    // loop must neither create nor write their rings (#35).
+    let app_owned_inputs: std::collections::BTreeSet<&str> = profile
+        .virtual_devices
+        .inputs
+        .iter()
+        .filter(|input| input.producer == mars_types::ProducerKind::ExternalApp)
+        .map(|input| input.id.as_str())
+        .collect();
+
     let mut vin_sinks = devices
         .iter()
-        .filter(|device| matches!(device.kind, NodeKind::VirtualInput))
+        .filter(|device| {
+            matches!(device.kind, NodeKind::VirtualInput)
+                && !app_owned_inputs.contains(device.id.as_str())
+        })
         .map(|device| RenderEndpoint {
             node_id: device.id.clone(),
             uid: device.uid.clone(),
             channels: device.channels,
+            ring_token: ring_token_for(&device.uid),
         })
         .collect::<Vec<_>>();
     vin_sinks.sort_by(|a, b| a.node_id.cmp(&b.node_id));
@@ -1733,6 +2150,7 @@ fn render_runtime_config_from_state(
             node_id: device.id.clone(),
             uid: device.uid.clone(),
             channels: device.channels,
+            ring_token: ring_token_for(&device.uid),
         })
         .collect::<Vec<_>>();
     external_inputs.sort_by(|a, b| a.node_id.cmp(&b.node_id));
@@ -1744,6 +2162,7 @@ fn render_runtime_config_from_state(
             node_id: device.id.clone(),
             uid: device.uid.clone(),
             channels: device.channels,
+            ring_token: ring_token_for(&device.uid),
         })
         .collect::<Vec<_>>();
     external_outputs.sort_by(|a, b| a.node_id.cmp(&b.node_id));
@@ -2029,6 +2448,114 @@ fn path_exists_between_nodes(graph: &RoutingGraph, starts: &[String], targets: &
     false
 }
 
+/// App-scoped virtual-input overlay leases (issue #40): each downstream app
+/// owns the (app_id, id) pairs it ensured. Overlays merge into every
+/// validated profile so plan/apply/status see one effective configuration.
+fn virtual_input_overlays_path() -> Result<PathBuf, String> {
+    if let Ok(path) = std::env::var("MARS_VIRTUAL_INPUT_OVERLAYS_PATH") {
+        return Ok(PathBuf::from(path));
+    }
+    let home = dirs::home_dir().ok_or_else(|| "cannot determine home directory".to_string())?;
+    Ok(home.join("Library/Application Support/mars/virtual_input_overlays.json"))
+}
+
+fn load_virtual_input_overlays() -> Vec<AppVirtualInput> {
+    let Ok(path) = virtual_input_overlays_path() else {
+        return Vec::new();
+    };
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<AppVirtualInput>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn persist_virtual_input_overlays(overlays: &[AppVirtualInput]) -> Result<(), String> {
+    let path = virtual_input_overlays_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create overlay dir: {error}"))?;
+    }
+    let payload = serde_json::to_string_pretty(overlays)
+        .map_err(|error| format!("failed to serialize overlays: {error}"))?;
+    fs::write(&path, payload).map_err(|error| format!("failed to persist overlays: {error}"))
+}
+
+/// Merge app-owned overlay inputs into a validated profile. Conflicts are
+/// errors, never silent precedence: a user profile and an app lease fighting
+/// over an id/uid must be resolved by a human.
+fn merge_overlay_inputs(profile: &mut Profile, overlays: &[AppVirtualInput]) -> Result<(), String> {
+    if overlays.is_empty() {
+        return Ok(());
+    }
+    let audio_rate = profile.audio.sample_rate.as_value().unwrap_or(48_000);
+    for overlay in overlays {
+        let id_taken = profile
+            .virtual_devices
+            .inputs
+            .iter()
+            .any(|input| input.id == overlay.id)
+            || profile
+                .virtual_devices
+                .outputs
+                .iter()
+                .any(|output| output.id == overlay.id)
+            || profile.buses.iter().any(|bus| bus.id == overlay.id);
+        if id_taken {
+            return Err(format!(
+                "virtual input overlay conflict: id '{}' (leased by app '{}') already exists in the profile",
+                overlay.id, overlay.app_id
+            ));
+        }
+        let uid_taken = profile
+            .virtual_devices
+            .inputs
+            .iter()
+            .filter_map(|input| input.uid.as_deref())
+            .chain(
+                profile
+                    .virtual_devices
+                    .outputs
+                    .iter()
+                    .filter_map(|output| output.uid.as_deref()),
+            )
+            .any(|uid| uid == overlay.uid);
+        if uid_taken {
+            return Err(format!(
+                "virtual input overlay conflict: uid '{}' (leased by app '{}') already exists in the profile",
+                overlay.uid, overlay.app_id
+            ));
+        }
+        if overlay.sample_rate != audio_rate {
+            return Err(format!(
+                "virtual input overlay '{}' requires {} Hz but the profile audio rate is {} Hz",
+                overlay.id, overlay.sample_rate, audio_rate
+            ));
+        }
+        profile.virtual_devices.inputs.push(VirtualInputDevice {
+            id: overlay.id.clone(),
+            name: overlay.name.clone(),
+            channels: Some(overlay.channels),
+            uid: Some(overlay.uid.clone()),
+            mix: None,
+            producer: ProducerKind::ExternalApp,
+        });
+    }
+    Ok(())
+}
+
+fn overlay_base_profile_path() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or_else(|| "cannot determine home directory".to_string())?;
+    let dir = home.join("Library/Application Support/mars");
+    fs::create_dir_all(&dir).map_err(|error| format!("failed to create state dir: {error}"))?;
+    let path = dir.join("overlay_base.yaml");
+    if !path.exists() {
+        let base = serde_yaml::to_string(&Profile::default())
+            .map_err(|error| format!("failed to serialize base profile: {error}"))?;
+        fs::write(&path, base).map_err(|error| format!("failed to write base profile: {error}"))?;
+    }
+    Ok(path)
+}
+
 fn driver_state_path() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or_else(|| "cannot determine home directory".to_string())?;
     Ok(home.join("Library/Caches/mars/driver_applied_state.json"))
@@ -2086,6 +2613,7 @@ fn hal_desired_from_driver_applied(state: &DriverAppliedState) -> HalDesiredStat
                 kind: node_kind_to_hal_kind(device.kind),
                 channels: device.channels,
                 hidden: device.hidden,
+                ring_token: ring_token_for(&device.uid),
             })
             .collect(),
     }
@@ -2188,6 +2716,7 @@ fn stage_driver_state(
         });
         hal_devices.push(HalDeviceState {
             id: output.id.clone(),
+            ring_token: ring_token_for(&uid),
             uid,
             name: output.name.clone(),
             kind: node_kind_to_hal_kind(NodeKind::VirtualOutput),
@@ -2213,6 +2742,7 @@ fn stage_driver_state(
         });
         hal_devices.push(HalDeviceState {
             id: input.id.clone(),
+            ring_token: ring_token_for(&uid),
             uid,
             name: input.name.clone(),
             kind: node_kind_to_hal_kind(NodeKind::VirtualInput),

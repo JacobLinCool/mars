@@ -232,6 +232,23 @@ pub struct VirtualInputDevice {
     pub uid: Option<String>,
     #[serde(default)]
     pub mix: Option<MixConfig>,
+    /// Who produces this virtual input's audio. `daemon` (default) means the
+    /// render graph writes the ring; `external_app` means a downstream app
+    /// owns the producer side and the daemon never writes the ring.
+    #[serde(default)]
+    pub producer: ProducerKind,
+}
+
+/// Producer ownership for a virtual input device.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProducerKind {
+    /// The daemon render graph produces this input's audio (legacy behavior).
+    #[default]
+    Daemon,
+    /// An external application owns the sole producer writer; the daemon
+    /// stages the device and reports producer health but never writes audio.
+    ExternalApp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
@@ -937,7 +954,104 @@ pub struct DaemonStatus {
     pub sink_runtime: SinkRuntimeStatus,
     #[serde(default)]
     pub plugin_runtime: PluginHostRuntimeStatus,
+    /// Producer health for app-owned (`producer: external_app`) virtual
+    /// inputs. Empty when no app-owned inputs are configured.
+    #[serde(default)]
+    pub virtual_input_producers: Vec<VirtualInputProducerStatus>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Downstream app request to ensure an app-owned virtual input exists.
+///
+/// Ensured devices live in an app-scoped declarative overlay merged into the
+/// effective configuration: each (app_id, id) pair is a lease the app owns,
+/// persisted across daemon restarts and applied through the same atomic
+/// transaction as profile changes.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct AppVirtualInput {
+    /// Owning application identifier (reverse-DNS recommended).
+    pub app_id: String,
+    /// Node id for this input (unique across the effective config).
+    pub id: String,
+    /// Human-visible device name.
+    pub name: String,
+    /// Stable device uid (drives ring naming and client device selection).
+    pub uid: String,
+    /// Sample rate; must match the effective audio configuration (48 kHz
+    /// today, see issue #48).
+    pub sample_rate: u32,
+    /// Interleaved channel count (mono first-class; multi-channel later).
+    pub channels: u16,
+    /// Producer ownership; `external_app` for downstream apps.
+    #[serde(default)]
+    pub producer: ProducerKind,
+}
+
+/// Request to remove an app-owned virtual input lease.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct RemoveVirtualInputRequest {
+    pub app_id: String,
+    pub id: String,
+}
+
+/// Request for the producer status of one app-owned virtual input.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct VirtualInputStatusRequest {
+    pub app_id: String,
+    pub id: String,
+}
+
+/// Result of ensuring an app-owned virtual input: everything an SDK writer
+/// needs to attach to the ring without knowing MARS naming internals.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct EnsuredVirtualInput {
+    /// Device uid.
+    pub uid: String,
+    /// Fully tagged logical ring name (encapsulates the capability token).
+    pub ring_name: String,
+    /// Ring sample rate.
+    pub sample_rate: u32,
+    /// Ring channel count.
+    pub channels: u16,
+    /// Ring capacity in frames.
+    pub capacity_frames: u32,
+    /// Producer health at ensure time.
+    pub producer: VirtualInputProducerStatus,
+}
+
+/// Health snapshot for an app-owned virtual input producer.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct VirtualInputProducerStatus {
+    /// Profile node id of the virtual input.
+    pub id: String,
+    /// Device uid.
+    pub uid: String,
+    /// Producer ownership declared in the profile.
+    pub kind: ProducerKind,
+    /// Observed producer state.
+    pub state: ProducerState,
+    /// Total frames the producer has written.
+    pub write_idx: u64,
+    /// Consumer-side underrun events on the ring.
+    pub underrun_count: u64,
+    /// Number of times a producer attached to the ring.
+    pub attach_count: u64,
+    /// Producer generation (bumped on attach and detach).
+    pub generation: u64,
+}
+
+/// Observed state of an app-owned virtual input producer.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProducerState {
+    /// No producer has ever attached to the ring.
+    Absent,
+    /// The producer made write progress since the previous observation.
+    Active,
+    /// A producer attached but stopped making progress.
+    Stale,
+    /// The producer is attached but the consumer is underrunning.
+    Underrunning,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]

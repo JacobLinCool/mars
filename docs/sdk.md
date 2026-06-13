@@ -58,6 +58,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `MarsClient::processes()`
 - `MarsClient::logs()/logs_once()`
 - `MarsClient::doctor()`
+- `MarsClient::ensure_virtual_input()/remove_virtual_input()/virtual_input_status()`
+
+## Virtual microphone (app-owned producer)
+
+Downstream apps can own a virtual microphone end to end: MARS stages the
+HAL device and reports producer health, while the app is the sole audio
+producer. Devices are app-scoped declarative leases — persisted across
+daemon restarts, applied atomically, and conflict-checked against the user
+profile and other apps.
+
+```rust
+use mars_sdk::{AppVirtualInput, MarsClient, ProducerKind};
+
+let client = MarsClient::new_default(MarsClient::default_timeout())?;
+let mic = client
+    .ensure_virtual_input(AppVirtualInput {
+        app_id: "com.example.virtual-mic-app".into(),
+        id: "primary-mic".into(),
+        name: "Virtual Mic".into(),
+        uid: "com.example.virtual-mic-app.primary-mic".into(),
+        sample_rate: 48_000, // locked; see issue #48
+        channels: 1,
+        producer: ProducerKind::ExternalApp,
+    })
+    .await?;
+
+let mut writer = mic.open_live_writer()?; // RT-safe from your audio callback
+writer.write_f32_interleaved_live(&frames)?;
+writer.clear_unread();     // drop backlog on mode changes
+writer.flush_silence()?;   // smooth decay before shutdown
+drop(writer);              // detaches; `mars status` shows producer absent
+```
+
+Producer health (`absent` / `active` / `stale` / `underrunning`) is visible
+in `mars status --json` under `virtual_input_producers` and via
+`client.virtual_input_status(app_id, id)`.
+
+## Runtime install management
+
+The `mars_sdk::runtime` module manages the installed runtime itself
+(package verification, install/update/uninstall, and a read-only
+`runtime_status()` state machine). See
+[installer-embedding.md](installer-embedding.md) for the full embedding
+guide.
 
 ## Example
 

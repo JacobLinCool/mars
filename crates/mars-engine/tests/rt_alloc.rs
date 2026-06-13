@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use mars_engine::{Engine, EngineSnapshot};
 use mars_graph::build_routing_graph;
 use mars_types::{
-    ProcessorChain, ProcessorDefinition, ProcessorKind, Profile, Route, RouteMatrix,
+    ProcessorChain, ProcessorDefinition, ProcessorKind, ProducerKind, Profile, Route, RouteMatrix,
     VirtualInputDevice, VirtualOutputDevice,
 };
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
@@ -43,6 +43,7 @@ fn render_cycle_into_has_zero_heap_allocation_after_prepare() {
         channels: Some(8),
         uid: None,
         mix: None,
+        producer: ProducerKind::default(),
     });
     profile.processors.push(ProcessorDefinition {
         id: "eq-rt".to_string(),
