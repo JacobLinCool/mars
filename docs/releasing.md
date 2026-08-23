@@ -1,6 +1,6 @@
 # Releasing MARS
 
-MARS publishes native `arm64` and `x86_64` macOS installer packages from
+MARS publishes a native Apple Silicon (`arm64`) macOS installer package from
 version tags. Every executable is signed with Developer ID and hardened
 runtime, and every installer is submitted with `notarytool`, stapled, checked
 with Gatekeeper, and uploaded with checksums and notarization logs.
@@ -38,7 +38,6 @@ The tag must be `vX.Y.Z`, match the daemon crate version exactly, and point to
 a commit contained in `main`. The workflow publishes:
 
 - `mars-X.Y.Z-arm64.pkg`
-- `mars-X.Y.Z-x86_64.pkg`
 - per-package checksums and notarization logs
 - `SHA256SUMS`
 

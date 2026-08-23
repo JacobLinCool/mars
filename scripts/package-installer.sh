@@ -10,7 +10,7 @@ cd "$ROOT_DIR"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT_DIR/crates/mars-daemon/Cargo.toml" | head -1)"
 ARCH="$(uname -m)"
 case "$ARCH" in
-  arm64|x86_64) ;;
+  arm64) ;;
   *)
     echo "error: unsupported release architecture: $ARCH" >&2
     exit 1
