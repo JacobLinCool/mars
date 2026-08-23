@@ -59,7 +59,11 @@ async fn start_ipc_env() -> IpcBenchEnv {
     let log_path = std::env::temp_dir().join(format!("{tag}.log"));
     fs::write(&log_path, "one\ntwo\nthree\n").expect("seed log file");
 
-    let daemon = Arc::new(MarsDaemon::new(log_path.clone()));
+    let intent_path = std::env::temp_dir().join(format!("{tag}.intents.json"));
+    let daemon = Arc::new(
+        MarsDaemon::new_with_intent_store_path(log_path.clone(), intent_path)
+            .expect("create benchmark daemon"),
+    );
     let daemon_for_server = Arc::clone(&daemon);
     let socket_for_server = socket_path.clone();
     let server = tokio::spawn(async move {

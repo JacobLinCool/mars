@@ -6,6 +6,7 @@
 pub mod capture_runtime;
 mod render_qos;
 pub mod sink_runtime;
+mod virtual_input_intents;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
@@ -36,24 +37,29 @@ use mars_hal::{
 use mars_ipc::{
     ApiError, DaemonRequest, DaemonResponse, LogRequest, LogResponse, RequestHandler, serve,
 };
-use mars_profile::{ValidatedProfile, load_profile, validate_only};
+use mars_profile::{ValidatedProfile, load_profile, validate_profile};
 use mars_shm::{RingSpec, StreamDirection, global_registry, ring_token_for, stream_name_tagged};
 use mars_types::{
-    AppVirtualInput, ApplyPlan, ApplyRequest, ApplyResult, CaptureRuntimeHealth,
-    CaptureRuntimeStatus, DaemonStatus, DeviceDescriptor, DriverStatusSummary, EnsuredVirtualInput,
-    ExitCode, ExternalRuntimeStatus, MANAGED_UID_PREFIX, NodeKind, PlanChange, PlanChangeKind,
-    PlanRequest, PluginHostRuntimeStatus, ProducerKind, ProducerState, Profile,
-    RemoveVirtualInputRequest, RuntimeCounters, SinkRuntimeHealth, SinkRuntimeStatus,
-    VirtualInputDevice, VirtualInputProducerStatus, VirtualInputStatusRequest,
+    AppVirtualInputSpec, AppVirtualInputs, ApplyPlan, ApplyRequest, ApplyResult,
+    CaptureRuntimeHealth, CaptureRuntimeStatus, DaemonStatus, DeviceDescriptor,
+    DriverStatusSummary, EnsuredVirtualInput, ExitCode, ExternalRuntimeStatus,
+    GetVirtualInputsRequest, MANAGED_UID_PREFIX, NodeKind, PlanChange, PlanChangeKind, PlanRequest,
+    PluginHostRuntimeStatus, ProducerKind, ProducerState, Profile, RuntimeCounters,
+    SetVirtualInputsRequest, SetVirtualInputsResult, SinkRuntimeHealth, SinkRuntimeStatus,
+    ValidationReport, VirtualInputDevice, VirtualInputProducerStatus, VirtualInputStatusRequest,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sink_runtime::{SinkBinding, SinkBindingKind, SinkRuntime, SinkRuntimeSubmitter};
 use tracing::{debug, info, warn};
+use virtual_input_intents::{IntentApps, VirtualInputIntentStore};
 
 #[derive(Debug)]
 pub struct MarsDaemon {
     state: Mutex<DaemonState>,
+    mutation_lock: Mutex<()>,
+    virtual_input_intents: Mutex<VirtualInputIntentStore>,
     render_runtime: Mutex<Option<RenderRuntime>>,
     capture_runtime: Mutex<Option<CaptureRuntime>>,
     log_path: PathBuf,
@@ -504,18 +510,33 @@ fn run_render_loop(
 }
 
 impl MarsDaemon {
-    #[must_use]
-    pub fn new(log_path: PathBuf) -> Self {
-        Self {
+    pub fn new(log_path: PathBuf) -> anyhow::Result<Self> {
+        let intent_path = VirtualInputIntentStore::default_path().map_err(anyhow::Error::msg)?;
+        Self::new_with_intent_store_path(log_path, intent_path)
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_intent_store_path(
+        log_path: PathBuf,
+        intent_path: PathBuf,
+    ) -> anyhow::Result<Self> {
+        let virtual_input_intents =
+            VirtualInputIntentStore::load(intent_path).map_err(anyhow::Error::msg)?;
+        Ok(Self {
             state: Mutex::new(DaemonState::default()),
+            mutation_lock: Mutex::new(()),
+            virtual_input_intents: Mutex::new(virtual_input_intents),
             render_runtime: Mutex::new(None),
             capture_runtime: Mutex::new(None),
             log_path,
-        }
+        })
     }
 
-    pub async fn run(self: Arc<Self>, socket_path: &Path) -> Result<(), mars_ipc::IpcError> {
-        serve(socket_path, self).await
+    pub async fn run(self: Arc<Self>, socket_path: &Path) -> anyhow::Result<()> {
+        self.reconcile_persisted_intents()
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        serve(socket_path, self).await?;
+        Ok(())
     }
 
     fn stop_render_runtime(&self) {
@@ -692,19 +713,20 @@ impl MarsDaemon {
     }
 
     fn apply_internal(&self, request: ApplyRequest) -> Result<ApplyResult, ApiError> {
+        let _mutation = self.mutation_lock.lock();
+        let intents = self.virtual_input_intents.lock().apps().clone();
+        self.apply_internal_with_intents(request, &intents)
+    }
+
+    fn apply_internal_with_intents(
+        &self,
+        request: ApplyRequest,
+        intents: &IntentApps,
+    ) -> Result<ApplyResult, ApiError> {
         let deadline = Self::apply_deadline(request.timeout_ms);
         Self::ensure_within_deadline(deadline, "profile-validate")?;
 
-        let mut validated = load_profile(Path::new(&request.profile_path)).map_err(|error| {
-            ApiError::new(
-                format!(
-                    "profile validation failed (strict policy requires apply_mode=atomic and on_missing_external=error): {error}"
-                ),
-                ExitCode::InvalidInput,
-            )
-        })?;
-        merge_overlay_inputs(&mut validated.profile, &load_virtual_input_overlays())
-            .map_err(|error| ApiError::new(error, ExitCode::InvalidInput))?;
+        let validated = load_effective_profile(Path::new(&request.profile_path), intents)?;
 
         let plan_request = PlanRequest {
             profile_path: request.profile_path.clone(),
@@ -956,6 +978,24 @@ impl MarsDaemon {
     }
 
     fn clear_internal(&self, keep_devices: bool) -> Result<ApplyResult, ApiError> {
+        let _mutation = self.mutation_lock.lock();
+        let intents = self.virtual_input_intents.lock().apps().clone();
+        if !intents.is_empty() {
+            let profile_path = intent_base_profile_path()
+                .map_err(|error| ApiError::new(error, ExitCode::InvalidInput))?
+                .display()
+                .to_string();
+            return self.apply_internal_with_intents(
+                ApplyRequest {
+                    profile_path,
+                    no_delete: keep_devices,
+                    dry_run: false,
+                    timeout_ms: 30_000,
+                },
+                &intents,
+            );
+        }
+
         self.stop_render_runtime();
         self.stop_capture_runtime();
         let mut state = self.state.lock();
@@ -1118,66 +1158,55 @@ impl MarsDaemon {
     /// virtual inputs by reading their ring headers (#35).
     ///
     /// The daemon never writes these rings; it classifies producers from the
-    /// v2 header counters: `absent` until the first attach, `active` while
-    /// `write_idx` progresses, `underrunning` when the consumer underruns
-    /// despite progress, and `stale` once progress stops for
+    /// v2 header counters: `absent` while detached, `active` while `write_idx`
+    /// progresses, `underrunning` when the consumer underruns despite
+    /// progress, and `stale` once progress stops for
     /// [`PRODUCER_STALE_AFTER`].
     fn virtual_input_producer_statuses(&self) -> Vec<VirtualInputProducerStatus> {
-        let profile = { self.state.lock().current_profile.clone() };
-        let Some(profile) = profile else {
-            return Vec::new();
-        };
-
-        let sample_rate = profile.audio.sample_rate.as_value().unwrap_or(48_000);
-        let default_channels = profile.audio.channels.as_value().unwrap_or(2);
+        let intents = self.virtual_input_intents.lock().apps().clone();
+        let buffer_frames = self
+            .state
+            .lock()
+            .current_profile
+            .as_ref()
+            .map_or(default_driver_buffer_frames(), |profile| {
+                profile.audio.buffer_frames
+            });
         let mut statuses = Vec::new();
 
-        for input in profile
-            .virtual_devices
-            .inputs
-            .iter()
-            .filter(|input| input.producer == ProducerKind::ExternalApp)
-        {
-            let uid = input
-                .uid
-                .clone()
-                .unwrap_or_else(|| format!("{MANAGED_UID_PREFIX}vin.{}", input.id));
-            let spec = RingSpec {
-                sample_rate,
-                channels: input.channels.unwrap_or(default_channels),
-                capacity_frames: profile.audio.buffer_frames.saturating_mul(8),
-            };
-            let name = stream_name_tagged(StreamDirection::Vin, &uid, &ring_token_for(&uid));
-            let header = global_registry()
-                .create_or_open(&name, spec)
-                .ok()
-                .and_then(|handle| handle.lock().header().ok());
+        for (app_id, inputs) in intents {
+            for input in inputs {
+                let ring_spec = RingSpec {
+                    sample_rate: input.sample_rate,
+                    channels: input.channels,
+                    capacity_frames: buffer_frames.saturating_mul(8),
+                };
+                let name = stream_name_tagged(
+                    StreamDirection::Vin,
+                    &input.uid,
+                    &ring_token_for(&input.uid),
+                );
+                let header = global_registry()
+                    .create_or_open(&name, ring_spec)
+                    .ok()
+                    .and_then(|handle| handle.lock().header().ok());
 
-            let Some(header) = header else {
-                statuses.push(VirtualInputProducerStatus {
-                    id: input.id.clone(),
-                    uid,
-                    kind: ProducerKind::ExternalApp,
-                    state: ProducerState::Absent,
-                    write_idx: 0,
-                    underrun_count: 0,
-                    attach_count: 0,
-                    generation: 0,
-                });
-                continue;
-            };
+                let Some(header) = header else {
+                    statuses.push(absent_producer_status(&app_id, &input));
+                    continue;
+                };
 
-            let now = Instant::now();
-            let (progressed, underrun_delta, stalled_for) =
-                {
+                let now = Instant::now();
+                let (progressed, underrun_delta, stalled_for) = {
                     let mut state = self.state.lock();
-                    let observation = state.producer_observations.entry(uid.clone()).or_insert(
-                        ProducerObservation {
+                    let observation = state
+                        .producer_observations
+                        .entry(input.uid.clone())
+                        .or_insert(ProducerObservation {
                             write_idx: header.write_idx,
                             underrun_count: header.underrun_count,
                             last_progress: now,
-                        },
-                    );
+                        });
                     let progressed = header.write_idx > observation.write_idx;
                     let underrun_delta = header
                         .underrun_count
@@ -1191,122 +1220,128 @@ impl MarsDaemon {
                     (progressed, underrun_delta, stalled_for)
                 };
 
-            let state = if header.producer_attach_count == 0 {
-                ProducerState::Absent
-            } else if progressed && underrun_delta > 0 {
-                ProducerState::Underrunning
-            } else if progressed || stalled_for <= PRODUCER_STALE_AFTER {
-                ProducerState::Active
-            } else {
-                ProducerState::Stale
-            };
+                let state = if header.producer_attach_count == 0
+                    || header.producer_generation.is_multiple_of(2)
+                {
+                    ProducerState::Absent
+                } else if progressed && underrun_delta > 0 {
+                    ProducerState::Underrunning
+                } else if progressed || stalled_for <= PRODUCER_STALE_AFTER {
+                    ProducerState::Active
+                } else {
+                    ProducerState::Stale
+                };
 
-            statuses.push(VirtualInputProducerStatus {
-                id: input.id.clone(),
-                uid,
-                kind: ProducerKind::ExternalApp,
-                state,
-                write_idx: header.write_idx,
-                underrun_count: header.underrun_count,
-                attach_count: header.producer_attach_count,
-                generation: header.producer_generation,
-            });
+                statuses.push(VirtualInputProducerStatus {
+                    app_id: app_id.clone(),
+                    id: input.id,
+                    uid: input.uid,
+                    kind: ProducerKind::ExternalApp,
+                    state,
+                    write_idx: header.write_idx,
+                    underrun_count: header.underrun_count,
+                    attach_count: header.producer_attach_count,
+                    generation: header.producer_generation,
+                });
+            }
         }
 
         statuses
     }
 
-    /// Ensure an app-owned virtual input exists (issue #40).
-    ///
-    /// The spec becomes an app-scoped overlay lease persisted across daemon
-    /// restarts; the effective configuration is re-applied through the
-    /// normal atomic transaction. Idempotent per (app_id, id).
-    fn ensure_virtual_input_internal(
+    fn set_virtual_inputs_internal(
         &self,
-        spec: AppVirtualInput,
-    ) -> Result<EnsuredVirtualInput, ApiError> {
-        if spec.app_id.is_empty() || spec.id.is_empty() || spec.uid.is_empty() {
-            return Err(ApiError::new(
-                "app_id, id, and uid must be non-empty",
-                ExitCode::InvalidInput,
-            ));
-        }
-        if spec.producer != ProducerKind::ExternalApp {
-            return Err(ApiError::new(
-                "ensure_virtual_input only supports producer: external_app",
-                ExitCode::InvalidInput,
-            ));
-        }
-        if !(1..=2).contains(&spec.channels) {
-            return Err(ApiError::new(
-                format!(
-                    "unsupported channel count {} (mono is first-class; stereo accepted)",
-                    spec.channels
-                ),
-                ExitCode::InvalidInput,
-            ));
+        request: SetVirtualInputsRequest,
+    ) -> Result<SetVirtualInputsResult, ApiError> {
+        validate_app_id(&request.app_id)?;
+        let _mutation = self.mutation_lock.lock();
+        let profile_path = self.intent_base_profile_for_current_state()?;
+
+        let (previous, candidate) = {
+            let store = self.virtual_input_intents.lock();
+            let previous = store.apps().clone();
+            let candidate = store.candidate(&request.app_id, request.inputs.clone());
+            (previous, candidate)
+        };
+
+        load_effective_profile(Path::new(&profile_path), &candidate)?;
+
+        if candidate != previous {
+            self.virtual_input_intents
+                .lock()
+                .persist(&candidate)
+                .map_err(|error| ApiError::new(error, ExitCode::ApplyFailed))?;
         }
 
-        let mut overlays = load_virtual_input_overlays();
-        for other in overlays
-            .iter()
-            .filter(|other| !(other.app_id == spec.app_id && other.id == spec.id))
-        {
-            if other.id == spec.id || other.uid == spec.uid {
-                return Err(ApiError::new(
-                    format!(
-                        "virtual input conflict: '{}' / uid '{}' is leased by app '{}'",
-                        spec.id, spec.uid, other.app_id
-                    ),
-                    ExitCode::InvalidInput,
-                ));
+        let apply = self.apply_internal_with_intents(
+            ApplyRequest {
+                profile_path,
+                no_delete: false,
+                dry_run: false,
+                timeout_ms: 30_000,
+            },
+            &candidate,
+        );
+
+        let apply = match apply {
+            Ok(apply) => {
+                let active_uids = candidate
+                    .values()
+                    .flat_map(|inputs| inputs.iter().map(|input| input.uid.as_str()))
+                    .collect::<BTreeSet<_>>();
+                self.state
+                    .lock()
+                    .producer_observations
+                    .retain(|uid, _| active_uids.contains(uid.as_str()));
+                self.virtual_input_intents.lock().install(candidate);
+                apply
             }
-        }
-        overlays.retain(|other| !(other.app_id == spec.app_id && other.id == spec.id));
-        overlays.push(spec.clone());
-        persist_virtual_input_overlays(&overlays)
-            .map_err(|error| ApiError::new(error, ExitCode::InvalidInput))?;
+            Err(apply_error) => {
+                let restore = self.virtual_input_intents.lock().persist(&previous);
+                if let Err(restore_error) = restore {
+                    self.virtual_input_intents.lock().install(candidate);
+                    return Err(ApiError::new(
+                        format!(
+                            "{}; failed to restore virtual-input intent store: {restore_error}",
+                            apply_error.message
+                        ),
+                        ExitCode::ApplyFailed,
+                    ));
+                }
+                self.virtual_input_intents.lock().install(previous);
+                return Err(apply_error);
+            }
+        };
 
-        self.reapply_effective_profile()?;
-
-        Ok(self.ensured_virtual_input_response(&spec))
+        let ensured_inputs = request
+            .inputs
+            .iter()
+            .map(|spec| self.ensured_virtual_input_response(&request.app_id, spec))
+            .collect();
+        Ok(SetVirtualInputsResult {
+            apply,
+            ensured_inputs,
+        })
     }
 
-    /// Remove an app-owned virtual input lease and re-apply (issue #40).
-    fn remove_virtual_input_internal(
+    fn get_virtual_inputs_internal(
         &self,
-        request: &RemoveVirtualInputRequest,
-    ) -> Result<ApplyResult, ApiError> {
-        let mut overlays = load_virtual_input_overlays();
-        let before = overlays.len();
-        overlays.retain(|other| !(other.app_id == request.app_id && other.id == request.id));
-        if overlays.len() == before {
-            return Err(ApiError::new(
-                format!(
-                    "no virtual input lease for app '{}' id '{}'",
-                    request.app_id, request.id
-                ),
-                ExitCode::InvalidInput,
-            ));
-        }
-        persist_virtual_input_overlays(&overlays)
-            .map_err(|error| ApiError::new(error, ExitCode::InvalidInput))?;
-        self.reapply_effective_profile()
+        request: &GetVirtualInputsRequest,
+    ) -> Result<AppVirtualInputs, ApiError> {
+        validate_app_id(&request.app_id)?;
+        Ok(self.virtual_input_intents.lock().app(&request.app_id))
     }
 
-    /// Producer status for one leased virtual input (issue #40).
     fn virtual_input_status_internal(
         &self,
         request: &VirtualInputStatusRequest,
     ) -> Result<VirtualInputProducerStatus, ApiError> {
-        let overlays = load_virtual_input_overlays();
-        let Some(lease) = overlays
-            .iter()
-            .find(|other| other.app_id == request.app_id && other.id == request.id)
-        else {
+        validate_app_id(&request.app_id)?;
+        let stored = self.virtual_input_intents.lock().app(&request.app_id);
+        let Some(spec) = stored.inputs.iter().find(|input| input.id == request.id) else {
             return Err(ApiError::new(
                 format!(
-                    "no virtual input lease for app '{}' id '{}'",
+                    "no virtual input intent for app '{}' id '{}'",
                     request.app_id, request.id
                 ),
                 ExitCode::InvalidInput,
@@ -1315,39 +1350,47 @@ impl MarsDaemon {
         let statuses = self.virtual_input_producer_statuses();
         Ok(statuses
             .into_iter()
-            .find(|status| status.uid == lease.uid)
-            .unwrap_or(VirtualInputProducerStatus {
-                id: lease.id.clone(),
-                uid: lease.uid.clone(),
-                kind: ProducerKind::ExternalApp,
-                state: ProducerState::Absent,
-                write_idx: 0,
-                underrun_count: 0,
-                attach_count: 0,
-                generation: 0,
-            }))
+            .find(|status| status.app_id == request.app_id && status.id == request.id)
+            .unwrap_or_else(|| absent_producer_status(&request.app_id, spec)))
     }
 
-    /// Re-apply the current profile (or the synthetic overlay base when no
-    /// profile is applied) so persisted overlays take effect atomically.
-    fn reapply_effective_profile(&self) -> Result<ApplyResult, ApiError> {
-        let current_path = { self.state.lock().current_profile_path.clone() };
-        let profile_path = match current_path {
-            Some(path) if Path::new(&path).exists() => path,
-            _ => overlay_base_profile_path()
-                .map_err(|error| ApiError::new(error, ExitCode::InvalidInput))?
-                .display()
-                .to_string(),
-        };
-        self.apply_internal(ApplyRequest {
-            profile_path,
-            no_delete: false,
-            dry_run: false,
-            timeout_ms: 30_000,
-        })
+    fn reconcile_persisted_intents(&self) -> Result<(), ApiError> {
+        let _mutation = self.mutation_lock.lock();
+        let intents = self.virtual_input_intents.lock().apps().clone();
+        if intents.is_empty() {
+            return Ok(());
+        }
+        let profile_path = intent_base_profile_path()
+            .map_err(|error| ApiError::new(error, ExitCode::InvalidInput))?
+            .display()
+            .to_string();
+        self.apply_internal_with_intents(
+            ApplyRequest {
+                profile_path,
+                no_delete: false,
+                dry_run: false,
+                timeout_ms: 30_000,
+            },
+            &intents,
+        )?;
+        Ok(())
     }
 
-    fn ensured_virtual_input_response(&self, spec: &AppVirtualInput) -> EnsuredVirtualInput {
+    fn intent_base_profile_for_current_state(&self) -> Result<String, ApiError> {
+        let current_path = self.state.lock().current_profile_path.clone();
+        match current_path {
+            Some(path) if Path::new(&path).exists() => Ok(path),
+            _ => intent_base_profile_path()
+                .map_err(|error| ApiError::new(error, ExitCode::InvalidInput))
+                .map(|path| path.display().to_string()),
+        }
+    }
+
+    fn ensured_virtual_input_response(
+        &self,
+        app_id: &str,
+        spec: &AppVirtualInputSpec,
+    ) -> EnsuredVirtualInput {
         let buffer_frames = {
             let state = self.state.lock();
             state
@@ -1360,17 +1403,8 @@ impl MarsDaemon {
         let producer = self
             .virtual_input_producer_statuses()
             .into_iter()
-            .find(|status| status.uid == spec.uid)
-            .unwrap_or(VirtualInputProducerStatus {
-                id: spec.id.clone(),
-                uid: spec.uid.clone(),
-                kind: ProducerKind::ExternalApp,
-                state: ProducerState::Absent,
-                write_idx: 0,
-                underrun_count: 0,
-                attach_count: 0,
-                generation: 0,
-            });
+            .find(|status| status.app_id == app_id && status.id == spec.id)
+            .unwrap_or_else(|| absent_producer_status(app_id, spec));
         EnsuredVirtualInput {
             uid: spec.uid.clone(),
             ring_name: stream_name_tagged(
@@ -1680,21 +1714,25 @@ impl RequestHandler for MarsDaemon {
         match request {
             DaemonRequest::Ping => Ok(DaemonResponse::Pong),
             DaemonRequest::Validate(request) => {
-                let report = validate_only(Path::new(&request.profile_path));
+                let intents = self.virtual_input_intents.lock().apps().clone();
+                let report =
+                    match load_effective_profile(Path::new(&request.profile_path), &intents) {
+                        Ok(validated) => ValidationReport {
+                            valid: true,
+                            warnings: validated.warnings,
+                            errors: Vec::new(),
+                        },
+                        Err(error) => ValidationReport {
+                            valid: false,
+                            warnings: Vec::new(),
+                            errors: vec![error.message],
+                        },
+                    };
                 Ok(DaemonResponse::Validate(report))
             }
             DaemonRequest::Plan(request) => {
-                let mut validated =
-                    load_profile(Path::new(&request.profile_path)).map_err(|error| {
-                        ApiError::new(
-                            format!(
-                                "profile validation failed (strict policy requires apply_mode=atomic and on_missing_external=error): {error}"
-                            ),
-                            ExitCode::InvalidInput,
-                        )
-                    })?;
-                merge_overlay_inputs(&mut validated.profile, &load_virtual_input_overlays())
-                    .map_err(|error| ApiError::new(error, ExitCode::InvalidInput))?;
+                let intents = self.virtual_input_intents.lock().apps().clone();
+                let validated = load_effective_profile(Path::new(&request.profile_path), &intents)?;
                 let plan = self.plan_internal(&request, &validated)?;
                 Ok(DaemonResponse::Plan(plan))
             }
@@ -1720,12 +1758,12 @@ impl RequestHandler for MarsDaemon {
             }
             DaemonRequest::Logs(request) => self.logs_internal(&request).map(DaemonResponse::Logs),
             DaemonRequest::Doctor => Ok(DaemonResponse::Doctor(self.doctor_report_internal())),
-            DaemonRequest::EnsureVirtualInput(spec) => self
-                .ensure_virtual_input_internal(spec)
-                .map(DaemonResponse::VirtualInputEnsured),
-            DaemonRequest::RemoveVirtualInput(request) => self
-                .remove_virtual_input_internal(&request)
-                .map(DaemonResponse::VirtualInputRemoved),
+            DaemonRequest::SetVirtualInputs(request) => self
+                .set_virtual_inputs_internal(request)
+                .map(DaemonResponse::VirtualInputsSet),
+            DaemonRequest::GetVirtualInputs(request) => self
+                .get_virtual_inputs_internal(&request)
+                .map(DaemonResponse::VirtualInputs),
             DaemonRequest::VirtualInputStatus(request) => self
                 .virtual_input_status_internal(&request)
                 .map(DaemonResponse::VirtualInputStatus),
@@ -2448,106 +2486,189 @@ fn path_exists_between_nodes(graph: &RoutingGraph, starts: &[String], targets: &
     false
 }
 
-/// App-scoped virtual-input overlay leases (issue #40): each downstream app
-/// owns the (app_id, id) pairs it ensured. Overlays merge into every
-/// validated profile so plan/apply/status see one effective configuration.
-fn virtual_input_overlays_path() -> Result<PathBuf, String> {
-    if let Ok(path) = std::env::var("MARS_VIRTUAL_INPUT_OVERLAYS_PATH") {
-        return Ok(PathBuf::from(path));
+fn load_effective_profile(path: &Path, intents: &IntentApps) -> Result<ValidatedProfile, ApiError> {
+    let base = load_profile(path).map_err(|error| {
+        ApiError::new(
+            format!(
+                "profile validation failed (strict policy requires apply_mode=atomic and on_missing_external=error): {error}"
+            ),
+            ExitCode::InvalidInput,
+        )
+    })?;
+    if let Some(input) = base
+        .profile
+        .virtual_devices
+        .inputs
+        .iter()
+        .find(|input| input.producer == ProducerKind::ExternalApp)
+    {
+        return Err(ApiError::new(
+            format!(
+                "base profile virtual input '{}' cannot use producer: external_app; declare it through SetVirtualInputs",
+                input.id
+            ),
+            ExitCode::InvalidInput,
+        ));
     }
-    let home = dirs::home_dir().ok_or_else(|| "cannot determine home directory".to_string())?;
-    Ok(home.join("Library/Application Support/mars/virtual_input_overlays.json"))
+
+    let mut profile = base.profile;
+    merge_virtual_input_intents(&mut profile, intents)
+        .map_err(|error| ApiError::new(error, ExitCode::InvalidInput))?;
+    validate_profile(profile).map_err(|error| {
+        ApiError::new(
+            format!("effective profile validation failed: {error}"),
+            ExitCode::InvalidInput,
+        )
+    })
 }
 
-fn load_virtual_input_overlays() -> Vec<AppVirtualInput> {
-    let Ok(path) = virtual_input_overlays_path() else {
-        return Vec::new();
-    };
-    fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Vec<AppVirtualInput>>(&raw).ok())
-        .unwrap_or_default()
-}
-
-fn persist_virtual_input_overlays(overlays: &[AppVirtualInput]) -> Result<(), String> {
-    let path = virtual_input_overlays_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("failed to create overlay dir: {error}"))?;
-    }
-    let payload = serde_json::to_string_pretty(overlays)
-        .map_err(|error| format!("failed to serialize overlays: {error}"))?;
-    fs::write(&path, payload).map_err(|error| format!("failed to persist overlays: {error}"))
-}
-
-/// Merge app-owned overlay inputs into a validated profile. Conflicts are
-/// errors, never silent precedence: a user profile and an app lease fighting
-/// over an id/uid must be resolved by a human.
-fn merge_overlay_inputs(profile: &mut Profile, overlays: &[AppVirtualInput]) -> Result<(), String> {
-    if overlays.is_empty() {
-        return Ok(());
-    }
+fn merge_virtual_input_intents(profile: &mut Profile, intents: &IntentApps) -> Result<(), String> {
     let audio_rate = profile.audio.sample_rate.as_value().unwrap_or(48_000);
-    for overlay in overlays {
-        let id_taken = profile
-            .virtual_devices
-            .inputs
-            .iter()
-            .any(|input| input.id == overlay.id)
-            || profile
-                .virtual_devices
-                .outputs
-                .iter()
-                .any(|output| output.id == overlay.id)
-            || profile.buses.iter().any(|bus| bus.id == overlay.id);
-        if id_taken {
-            return Err(format!(
-                "virtual input overlay conflict: id '{}' (leased by app '{}') already exists in the profile",
-                overlay.id, overlay.app_id
-            ));
+    let mut used_uids = profile
+        .virtual_devices
+        .inputs
+        .iter()
+        .map(|input| {
+            input
+                .uid
+                .clone()
+                .unwrap_or_else(|| format!("{MANAGED_UID_PREFIX}vin.{}", input.id))
+        })
+        .chain(profile.virtual_devices.outputs.iter().map(|output| {
+            output
+                .uid
+                .clone()
+                .unwrap_or_else(|| format!("{MANAGED_UID_PREFIX}vout.{}", output.id))
+        }))
+        .collect::<BTreeSet<_>>();
+
+    for (app_id, inputs) in intents {
+        validate_app_id_text(app_id)?;
+        let mut local_ids = BTreeSet::new();
+        for input in inputs {
+            validate_virtual_input_spec(app_id, input, audio_rate)?;
+            if !local_ids.insert(input.id.as_str()) {
+                return Err(format!(
+                    "duplicate virtual input id '{}' in app '{}'",
+                    input.id, app_id
+                ));
+            }
+            if !used_uids.insert(input.uid.clone()) {
+                return Err(format!(
+                    "virtual input uid '{}' declared by app '{}' is already in use",
+                    input.uid, app_id
+                ));
+            }
+            profile.virtual_devices.inputs.push(VirtualInputDevice {
+                id: namespaced_virtual_input_id(app_id, &input.id),
+                name: input.name.clone(),
+                channels: Some(input.channels),
+                uid: Some(input.uid.clone()),
+                mix: None,
+                producer: ProducerKind::ExternalApp,
+            });
         }
-        let uid_taken = profile
-            .virtual_devices
-            .inputs
-            .iter()
-            .filter_map(|input| input.uid.as_deref())
-            .chain(
-                profile
-                    .virtual_devices
-                    .outputs
-                    .iter()
-                    .filter_map(|output| output.uid.as_deref()),
-            )
-            .any(|uid| uid == overlay.uid);
-        if uid_taken {
-            return Err(format!(
-                "virtual input overlay conflict: uid '{}' (leased by app '{}') already exists in the profile",
-                overlay.uid, overlay.app_id
-            ));
-        }
-        if overlay.sample_rate != audio_rate {
-            return Err(format!(
-                "virtual input overlay '{}' requires {} Hz but the profile audio rate is {} Hz",
-                overlay.id, overlay.sample_rate, audio_rate
-            ));
-        }
-        profile.virtual_devices.inputs.push(VirtualInputDevice {
-            id: overlay.id.clone(),
-            name: overlay.name.clone(),
-            channels: Some(overlay.channels),
-            uid: Some(overlay.uid.clone()),
-            mix: None,
-            producer: ProducerKind::ExternalApp,
-        });
     }
     Ok(())
 }
 
-fn overlay_base_profile_path() -> Result<PathBuf, String> {
+fn validate_app_id(app_id: &str) -> Result<(), ApiError> {
+    validate_app_id_text(app_id).map_err(|error| ApiError::new(error, ExitCode::InvalidInput))
+}
+
+fn validate_app_id_text(app_id: &str) -> Result<(), String> {
+    if app_id.is_empty() || app_id.trim() != app_id {
+        return Err(
+            "app_id must be non-empty and must not contain surrounding whitespace".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_virtual_input_spec(
+    app_id: &str,
+    input: &AppVirtualInputSpec,
+    audio_rate: u32,
+) -> Result<(), String> {
+    if !valid_intent_local_id(&input.id) {
+        return Err(format!(
+            "invalid virtual input id '{}' in app '{}': must match [a-zA-Z0-9][a-zA-Z0-9-_]{{0,63}}",
+            input.id, app_id
+        ));
+    }
+    if input.name.trim().is_empty() || input.uid.trim().is_empty() {
+        return Err(format!(
+            "virtual input '{}' in app '{}' requires non-empty name and uid",
+            input.id, app_id
+        ));
+    }
+    if input.sample_rate != 48_000 || input.sample_rate != audio_rate {
+        return Err(format!(
+            "virtual input '{}' in app '{}' requires 48000 Hz and must match the profile audio rate ({audio_rate} Hz)",
+            input.id, app_id
+        ));
+    }
+    if !(1..=2).contains(&input.channels) {
+        return Err(format!(
+            "virtual input '{}' in app '{}' has unsupported channel count {} (expected mono or stereo)",
+            input.id, app_id, input.channels
+        ));
+    }
+    Ok(())
+}
+
+fn valid_intent_local_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    let mut length = 1_usize;
+    for character in chars {
+        length += 1;
+        if length > 64
+            || !(character.is_ascii_alphanumeric() || character == '-' || character == '_')
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn namespaced_virtual_input_id(app_id: &str, local_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(app_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(local_id.as_bytes());
+    let digest = hasher.finalize();
+    let suffix = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("app-{suffix}")
+}
+
+fn absent_producer_status(app_id: &str, spec: &AppVirtualInputSpec) -> VirtualInputProducerStatus {
+    VirtualInputProducerStatus {
+        app_id: app_id.to_string(),
+        id: spec.id.clone(),
+        uid: spec.uid.clone(),
+        kind: ProducerKind::ExternalApp,
+        state: ProducerState::Absent,
+        write_idx: 0,
+        underrun_count: 0,
+        attach_count: 0,
+        generation: 0,
+    }
+}
+
+fn intent_base_profile_path() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or_else(|| "cannot determine home directory".to_string())?;
     let dir = home.join("Library/Application Support/mars");
     fs::create_dir_all(&dir).map_err(|error| format!("failed to create state dir: {error}"))?;
-    let path = dir.join("overlay_base.yaml");
+    let path = dir.join("virtual_input_base.yaml");
     if !path.exists() {
         let base = serde_yaml::to_string(&Profile::default())
             .map_err(|error| format!("failed to serialize base profile: {error}"))?;

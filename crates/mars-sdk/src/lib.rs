@@ -13,10 +13,11 @@ use std::time::Duration;
 use mars_ipc::{Command, DaemonRequest, DaemonResponse, IpcClient};
 pub use mars_ipc::{IpcError, LogRequest, LogResponse};
 pub use mars_types::{
-    AppVirtualInput, ApplyPlan, ApplyRequest, ApplyResult, CaptureProcessInfo, ClearRequest,
-    DEFAULT_SOCKET_PATH_RELATIVE, DaemonStatus, DeviceInventory, DoctorReport, EnsuredVirtualInput,
-    ExitCode, PlanRequest, ProducerKind, ProducerState, RemoveVirtualInputRequest, ValidateRequest,
-    ValidationReport, VirtualInputProducerStatus, VirtualInputStatusRequest,
+    AppVirtualInputSpec, AppVirtualInputs, ApplyPlan, ApplyRequest, ApplyResult,
+    CaptureProcessInfo, ClearRequest, DEFAULT_SOCKET_PATH_RELATIVE, DaemonStatus, DeviceInventory,
+    DoctorReport, ExitCode, GetVirtualInputsRequest, PlanRequest, ProducerKind, ProducerState,
+    SetVirtualInputsRequest, ValidateRequest, ValidationReport, VirtualInputProducerStatus,
+    VirtualInputStatusRequest,
 };
 use thiserror::Error;
 pub use virtual_input::{LiveWriter, VirtualMic};
@@ -28,6 +29,12 @@ pub struct ApplyOptions {
     pub no_delete: bool,
     pub dry_run: bool,
     pub timeout_ms: u64,
+}
+
+#[derive(Debug)]
+pub struct SetVirtualInputsOutcome {
+    pub apply: ApplyResult,
+    pub virtual_mics: Vec<VirtualMic>,
 }
 
 impl Default for ApplyOptions {
@@ -234,45 +241,48 @@ impl MarsClient {
         }
     }
 
-    /// Ensure an app-owned virtual input exists and return a handle for
-    /// opening a live audio writer.
-    ///
-    /// The device is an app-scoped declarative lease: it persists across
-    /// daemon restarts, applies through the same atomic transaction as
-    /// profile changes, and conflicts (id/uid taken by the user profile or
-    /// another app) are rejected with a descriptive error. Idempotent per
-    /// `(app_id, id)`.
-    pub async fn ensure_virtual_input(
+    /// Atomically replace every virtual input owned by `app_id`.
+    /// An empty list removes that application's complete declaration.
+    pub async fn set_virtual_inputs(
         &self,
-        spec: AppVirtualInput,
-    ) -> Result<VirtualMic, MarsClientError> {
+        app_id: &str,
+        inputs: Vec<AppVirtualInputSpec>,
+    ) -> Result<SetVirtualInputsOutcome, MarsClientError> {
         match self
             .ipc
-            .send(DaemonRequest::EnsureVirtualInput(spec))
+            .send(DaemonRequest::SetVirtualInputs(SetVirtualInputsRequest {
+                app_id: app_id.to_string(),
+                inputs,
+            }))
             .await?
         {
-            DaemonResponse::VirtualInputEnsured(ensured) => Ok(VirtualMic::new(ensured)),
-            other => Err(unexpected_response(Command::EnsureVirtualInput, &other)),
+            DaemonResponse::VirtualInputsSet(result) => Ok(SetVirtualInputsOutcome {
+                apply: result.apply,
+                virtual_mics: result
+                    .ensured_inputs
+                    .into_iter()
+                    .map(VirtualMic::new)
+                    .collect(),
+            }),
+            other => Err(unexpected_response(Command::SetVirtualInputs, &other)),
         }
     }
 
-    /// Remove an app-owned virtual input lease.
-    pub async fn remove_virtual_input(
+    /// Read the complete virtual-input declaration owned by `app_id`.
+    pub async fn get_virtual_inputs(
         &self,
         app_id: &str,
-        id: &str,
-    ) -> Result<ApplyResult, MarsClientError> {
-        let request = RemoveVirtualInputRequest {
+    ) -> Result<AppVirtualInputs, MarsClientError> {
+        let request = GetVirtualInputsRequest {
             app_id: app_id.to_string(),
-            id: id.to_string(),
         };
         match self
             .ipc
-            .send(DaemonRequest::RemoveVirtualInput(request))
+            .send(DaemonRequest::GetVirtualInputs(request))
             .await?
         {
-            DaemonResponse::VirtualInputRemoved(result) => Ok(result),
-            other => Err(unexpected_response(Command::RemoveVirtualInput, &other)),
+            DaemonResponse::VirtualInputs(result) => Ok(result),
+            other => Err(unexpected_response(Command::GetVirtualInputs, &other)),
         }
     }
 
@@ -322,8 +332,8 @@ const fn response_command(response: &DaemonResponse) -> Command {
         DaemonResponse::Processes(_) => Command::Processes,
         DaemonResponse::Logs(_) => Command::Logs,
         DaemonResponse::Doctor(_) => Command::Doctor,
-        DaemonResponse::VirtualInputEnsured(_) => Command::EnsureVirtualInput,
-        DaemonResponse::VirtualInputRemoved(_) => Command::RemoveVirtualInput,
+        DaemonResponse::VirtualInputsSet(_) => Command::SetVirtualInputs,
+        DaemonResponse::VirtualInputs(_) => Command::GetVirtualInputs,
         DaemonResponse::VirtualInputStatus(_) => Command::VirtualInputStatus,
     }
 }
@@ -458,6 +468,27 @@ mod tests {
                 notes: Vec::new(),
             })),
             Command::Doctor
+        );
+        assert_eq!(
+            response_command(&DaemonResponse::VirtualInputsSet(
+                mars_types::SetVirtualInputsResult {
+                    apply: ApplyResult {
+                        applied: true,
+                        plan: ApplyPlan::default(),
+                        warnings: Vec::new(),
+                        errors: Vec::new(),
+                    },
+                    ensured_inputs: Vec::new(),
+                }
+            )),
+            Command::SetVirtualInputs
+        );
+        assert_eq!(
+            response_command(&DaemonResponse::VirtualInputs(AppVirtualInputs {
+                app_id: "com.example.app".to_string(),
+                inputs: Vec::new(),
+            })),
+            Command::GetVirtualInputs
         );
     }
 

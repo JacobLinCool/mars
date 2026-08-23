@@ -35,6 +35,7 @@ All active profiles must use `version: 2` (v1 is rejected).
   - `processor_runtime` (per-processor prepare/process/reset counters)
   - `capture_runtime` and `sink_runtime` health/counter snapshots
   - `plugin_runtime.*` (active/failed instances, timeout/error/restart counters, per-instance health)
+  - `virtual_input_producers[]` with the owning `app_id`, app-local `id`, and producer health
 - `mars doctor --json` includes plugin host summary counters:
   - `plugin_active`, `plugin_failed`, `plugin_timeouts`, `plugin_errors`, `plugin_restarts`
 - `mars processes --json` lists process object id, pid, bundle id, and running I/O flags for capture selector authoring.
@@ -73,6 +74,10 @@ All active profiles must use `version: 2` (v1 is rejected).
 - socket: `~/Library/Caches/mars/marsd.sock`
 - daemon log: `~/Library/Logs/mars/marsd.log`
 - driver state cache: `~/Library/Caches/mars/driver_applied_state.json`
+- app virtual-input intents: `~/Library/Application Support/mars/virtual_input_intents.json`
+
+`mars clear` clears the user base profile. App-owned virtual inputs remain active until their
+owning app submits an empty virtual-input set through the SDK.
 
 ## Deployment flow
 

@@ -58,31 +58,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `MarsClient::processes()`
 - `MarsClient::logs()/logs_once()`
 - `MarsClient::doctor()`
-- `MarsClient::ensure_virtual_input()/remove_virtual_input()/virtual_input_status()`
+- `MarsClient::set_virtual_inputs()/get_virtual_inputs()/virtual_input_status()`
 
 ## Virtual microphone (app-owned producer)
 
-Downstream apps can own a virtual microphone end to end: MARS stages the
-HAL device and reports producer health, while the app is the sole audio
-producer. Devices are app-scoped declarative leases — persisted across
-daemon restarts, applied atomically, and conflict-checked against the user
-profile and other apps.
+Downstream apps declare their complete set of virtual microphones: MARS
+persists the app-scoped intent, stages the HAL devices, and reports producer
+health while the app remains the sole audio producer. Replacing the set is
+atomic; passing an empty vector removes every input owned by that app without
+affecting other apps.
 
 ```rust
-use mars_sdk::{AppVirtualInput, MarsClient, ProducerKind};
+use mars_sdk::{AppVirtualInputSpec, MarsClient};
 
 let client = MarsClient::new_default(MarsClient::default_timeout())?;
-let mic = client
-    .ensure_virtual_input(AppVirtualInput {
-        app_id: "com.example.virtual-mic-app".into(),
+let outcome = client
+    .set_virtual_inputs("com.example.virtual-mic-app", vec![AppVirtualInputSpec {
         id: "primary-mic".into(),
         name: "Virtual Mic".into(),
         uid: "com.example.virtual-mic-app.primary-mic".into(),
-        sample_rate: 48_000, // locked; see issue #48
+        sample_rate: 48_000,
         channels: 1,
-        producer: ProducerKind::ExternalApp,
-    })
+    }])
     .await?;
+let mic = &outcome.virtual_mics[0];
 
 let mut writer = mic.open_live_writer()?; // RT-safe from your audio callback
 writer.write_f32_interleaved_live(&frames)?;
@@ -91,9 +90,13 @@ writer.flush_silence()?;   // smooth decay before shutdown
 drop(writer);              // detaches; `mars status` shows producer absent
 ```
 
-Producer health (`absent` / `active` / `stale` / `underrunning`) is visible
-in `mars status --json` under `virtual_input_producers` and via
-`client.virtual_input_status(app_id, id)`.
+The declaration persists across daemon restarts. `mars clear` clears the user
+base profile but leaves app-owned inputs intact. Producer health (`absent` /
+`active` / `stale` / `underrunning`) is visible in `mars status --json` under
+`virtual_input_producers` and via `client.virtual_input_status(app_id, id)`.
+
+App-produced inputs must be declared through this SDK API. User profile YAML
+cannot set `producer: external_app` because it has no owning `app_id`.
 
 ## Runtime install management
 

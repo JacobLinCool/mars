@@ -1,7 +1,7 @@
-//! Acceptance-test producer: ensures an app-owned virtual input and streams
+//! Acceptance-test producer: declares an app-owned virtual input and streams
 //! a 440 Hz sine through the live writer until killed (issue #41).
 //!
-//! Usage: `cargo run -p mars-sdk --example virtual_mic_producer [seconds]`
+//! Usage: `cargo run -p mars-sdk --example virtual_mic_producer [seconds|clear]`
 //!
 //! Pacing follows wall-clock absolute deadlines so the ring always holds
 //! fresh audio for the HAL consumer.
@@ -9,33 +9,46 @@
 use std::f32::consts::TAU;
 use std::time::{Duration, Instant};
 
-use mars_sdk::{AppVirtualInput, MarsClient, ProducerKind};
+use mars_sdk::{AppVirtualInputSpec, MarsClient};
 
 const SAMPLE_RATE: u32 = 48_000;
 const TONE_HZ: f32 = 440.0;
 const CHUNK_FRAMES: usize = 480; // 10 ms
+const APP_ID: &str = "com.mars.acceptance";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let seconds: u64 = std::env::args()
-        .nth(1)
-        .and_then(|raw| raw.parse().ok())
-        .unwrap_or(10);
+    let argument = std::env::args().nth(1);
 
     let client = MarsClient::new_default(MarsClient::default_timeout())?;
-    let mic = client
-        .ensure_virtual_input(AppVirtualInput {
-            app_id: "com.mars.acceptance".into(),
-            id: "acceptance-mic".into(),
-            name: "MARS Acceptance Mic".into(),
-            uid: "com.mars.acceptance.mic".into(),
-            sample_rate: SAMPLE_RATE,
-            channels: 1,
-            producer: ProducerKind::ExternalApp,
-        })
+    if argument.as_deref() == Some("clear") {
+        client.set_virtual_inputs(APP_ID, Vec::new()).await?;
+        println!("cleared acceptance virtual-input intent");
+        return Ok(());
+    }
+    let seconds = argument
+        .as_deref()
+        .map(str::parse)
+        .transpose()?
+        .unwrap_or(10_u64);
+    let outcome = client
+        .set_virtual_inputs(
+            APP_ID,
+            vec![AppVirtualInputSpec {
+                id: "acceptance-mic".into(),
+                name: "MARS Acceptance Mic".into(),
+                uid: "com.mars.acceptance.mic".into(),
+                sample_rate: SAMPLE_RATE,
+                channels: 1,
+            }],
+        )
         .await?;
+    let mic = outcome
+        .virtual_mics
+        .first()
+        .expect("set response includes the declared virtual mic");
     println!(
-        "ensured device uid={} ring={}",
+        "declared device uid={} ring={}",
         mic.uid(),
         mic.info().ring_name
     );

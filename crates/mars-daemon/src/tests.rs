@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -11,13 +12,13 @@ use mars_graph::build_routing_graph;
 use mars_ipc::{DaemonRequest, DaemonResponse, IpcClient, LogRequest};
 use mars_shm::{RingSpec, StreamDirection, global_registry, ring_token_for, stream_name_tagged};
 use mars_types::{
-    AuPluginApi, AutoOrU32, CaptureRuntimeHealth, CaptureRuntimeKind, CaptureRuntimeStatus,
-    CaptureRuntimeTapStatus, DeviceDescriptor, FileSink, FileSinkFormat, NodeKind, Pipe,
-    PluginHostHealth, PluginHostInstanceStatus, PluginHostRuntimeStatus, ProcessTap,
-    ProcessTapSelector, ProcessorChain, ProcessorDefinition, ProcessorKind, ProducerKind,
-    ProducerState, Profile, Route, RouteMatrix, SinkRuntimeHealth, SinkRuntimeKind,
-    SinkRuntimeSinkStatus, SinkRuntimeStatus, SystemTap, SystemTapMode, VirtualInputDevice,
-    VirtualOutputDevice,
+    AppVirtualInputSpec, AuPluginApi, AutoOrU32, CaptureRuntimeHealth, CaptureRuntimeKind,
+    CaptureRuntimeStatus, CaptureRuntimeTapStatus, DeviceDescriptor, DeviceMatch, ExternalOutput,
+    FileSink, FileSinkFormat, NodeKind, Pipe, PluginHostHealth, PluginHostInstanceStatus,
+    PluginHostRuntimeStatus, ProcessTap, ProcessTapSelector, ProcessorChain, ProcessorDefinition,
+    ProcessorKind, ProducerKind, ProducerState, Profile, Route, RouteMatrix,
+    SetVirtualInputsRequest, SinkRuntimeHealth, SinkRuntimeKind, SinkRuntimeSinkStatus,
+    SinkRuntimeStatus, SystemTap, SystemTapMode, VirtualInputDevice, VirtualOutputDevice,
 };
 
 use super::{
@@ -39,6 +40,11 @@ fn temp_socket_path(case: &str) -> PathBuf {
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
     std::env::temp_dir().join(format!("mars-daemon-{case}-{nanos}.sock"))
+}
+
+fn test_daemon(log_path: PathBuf) -> MarsDaemon {
+    let intent_path = log_path.with_extension("virtual-input-intents.json");
+    MarsDaemon::new_with_intent_store_path(log_path, intent_path).expect("create test daemon")
 }
 
 #[test]
@@ -183,7 +189,7 @@ fn apply_deadline_reports_stage_timeout() {
 fn logs_cursor_returns_incremental_lines() {
     let path = temp_log_path("incremental");
     fs::write(&path, "one\ntwo\nthree\n").expect("seed log");
-    let daemon = MarsDaemon::new(path.clone());
+    let daemon = test_daemon(path.clone());
 
     let initial = daemon
         .logs_internal(&LogRequest {
@@ -218,7 +224,7 @@ fn logs_cursor_returns_incremental_lines() {
 fn logs_cursor_beyond_file_len_falls_back_to_tail() {
     let path = temp_log_path("cursor-fallback");
     fs::write(&path, "a\nb\nc\nd\n").expect("seed log");
-    let daemon = MarsDaemon::new(path.clone());
+    let daemon = test_daemon(path.clone());
 
     let result = daemon
         .logs_internal(&LogRequest {
@@ -286,7 +292,7 @@ fn status_reports_sink_runtime_health_and_write_stats() {
         sample_rate: 48_000,
         buffer_frames: 64,
     }));
-    let daemon = MarsDaemon::new(temp_log_path("sink-status"));
+    let daemon = test_daemon(temp_log_path("sink-status"));
     {
         let mut state = daemon.state.lock();
         state.current_profile = Some(profile.clone());
@@ -347,7 +353,7 @@ fn status_reports_sink_runtime_health_and_write_stats() {
 
 #[test]
 fn doctor_report_includes_sink_runtime_health_summary() {
-    let daemon = MarsDaemon::new(temp_log_path("doctor-sink-health"));
+    let daemon = test_daemon(temp_log_path("doctor-sink-health"));
     {
         let mut state = daemon.state.lock();
         state.sink_runtime = SinkRuntimeStatus {
@@ -396,7 +402,7 @@ fn doctor_report_includes_sink_runtime_health_summary() {
 
 #[test]
 fn doctor_report_includes_plugin_runtime_health_summary() {
-    let daemon = MarsDaemon::new(temp_log_path("doctor-plugin-health"));
+    let daemon = test_daemon(temp_log_path("doctor-plugin-health"));
     {
         let mut state = daemon.state.lock();
         state.plugin_runtime = PluginHostRuntimeStatus {
@@ -594,7 +600,7 @@ async fn daemon_ipc_shm_soak_survives_ring_churn_and_reports_deadline_pressure()
 
     let log_path = temp_log_path("ipc-shm-soak");
     fs::write(&log_path, "boot\nready\n").expect("seed log file");
-    let daemon = Arc::new(MarsDaemon::new(log_path.clone()));
+    let daemon = Arc::new(test_daemon(log_path.clone()));
     {
         let mut state = daemon.state.lock();
         state.current_profile_path = Some("in-memory-profile".to_string());
@@ -755,7 +761,22 @@ fn app_owned_virtual_input_skips_render_and_reports_producer_health() {
 
     let log_path = temp_log_path("producer-health");
     fs::write(&log_path, "boot\n").expect("seed log file");
-    let daemon = MarsDaemon::new(log_path.clone());
+    let daemon = test_daemon(log_path.clone());
+    let app_id = "com.example.health";
+    {
+        let mut intents = daemon.virtual_input_intents.lock();
+        let candidate = intents.candidate(
+            app_id,
+            vec![AppVirtualInputSpec {
+                id: "mic".to_string(),
+                name: "App Mic".to_string(),
+                uid: vin_uid.clone(),
+                sample_rate,
+                channels: 1,
+            }],
+        );
+        intents.install(candidate);
+    }
     {
         let mut state = daemon.state.lock();
         state.current_profile_path = Some("in-memory-profile".to_string());
@@ -772,6 +793,8 @@ fn app_owned_virtual_input_skips_render_and_reports_producer_health() {
         .first()
         .expect("producer status present");
     assert_eq!(producer.uid, vin_uid);
+    assert_eq!(producer.app_id, app_id);
+    assert_eq!(producer.id, "mic");
     assert_eq!(producer.state, ProducerState::Absent);
     assert_eq!(producer.attach_count, 0);
 
@@ -800,98 +823,188 @@ fn app_owned_virtual_input_skips_render_and_reports_producer_health() {
     assert_eq!(producer.attach_count, 1);
     assert_eq!(producer.write_idx, 32);
 
+    ring.lock().detach_producer();
+    let status = daemon.status_internal();
+    let producer = status
+        .virtual_input_producers
+        .first()
+        .expect("producer status present after detach");
+    assert_eq!(producer.state, ProducerState::Absent);
+    assert_eq!(producer.generation, 2);
+
     let _ = global_registry().remove(&ring_name);
     let _ = fs::remove_file(&log_path);
 }
 
 #[test]
-fn overlay_merge_adds_app_owned_inputs_and_rejects_conflicts() {
-    use mars_types::AppVirtualInput;
+fn intent_merge_namespaces_local_ids_and_rejects_uid_conflicts() {
+    let mut intents = BTreeMap::new();
+    intents.insert(
+        "com.example.alpha".to_string(),
+        vec![AppVirtualInputSpec {
+            id: "mic".to_string(),
+            name: "Alpha Mic".to_string(),
+            uid: "com.example.alpha.mic".to_string(),
+            sample_rate: 48_000,
+            channels: 1,
+        }],
+    );
+    intents.insert(
+        "com.example.beta".to_string(),
+        vec![AppVirtualInputSpec {
+            id: "mic".to_string(),
+            name: "Beta Mic".to_string(),
+            uid: "com.example.beta.mic".to_string(),
+            sample_rate: 48_000,
+            channels: 2,
+        }],
+    );
 
-    let overlay = AppVirtualInput {
-        app_id: "com.example.app".to_string(),
-        id: "primary-mic".to_string(),
-        name: "Virtual Mic".to_string(),
-        uid: "com.example.app.primary-mic".to_string(),
-        sample_rate: 48_000,
-        channels: 1,
-        producer: ProducerKind::ExternalApp,
-    };
-
-    // Clean merge into an empty profile.
     let mut profile = Profile::default();
-    super::merge_overlay_inputs(&mut profile, std::slice::from_ref(&overlay)).expect("merge");
-    let merged = profile
-        .virtual_devices
-        .inputs
-        .iter()
-        .find(|input| input.id == "primary-mic")
-        .expect("overlay input present");
-    assert_eq!(merged.producer, ProducerKind::ExternalApp);
-    assert_eq!(merged.uid.as_deref(), Some("com.example.app.primary-mic"));
-    // Merged profiles must still build a valid graph.
-    build_routing_graph(&profile).expect("graph builds with overlay input");
+    super::merge_virtual_input_intents(&mut profile, &intents).expect("merge intents");
+    assert_eq!(profile.virtual_devices.inputs.len(), 2);
+    assert_ne!(
+        profile.virtual_devices.inputs[0].id,
+        profile.virtual_devices.inputs[1].id
+    );
+    assert!(
+        profile
+            .virtual_devices
+            .inputs
+            .iter()
+            .all(|input| input.id.starts_with("app-"))
+    );
+    build_routing_graph(&profile).expect("namespaced graph");
 
-    // Conflicting id with the user profile is rejected, not silently won.
-    let mut conflicted = Profile::default();
-    conflicted.virtual_devices.inputs.push(VirtualInputDevice {
-        id: "primary-mic".to_string(),
-        name: "User Mic".to_string(),
-        channels: Some(2),
+    intents.get_mut("com.example.beta").expect("beta")[0].uid = "com.example.alpha.mic".to_string();
+    let error = super::merge_virtual_input_intents(&mut Profile::default(), &intents)
+        .expect_err("reject cross-app uid conflict");
+    assert!(error.contains("already in use"), "got: {error}");
+
+    let mut base = Profile::default();
+    base.virtual_devices.inputs.push(VirtualInputDevice {
+        id: "base-mic".to_string(),
+        name: "Base Mic".to_string(),
+        channels: Some(1),
         uid: None,
         mix: None,
-        producer: ProducerKind::default(),
+        producer: ProducerKind::Daemon,
     });
-    let error = super::merge_overlay_inputs(&mut conflicted, std::slice::from_ref(&overlay))
-        .expect_err("id conflict must fail");
-    assert!(error.contains("conflict"), "got: {error}");
-
-    // Sample-rate mismatch is rejected (issue #48 lock).
-    let mut wrong_rate = overlay.clone();
-    wrong_rate.sample_rate = 44_100;
-    wrong_rate.id = "other-mic".to_string();
-    wrong_rate.uid = "com.example.app.other".to_string();
-    let mut profile = Profile::default();
-    let error = super::merge_overlay_inputs(&mut profile, std::slice::from_ref(&wrong_rate))
-        .expect_err("rate mismatch must fail");
-    assert!(error.contains("48000"), "got: {error}");
+    let mut base_conflict = BTreeMap::new();
+    base_conflict.insert(
+        "com.example.app".to_string(),
+        vec![AppVirtualInputSpec {
+            id: "mic".to_string(),
+            name: "App Mic".to_string(),
+            uid: "com.mars.vin.base-mic".to_string(),
+            sample_rate: 48_000,
+            channels: 1,
+        }],
+    );
+    let error = super::merge_virtual_input_intents(&mut base, &base_conflict)
+        .expect_err("reject derived base uid conflict");
+    assert!(error.contains("already in use"), "got: {error}");
 }
 
 #[test]
-fn ensure_virtual_input_validates_spec_before_touching_state() {
-    use mars_types::AppVirtualInput;
+fn set_virtual_inputs_rejects_invalid_request_without_touching_store() {
+    let log_path = temp_log_path("set-validate");
+    let base_path = log_path.with_extension("base.yaml");
+    fs::write(
+        &base_path,
+        serde_yaml::to_string(&Profile::default()).expect("serialize base"),
+    )
+    .expect("write base");
+    let daemon = test_daemon(log_path.clone());
+    daemon.state.lock().current_profile_path = Some(base_path.display().to_string());
 
-    let log_path = temp_log_path("ensure-validate");
-    fs::write(&log_path, "boot\n").expect("seed log file");
-    let daemon = MarsDaemon::new(log_path.clone());
-
-    let mut spec = AppVirtualInput {
-        app_id: String::new(),
-        id: "mic".to_string(),
-        name: "Mic".to_string(),
-        uid: "u".to_string(),
-        sample_rate: 48_000,
-        channels: 1,
-        producer: ProducerKind::ExternalApp,
+    let invalid = SetVirtualInputsRequest {
+        app_id: "com.example.app".to_string(),
+        inputs: vec![AppVirtualInputSpec {
+            id: "mic".to_string(),
+            name: "Mic".to_string(),
+            uid: "com.example.app.mic".to_string(),
+            sample_rate: 48_000,
+            channels: 8,
+        }],
     };
     let error = daemon
-        .ensure_virtual_input_internal(spec.clone())
-        .expect_err("empty app_id rejected");
-    assert!(error.message.contains("non-empty"));
+        .set_virtual_inputs_internal(invalid)
+        .expect_err("reject invalid channel count");
+    assert!(error.message.contains("channel"), "got: {}", error.message);
+    assert!(daemon.virtual_input_intents.lock().apps().is_empty());
 
-    spec.app_id = "com.example.app".to_string();
-    spec.producer = ProducerKind::Daemon;
+    let _ = fs::remove_file(base_path);
+    let _ = fs::remove_file(log_path);
+}
+
+#[test]
+fn base_profile_rejects_unowned_external_app_input() {
+    let path = temp_log_path("base-external-app").with_extension("yaml");
+    let mut base = Profile::default();
+    base.virtual_devices.inputs.push(VirtualInputDevice {
+        id: "unowned".to_string(),
+        name: "Unowned".to_string(),
+        channels: Some(1),
+        uid: Some("com.example.unowned".to_string()),
+        mix: None,
+        producer: ProducerKind::ExternalApp,
+    });
+    fs::write(&path, serde_yaml::to_string(&base).expect("serialize base")).expect("write base");
+
+    let error = super::load_effective_profile(&path, &BTreeMap::new())
+        .expect_err("reject unowned external-app input");
+    assert!(error.message.contains("SetVirtualInputs"));
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn set_virtual_inputs_restores_store_when_apply_fails() {
+    let log_path = temp_log_path("set-rollback");
+    let base_path = log_path.with_extension("base.yaml");
+    let intent_path = log_path.with_extension("virtual-input-intents.json");
+    let mut base = Profile::default();
+    base.external.outputs.push(ExternalOutput {
+        id: "missing-output".to_string(),
+        r#match: DeviceMatch {
+            uid: Some("com.example.device.that.does.not.exist".to_string()),
+            ..DeviceMatch::default()
+        },
+        channels: Some(2),
+    });
+    fs::write(
+        &base_path,
+        serde_yaml::to_string(&base).expect("serialize base"),
+    )
+    .expect("write base");
+    let daemon = MarsDaemon::new_with_intent_store_path(log_path.clone(), intent_path.clone())
+        .expect("create daemon");
+    daemon.state.lock().current_profile_path = Some(base_path.display().to_string());
+
     let error = daemon
-        .ensure_virtual_input_internal(spec.clone())
-        .expect_err("daemon producer rejected");
-    assert!(error.message.contains("external_app"));
+        .set_virtual_inputs_internal(SetVirtualInputsRequest {
+            app_id: "com.example.app".to_string(),
+            inputs: vec![AppVirtualInputSpec {
+                id: "mic".to_string(),
+                name: "Mic".to_string(),
+                uid: "com.example.app.mic".to_string(),
+                sample_rate: 48_000,
+                channels: 1,
+            }],
+        })
+        .expect_err("missing external device should fail apply");
+    assert!(
+        error.message.contains("missing external"),
+        "got: {}",
+        error.message
+    );
+    assert!(daemon.virtual_input_intents.lock().apps().is_empty());
+    let reloaded = super::VirtualInputIntentStore::load(intent_path.clone())
+        .expect("reload restored intent store");
+    assert!(reloaded.apps().is_empty());
+    assert!(daemon.state.lock().current_profile.is_none());
 
-    spec.producer = ProducerKind::ExternalApp;
-    spec.channels = 8;
-    let error = daemon
-        .ensure_virtual_input_internal(spec)
-        .expect_err("channel count rejected");
-    assert!(error.message.contains("channel"));
-
-    let _ = fs::remove_file(&log_path);
+    let _ = fs::remove_file(intent_path);
+    let _ = fs::remove_file(base_path);
+    let _ = fs::remove_file(log_path);
 }

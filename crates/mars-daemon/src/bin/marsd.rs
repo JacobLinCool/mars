@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let _guard = setup_logging()?;
-    let daemon = Arc::new(MarsDaemon::new(default_log_path()));
+    let daemon = Arc::new(MarsDaemon::new(default_log_path())?);
     let daemon_task = tokio::spawn({
         let daemon = daemon.clone();
         let socket_path = socket_path.clone();

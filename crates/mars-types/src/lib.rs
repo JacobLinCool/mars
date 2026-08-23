@@ -961,17 +961,11 @@ pub struct DaemonStatus {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Downstream app request to ensure an app-owned virtual input exists.
-///
-/// Ensured devices live in an app-scoped declarative overlay merged into the
-/// effective configuration: each (app_id, id) pair is a lease the app owns,
-/// persisted across daemon restarts and applied through the same atomic
-/// transaction as profile changes.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
-pub struct AppVirtualInput {
-    /// Owning application identifier (reverse-DNS recommended).
-    pub app_id: String,
-    /// Node id for this input (unique across the effective config).
+/// One app-local virtual-input declaration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AppVirtualInputSpec {
+    /// Node id, unique within the owning application's intent.
     pub id: String,
     /// Human-visible device name.
     pub name: String,
@@ -982,16 +976,30 @@ pub struct AppVirtualInput {
     pub sample_rate: u32,
     /// Interleaved channel count (mono first-class; multi-channel later).
     pub channels: u16,
-    /// Producer ownership; `external_app` for downstream apps.
-    #[serde(default)]
-    pub producer: ProducerKind,
 }
 
-/// Request to remove an app-owned virtual input lease.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
-pub struct RemoveVirtualInputRequest {
+/// Atomically replace all virtual inputs owned by one application.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SetVirtualInputsRequest {
     pub app_id: String,
-    pub id: String,
+    #[serde(default)]
+    pub inputs: Vec<AppVirtualInputSpec>,
+}
+
+/// Read the virtual-input declarations owned by one application.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GetVirtualInputsRequest {
+    pub app_id: String,
+}
+
+/// Stored declarative state for one application.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct AppVirtualInputs {
+    pub app_id: String,
+    #[serde(default)]
+    pub inputs: Vec<AppVirtualInputSpec>,
 }
 
 /// Request for the producer status of one app-owned virtual input.
@@ -1001,7 +1009,7 @@ pub struct VirtualInputStatusRequest {
     pub id: String,
 }
 
-/// Result of ensuring an app-owned virtual input: everything an SDK writer
+/// One declared app-owned virtual input: everything an SDK writer
 /// needs to attach to the ring without knowing MARS naming internals.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct EnsuredVirtualInput {
@@ -1015,14 +1023,24 @@ pub struct EnsuredVirtualInput {
     pub channels: u16,
     /// Ring capacity in frames.
     pub capacity_frames: u32,
-    /// Producer health at ensure time.
+    /// Producer health when the declaration was applied.
     pub producer: VirtualInputProducerStatus,
+}
+
+/// Result of replacing one application's complete virtual-input declaration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct SetVirtualInputsResult {
+    pub apply: ApplyResult,
+    #[serde(default)]
+    pub ensured_inputs: Vec<EnsuredVirtualInput>,
 }
 
 /// Health snapshot for an app-owned virtual input producer.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct VirtualInputProducerStatus {
-    /// Profile node id of the virtual input.
+    /// Owning application identifier.
+    pub app_id: String,
+    /// App-local virtual-input id.
     pub id: String,
     /// Device uid.
     pub uid: String,
@@ -1044,7 +1062,7 @@ pub struct VirtualInputProducerStatus {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProducerState {
-    /// No producer has ever attached to the ring.
+    /// No producer is currently attached to the ring.
     Absent,
     /// The producer made write progress since the previous observation.
     Active,

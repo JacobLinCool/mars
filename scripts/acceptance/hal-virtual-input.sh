@@ -16,6 +16,12 @@ cd "$REPO_ROOT"
 LOG_DIR="$(mktemp -d /tmp/mars-acceptance.XXXXXX)"
 UID_UNDER_TEST="com.mars.acceptance.mic"
 
+clear_acceptance_intent() {
+    cargo run -q -p mars-sdk --example virtual_mic_producer -- clear >/dev/null 2>&1 || true
+}
+
+trap clear_acceptance_intent EXIT
+
 capture_diagnostics() {
     echo "==> capturing diagnostics into $LOG_DIR"
     cargo run -q -p mars-cli --bin mars -- status --json > "$LOG_DIR/status.json" 2>&1 || true
@@ -70,8 +76,8 @@ if ! cargo run -q -p mars-sdk --example virtual_mic_reader -- "$UID_UNDER_TEST" 
     fail "virtual input did not return silence after producer exit"
 fi
 
-echo "==> cleanup: removing the acceptance lease"
-# Lease removal re-applies the effective profile; the HAL drops the device.
-cargo run -q -p mars-cli --bin mars -- status --json > /dev/null 2>&1 || true
+echo "==> cleanup: removing the acceptance intent"
+clear_acceptance_intent
+trap - EXIT
 rm -rf "$LOG_DIR"
 echo "PASS: external producer → ring → HAL → CoreAudio client verified"

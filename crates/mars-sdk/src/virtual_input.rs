@@ -2,27 +2,26 @@
 //! [`LiveWriter`].
 //!
 //! Apps never construct ring names or touch MARS internals: the daemon's
-//! `EnsureVirtualInput` response carries everything needed to attach, and
+//! `SetVirtualInputs` response carries everything needed to attach, and
 //! the writer wraps the shared-memory ring v2 producer half.
 //!
 //! # Example
 //!
 //! ```no_run
 //! # async fn demo() -> Result<(), mars_sdk::MarsClientError> {
-//! use mars_sdk::{AppVirtualInput, MarsClient, ProducerKind};
+//! use mars_sdk::{AppVirtualInputSpec, MarsClient};
 //!
 //! let client = MarsClient::new_default(MarsClient::default_timeout())?;
-//! let mic = client
-//!     .ensure_virtual_input(AppVirtualInput {
-//!         app_id: "com.example.virtual-mic-app".into(),
+//! let outcome = client
+//!     .set_virtual_inputs("com.example.virtual-mic-app", vec![AppVirtualInputSpec {
 //!         id: "primary-mic".into(),
 //!         name: "Virtual Mic".into(),
 //!         uid: "com.example.virtual-mic-app.primary-mic".into(),
 //!         sample_rate: 48_000,
 //!         channels: 1,
-//!         producer: ProducerKind::ExternalApp,
-//!     })
+//!     }])
 //!     .await?;
+//! let mic = &outcome.virtual_mics[0];
 //!
 //! let mut writer = mic.open_live_writer()?;
 //! let frames = vec![0.0_f32; 480]; // 10 ms of mono 48 kHz audio
@@ -37,7 +36,7 @@ use mars_types::EnsuredVirtualInput;
 
 use crate::MarsClientError;
 
-/// Handle to an ensured app-owned virtual input device.
+/// Handle to a declared app-owned virtual input device.
 #[derive(Debug, Clone)]
 pub struct VirtualMic {
     ensured: EnsuredVirtualInput,
@@ -54,7 +53,7 @@ impl VirtualMic {
         &self.ensured.uid
     }
 
-    /// Full ensure response, including producer health at ensure time.
+    /// Full declaration response, including producer health at apply time.
     #[must_use]
     pub const fn info(&self) -> &EnsuredVirtualInput {
         &self.ensured
@@ -160,6 +159,7 @@ mod tests {
             channels: 1,
             capacity_frames: 64,
             producer: VirtualInputProducerStatus {
+                app_id: "com.example.test".to_string(),
                 id: name.to_string(),
                 uid: format!("test.{name}"),
                 kind: ProducerKind::ExternalApp,

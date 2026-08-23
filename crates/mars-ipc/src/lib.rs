@@ -7,10 +7,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use mars_types::{
-    AppVirtualInput, ApplyPlan, ApplyRequest, ApplyResult, CaptureProcessInfo, ClearRequest,
-    DaemonStatus, DeviceInventory, DoctorReport, EnsuredVirtualInput, ExitCode, PlanRequest,
-    RemoveVirtualInputRequest, ValidateRequest, ValidationReport, VirtualInputProducerStatus,
-    VirtualInputStatusRequest,
+    AppVirtualInputs, ApplyPlan, ApplyRequest, ApplyResult, CaptureProcessInfo, ClearRequest,
+    DaemonStatus, DeviceInventory, DoctorReport, ExitCode, GetVirtualInputsRequest, PlanRequest,
+    SetVirtualInputsRequest, SetVirtualInputsResult, ValidateRequest, ValidationReport,
+    VirtualInputProducerStatus, VirtualInputStatusRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,7 +21,7 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -36,8 +36,8 @@ pub enum Command {
     Processes,
     Logs,
     Doctor,
-    EnsureVirtualInput,
-    RemoveVirtualInput,
+    SetVirtualInputs,
+    GetVirtualInputs,
     VirtualInputStatus,
 }
 
@@ -89,8 +89,8 @@ pub enum DaemonRequest {
     Processes,
     Logs(LogRequest),
     Doctor,
-    EnsureVirtualInput(AppVirtualInput),
-    RemoveVirtualInput(RemoveVirtualInputRequest),
+    SetVirtualInputs(SetVirtualInputsRequest),
+    GetVirtualInputs(GetVirtualInputsRequest),
     VirtualInputStatus(VirtualInputStatusRequest),
 }
 
@@ -108,8 +108,8 @@ impl DaemonRequest {
             Self::Processes => Command::Processes,
             Self::Logs(_) => Command::Logs,
             Self::Doctor => Command::Doctor,
-            Self::EnsureVirtualInput(_) => Command::EnsureVirtualInput,
-            Self::RemoveVirtualInput(_) => Command::RemoveVirtualInput,
+            Self::SetVirtualInputs(_) => Command::SetVirtualInputs,
+            Self::GetVirtualInputs(_) => Command::GetVirtualInputs,
             Self::VirtualInputStatus(_) => Command::VirtualInputStatus,
         }
     }
@@ -124,10 +124,10 @@ impl DaemonRequest {
             Self::Apply(payload) => serde_json::to_value(payload).map_err(IpcError::SerdeJson),
             Self::Clear(payload) => serde_json::to_value(payload).map_err(IpcError::SerdeJson),
             Self::Logs(payload) => serde_json::to_value(payload).map_err(IpcError::SerdeJson),
-            Self::EnsureVirtualInput(payload) => {
+            Self::SetVirtualInputs(payload) => {
                 serde_json::to_value(payload).map_err(IpcError::SerdeJson)
             }
-            Self::RemoveVirtualInput(payload) => {
+            Self::GetVirtualInputs(payload) => {
                 serde_json::to_value(payload).map_err(IpcError::SerdeJson)
             }
             Self::VirtualInputStatus(payload) => {
@@ -149,8 +149,8 @@ pub enum DaemonResponse {
     Processes(Vec<CaptureProcessInfo>),
     Logs(LogResponse),
     Doctor(DoctorReport),
-    VirtualInputEnsured(EnsuredVirtualInput),
-    VirtualInputRemoved(ApplyResult),
+    VirtualInputsSet(SetVirtualInputsResult),
+    VirtualInputs(AppVirtualInputs),
     VirtualInputStatus(VirtualInputProducerStatus),
 }
 
@@ -185,10 +185,10 @@ impl DaemonResponse {
             Command::Doctor => Ok(Self::Doctor(
                 serde_json::from_value(payload).map_err(IpcError::SerdeJson)?,
             )),
-            Command::EnsureVirtualInput => Ok(Self::VirtualInputEnsured(
+            Command::SetVirtualInputs => Ok(Self::VirtualInputsSet(
                 serde_json::from_value(payload).map_err(IpcError::SerdeJson)?,
             )),
-            Command::RemoveVirtualInput => Ok(Self::VirtualInputRemoved(
+            Command::GetVirtualInputs => Ok(Self::VirtualInputs(
                 serde_json::from_value(payload).map_err(IpcError::SerdeJson)?,
             )),
             Command::VirtualInputStatus => Ok(Self::VirtualInputStatus(
@@ -209,12 +209,10 @@ impl DaemonResponse {
             Self::Processes(value) => serde_json::to_value(value).map_err(IpcError::SerdeJson),
             Self::Logs(value) => serde_json::to_value(value).map_err(IpcError::SerdeJson),
             Self::Doctor(value) => serde_json::to_value(value).map_err(IpcError::SerdeJson),
-            Self::VirtualInputEnsured(value) => {
+            Self::VirtualInputsSet(value) => {
                 serde_json::to_value(value).map_err(IpcError::SerdeJson)
             }
-            Self::VirtualInputRemoved(value) => {
-                serde_json::to_value(value).map_err(IpcError::SerdeJson)
-            }
+            Self::VirtualInputs(value) => serde_json::to_value(value).map_err(IpcError::SerdeJson),
             Self::VirtualInputStatus(value) => {
                 serde_json::to_value(value).map_err(IpcError::SerdeJson)
             }
@@ -446,11 +444,11 @@ fn deserialize_request(command: Command, payload: Value) -> Result<DaemonRequest
             .map(DaemonRequest::Logs)
             .map_err(|error| IpcError::InvalidRequestPayload(command, error)),
         Command::Doctor => Ok(DaemonRequest::Doctor),
-        Command::EnsureVirtualInput => serde_json::from_value(payload)
-            .map(DaemonRequest::EnsureVirtualInput)
+        Command::SetVirtualInputs => serde_json::from_value(payload)
+            .map(DaemonRequest::SetVirtualInputs)
             .map_err(|error| IpcError::InvalidRequestPayload(command, error)),
-        Command::RemoveVirtualInput => serde_json::from_value(payload)
-            .map(DaemonRequest::RemoveVirtualInput)
+        Command::GetVirtualInputs => serde_json::from_value(payload)
+            .map(DaemonRequest::GetVirtualInputs)
             .map_err(|error| IpcError::InvalidRequestPayload(command, error)),
         Command::VirtualInputStatus => serde_json::from_value(payload)
             .map(DaemonRequest::VirtualInputStatus)
@@ -668,5 +666,49 @@ mod tests {
         assert!(processes[0].is_running);
         assert!(processes[0].is_running_input);
         assert!(!processes[0].is_running_output);
+    }
+
+    #[test]
+    fn virtual_input_intent_requests_and_responses_round_trip() {
+        let request = deserialize_request(
+            Command::SetVirtualInputs,
+            json!({
+                "app_id": "com.example.app",
+                "inputs": [{
+                    "id": "mic",
+                    "name": "Example Mic",
+                    "uid": "com.example.app.mic",
+                    "sample_rate": 48000,
+                    "channels": 1
+                }]
+            }),
+        )
+        .expect("parse set request");
+        let DaemonRequest::SetVirtualInputs(request) = request else {
+            panic!("expected set request");
+        };
+        assert_eq!(request.app_id, "com.example.app");
+        assert_eq!(request.inputs[0].id, "mic");
+
+        let payload = DaemonResponse::VirtualInputs(AppVirtualInputs {
+            app_id: request.app_id,
+            inputs: request.inputs,
+        })
+        .into_payload()
+        .expect("serialize get response");
+        let DaemonResponse::VirtualInputs(stored) =
+            DaemonResponse::from_payload(Command::GetVirtualInputs, payload)
+                .expect("deserialize get response")
+        else {
+            panic!("expected get response");
+        };
+        assert_eq!(stored.app_id, "com.example.app");
+        assert_eq!(stored.inputs[0].uid, "com.example.app.mic");
+    }
+
+    #[test]
+    fn retired_per_device_commands_are_rejected() {
+        assert!(serde_json::from_str::<Command>(r#""ensure_virtual_input""#).is_err());
+        assert!(serde_json::from_str::<Command>(r#""remove_virtual_input""#).is_err());
     }
 }

@@ -15,8 +15,8 @@ What it exercises:
 1. preflight — signed `mars.driver` present in `/Library/Audio/Plug-Ins/HAL`,
    `marsd` reachable (exits `2` with instructions when unmet: these are the
    manual-setup prerequisites that signing/permissions impose)
-2. an external producer (`mars-sdk` example `virtual_mic_producer`) ensures
-   an app-owned virtual input (`producer: external_app`) and streams a
+2. an external producer (`mars-sdk` example `virtual_mic_producer`) declares
+   an app-owned virtual input set and streams a
    440 Hz sine through `LiveWriter`
 3. `mars status --json` must report the producer `active`
 4. a CoreAudio client (`virtual_mic_reader`, cpal-based) captures 2 s from
@@ -61,7 +61,7 @@ observation.
 1. Select MARS Acceptance Mic in Zoom and leave it selected.
 2. Upgrade or reinstall the runtime (`mars runtime update`, or
    uninstall + install).
-3. Re-ensure the device with the same `uid`
+3. Re-submit the virtual-input set with the same `uid`
    (`com.mars.acceptance.mic`).
 4. Expected: Zoom still has the device selected (CoreAudio matches by
    UID); no re-selection needed.

@@ -20,6 +20,7 @@ bundles/mars.driver/Contents/_CodeSignature
 bundles/mars.driver/Contents/CodeResources
 bundles/mars.driver/Contents/MacOS/mars_hal
 .DS_Store
+*.shadow.md
 sudo.secret
 notary.secret
 .claude/worktrees/

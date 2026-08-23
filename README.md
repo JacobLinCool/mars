@@ -6,7 +6,7 @@ MARS (macOS Audio Router Service) is an audio routing system for macOS 15+.
 
 - `mars` CLI with commands: `create`, `open`, `apply`, `clear`, `validate`, `plan`, `status`, `devices`, `processes`, `test`, `logs`, `doctor`
 - `marsd` daemon with declarative apply transaction and rollback semantics
-- `mars-sdk` Rust SDK crate for building external apps/tools on the typed MARS API
+- `mars-sdk` Rust SDK with app-scoped declarative virtual-input intents and realtime writers
 - `mars-hal` AudioServerPlugIn driver crate and `mars.driver` bundle scaffold
 - Profile schema `version: 2` only (`version: 1` is rejected)
 - Process/system capture tap model (`captures.process_taps` and `captures.system_taps`)
