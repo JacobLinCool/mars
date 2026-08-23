@@ -41,10 +41,18 @@ cp -R "$ROOT_DIR/bundles/mars.driver" "$STAGE_DIR/driver/mars.driver"
 # Sign the CLI binaries with the same Developer ID policy as the driver bundle
 # (build-driver.sh already signed the bundle). Unsigned packages stay unsigned
 # and must be installed with --allow-unsigned (development only).
-DEV_ID="$(security find-identity -v -p codesigning 2>/dev/null | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/' || true)"
+DEV_ID="${MARS_DEVELOPER_ID_APPLICATION:-}"
+if [ -z "$DEV_ID" ]; then
+  DEV_ID="$(security find-identity -v -p codesigning 2>/dev/null | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/' || true)"
+fi
 if [ -n "$DEV_ID" ]; then
-  codesign --force --sign "$DEV_ID" --options runtime "$STAGE_DIR/bin/mars"
-  codesign --force --sign "$DEV_ID" --options runtime "$STAGE_DIR/bin/marsd"
+  codesign --force --sign "$DEV_ID" --options runtime --timestamp "$STAGE_DIR/bin/mars"
+  codesign --force --sign "$DEV_ID" --options runtime --timestamp "$STAGE_DIR/bin/marsd"
+  codesign --verify --strict --verbose=2 "$STAGE_DIR/bin/mars"
+  codesign --verify --strict --verbose=2 "$STAGE_DIR/bin/marsd"
+elif [ "${MARS_REQUIRE_SIGNING:-0}" = "1" ]; then
+  echo "error: MARS_REQUIRE_SIGNING=1 but no Developer ID Application certificate is available." >&2
+  exit 1
 else
   echo "warning: no Developer ID Application certificate found; packaging unsigned binaries." >&2
   echo "warning: install will require --allow-unsigned (development only)." >&2

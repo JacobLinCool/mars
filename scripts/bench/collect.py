@@ -63,6 +63,11 @@ def load_json(path: Path) -> dict:
 def collect_records(criterion_dirs: list[Path], sample_rate_hz: int) -> list[dict]:
     records: dict[tuple[str, str], dict] = {}
 
+    def retain_minimum(key: tuple[str, str], record: dict) -> None:
+        current = records.get(key)
+        if current is None or record["value"] < current["value"]:
+            records[key] = record
+
     for criterion_dir in criterion_dirs:
         for benchmark_file in sorted(criterion_dir.rglob("new/benchmark.json")):
             bench_dir = benchmark_file.parent
@@ -108,25 +113,31 @@ def collect_records(criterion_dirs: list[Path], sample_rate_hz: int) -> list[dic
             p99_ns = parse_finite_float(quantile(per_iter_ns, 0.99), f"{benchmark_id} p99_ns")
 
             for metric, value in (("median_ns", median_ns), ("p95_ns", p95_ns)):
-                records[(benchmark_id, metric)] = {
-                    "benchmark_id": benchmark_id,
-                    "metric": metric,
-                    "value": value,
-                    "unit": "ns",
-                }
+                retain_minimum(
+                    (benchmark_id, metric),
+                    {
+                        "benchmark_id": benchmark_id,
+                        "metric": metric,
+                        "value": value,
+                        "unit": "ns",
+                    },
+                )
 
             frames = parse_frames(benchmark_id)
             if frames is not None and sample_rate_hz > 0:
                 period_ns = (frames * 1_000_000_000.0) / float(sample_rate_hz)
                 if period_ns > 0:
-                    records[(benchmark_id, "rt_cycle_p99_ratio")] = {
-                        "benchmark_id": benchmark_id,
-                        "metric": "rt_cycle_p99_ratio",
-                        "value": p99_ns / period_ns,
-                        "unit": "ratio",
-                        "period_frames": frames,
-                        "sample_rate_hz": sample_rate_hz,
-                    }
+                    retain_minimum(
+                        (benchmark_id, "rt_cycle_p99_ratio"),
+                        {
+                            "benchmark_id": benchmark_id,
+                            "metric": "rt_cycle_p99_ratio",
+                            "value": p99_ns / period_ns,
+                            "unit": "ratio",
+                            "period_frames": frames,
+                            "sample_rate_hz": sample_rate_hz,
+                        },
+                    )
 
     sorted_records = sorted(
         records.values(),

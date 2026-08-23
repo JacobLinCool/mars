@@ -79,10 +79,14 @@ with open(path, 'wb') as f:
 # Local insecure signing must be an explicit opt-in.
 ALLOW_INSECURE_SIGNING="${MARS_ALLOW_INSECURE_SIGNING:-0}"
 
-DEV_ID="$(security find-identity -v -p codesigning 2>/dev/null | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/' || true)"
+DEV_ID="${MARS_DEVELOPER_ID_APPLICATION:-}"
+if [ -z "$DEV_ID" ]; then
+    DEV_ID="$(security find-identity -v -p codesigning 2>/dev/null | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/' || true)"
+fi
 
 if [ -n "$DEV_ID" ]; then
-    codesign --force --sign "$DEV_ID" --deep --options runtime "$ROOT_DIR/bundles/mars.driver"
+    codesign --force --sign "$DEV_ID" --deep --options runtime --timestamp "$ROOT_DIR/bundles/mars.driver"
+    codesign --verify --deep --strict --verbose=2 "$ROOT_DIR/bundles/mars.driver"
 elif [ "$ALLOW_INSECURE_SIGNING" = "1" ]; then
     SIGN_ID="-"
     FOUND_ID="$(security find-identity -v -p codesigning 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/' || true)"

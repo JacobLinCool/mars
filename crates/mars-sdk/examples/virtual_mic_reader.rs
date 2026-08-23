@@ -40,8 +40,10 @@ fn main() {
     let Some(device) = host.input_devices().ok().and_then(|mut devices| {
         devices.find(|device| {
             device
-                .name()
-                .map(|name| name.contains("MARS") || name.contains("Acceptance"))
+                .description()
+                .map(|description| {
+                    description.name().contains("MARS") || description.name().contains("Acceptance")
+                })
                 .unwrap_or(false)
         })
     }) else {

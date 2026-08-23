@@ -1,0 +1,45 @@
+#!/bin/bash
+set -euo pipefail
+
+LABEL="com.mars.marsd"
+CONSOLE_USER="$(/usr/bin/stat -f '%Su' /dev/console)"
+case "$CONSOLE_USER" in
+  ""|root|loginwindow|_mbsetupuser)
+    echo "error: MARS requires an active macOS user session during installation." >&2
+    exit 1
+    ;;
+esac
+
+USER_UID="$(/usr/bin/id -u "$CONSOLE_USER")"
+USER_GROUP="$(/usr/bin/id -gn "$CONSOLE_USER")"
+USER_HOME="$(/usr/bin/dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory | /usr/bin/awk '{print $2}')"
+if [ -z "$USER_HOME" ] || [ ! -d "$USER_HOME" ]; then
+  echo "error: unable to resolve the active user's home directory." >&2
+  exit 1
+fi
+
+/usr/bin/install -d -m 0755 -o "$CONSOLE_USER" -g "$USER_GROUP" \
+  "$USER_HOME/Library/LaunchAgents" \
+  "$USER_HOME/Library/Logs/mars" \
+  "$USER_HOME/Library/Caches/mars" \
+  "$USER_HOME/Library/Application Support/mars/profiles"
+
+PLIST_TEMPLATE="/usr/local/share/mars/com.mars.marsd.plist.in"
+PLIST_DEST="$USER_HOME/Library/LaunchAgents/$LABEL.plist"
+/usr/bin/sed \
+  -e "s#__MARS_BIN__#/usr/local/bin#g" \
+  -e "s#__HOME__#$USER_HOME#g" \
+  "$PLIST_TEMPLATE" > "$PLIST_DEST"
+/usr/sbin/chown "$CONSOLE_USER:$USER_GROUP" "$PLIST_DEST"
+/bin/chmod 0644 "$PLIST_DEST"
+
+/bin/launchctl bootout "gui/$USER_UID/$LABEL" >/dev/null 2>&1 || true
+/bin/launchctl bootstrap "gui/$USER_UID" "$PLIST_DEST"
+/bin/launchctl enable "gui/$USER_UID/$LABEL"
+/bin/launchctl kickstart -k "gui/$USER_UID/$LABEL"
+
+if ! /usr/bin/killall -9 coreaudiod; then
+  echo "warning: CoreAudio could not be reloaded automatically; restart macOS before using MARS." >&2
+fi
+
+echo "MARS installed for $CONSOLE_USER. Run: mars doctor"

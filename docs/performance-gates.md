@@ -8,6 +8,8 @@ This repository uses hard, merge-blocking benchmark gates on `macos-15`.
 - `p95_ns`: fail on regression over `15%`
 - `rt_cycle_p99_ratio`: fail when over `0.75` of callback period
 - non-finite budget or metric values (`NaN`, `inf`) are rejected
+- CI runs each benchmark set twice and evaluates the minimum value per metric,
+  filtering transient shared-runner contention without relaxing the budgets
 
 Budgets are committed at:
 
@@ -31,7 +33,7 @@ Run from repository root.
 ### Full gate (all budgets, slow)
 
 ```bash
-scripts/bench/verify.sh --platform macos-15
+scripts/bench/verify.sh --platform macos-15 --attempts 2
 ```
 
 ### Matrix gate

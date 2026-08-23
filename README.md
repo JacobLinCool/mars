@@ -219,6 +219,11 @@ Quick health check:
 mars doctor
 ```
 
+Tagged releases provide Developer ID-signed and Apple-notarized `.pkg`
+installers for Apple Silicon and Intel Macs. See
+[`docs/releasing.md`](docs/releasing.md) for the release contract and required
+GitHub configuration.
+
 If logs report `Mars driver plugin not found in loaded CoreAudio plugins`, run:
 
 ```bash

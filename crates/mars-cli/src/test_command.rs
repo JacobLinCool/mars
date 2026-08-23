@@ -646,48 +646,46 @@ pub(crate) fn format_route_test_report(report: &RouteTestReport) -> String {
 }
 
 fn build_internal_test_profile(sample_rate: u32, buffer_frames: u32) -> Profile {
-    let mut profile = Profile::default();
-    profile.name = Some("mars-test-internal-latency".to_string());
-    profile.description = Some("Temporary internal loopback profile for `mars test`.".to_string());
-    profile.audio = AudioConfig {
-        sample_rate: AutoOrU32::Value(sample_rate),
-        channels: AutoOrU16::Value(2),
-        buffer_frames,
-        format: Default::default(),
-        latency_mode: Default::default(),
-    };
-    profile.virtual_devices = VirtualDevices {
-        outputs: vec![VirtualOutputDevice {
-            id: TEST_VIRTUAL_OUTPUT_ID.to_string(),
-            name: TEST_VIRTUAL_OUTPUT_NAME.to_string(),
-            channels: Some(2),
-            uid: Some(TEST_VIRTUAL_OUTPUT_UID.to_string()),
-            hidden: false,
+    Profile {
+        name: Some("mars-test-internal-latency".to_string()),
+        description: Some("Temporary internal loopback profile for `mars test`.".to_string()),
+        audio: AudioConfig {
+            sample_rate: AutoOrU32::Value(sample_rate),
+            channels: AutoOrU16::Value(2),
+            buffer_frames,
+            format: Default::default(),
+            latency_mode: Default::default(),
+        },
+        virtual_devices: VirtualDevices {
+            outputs: vec![VirtualOutputDevice {
+                id: TEST_VIRTUAL_OUTPUT_ID.to_string(),
+                name: TEST_VIRTUAL_OUTPUT_NAME.to_string(),
+                channels: Some(2),
+                uid: Some(TEST_VIRTUAL_OUTPUT_UID.to_string()),
+                hidden: false,
+            }],
+            inputs: vec![VirtualInputDevice {
+                id: TEST_VIRTUAL_INPUT_ID.to_string(),
+                name: TEST_VIRTUAL_INPUT_NAME.to_string(),
+                channels: Some(2),
+                uid: Some(TEST_VIRTUAL_INPUT_UID.to_string()),
+                mix: None,
+                producer: ProducerKind::default(),
+            }],
+        },
+        external: ExternalDevices::default(),
+        pipes: vec![Pipe {
+            from: TEST_VIRTUAL_OUTPUT_ID.to_string(),
+            to: TEST_VIRTUAL_INPUT_ID.to_string(),
+            enabled: true,
+            gain_db: 0.0,
+            mute: false,
+            pan: 0.0,
+            delay_ms: 0.0,
         }],
-        inputs: vec![VirtualInputDevice {
-            id: TEST_VIRTUAL_INPUT_ID.to_string(),
-            name: TEST_VIRTUAL_INPUT_NAME.to_string(),
-            channels: Some(2),
-            uid: Some(TEST_VIRTUAL_INPUT_UID.to_string()),
-            mix: None,
-            producer: ProducerKind::default(),
-        }],
-    };
-    profile.external = ExternalDevices::default();
-    profile.pipes = Vec::new();
-    profile.policy = Policy::default();
-
-    profile.pipes.push(Pipe {
-        from: TEST_VIRTUAL_OUTPUT_ID.to_string(),
-        to: TEST_VIRTUAL_INPUT_ID.to_string(),
-        enabled: true,
-        gain_db: 0.0,
-        mute: false,
-        pan: 0.0,
-        delay_ms: 0.0,
-    });
-
-    profile
+        policy: Policy::default(),
+        ..Profile::default()
+    }
 }
 
 fn build_route_test_profile(
@@ -698,38 +696,41 @@ fn build_route_test_profile(
     speaker: &ExternalDeviceInfo,
     speaker_channels: u16,
 ) -> Profile {
-    let mut profile = Profile::default();
-    profile.name = Some("mars-test-route".to_string());
-    profile.description = Some(
-        "Temporary microphone-to-speaker route test profile for `mars test --route`.".to_string(),
-    );
-    profile.audio = AudioConfig {
-        sample_rate: AutoOrU32::Value(sample_rate),
-        channels: AutoOrU16::Value(2),
-        buffer_frames,
-        format: Default::default(),
-        latency_mode: Default::default(),
+    let mut profile = Profile {
+        name: Some("mars-test-route".to_string()),
+        description: Some(
+            "Temporary microphone-to-speaker route test profile for `mars test --route`."
+                .to_string(),
+        ),
+        audio: AudioConfig {
+            sample_rate: AutoOrU32::Value(sample_rate),
+            channels: AutoOrU16::Value(2),
+            buffer_frames,
+            format: Default::default(),
+            latency_mode: Default::default(),
+        },
+        virtual_devices: VirtualDevices {
+            outputs: vec![VirtualOutputDevice {
+                id: TEST_VIRTUAL_OUTPUT_ID.to_string(),
+                name: TEST_VIRTUAL_OUTPUT_NAME.to_string(),
+                channels: Some(speaker_channels),
+                uid: Some(TEST_VIRTUAL_OUTPUT_UID.to_string()),
+                hidden: false,
+            }],
+            inputs: vec![VirtualInputDevice {
+                id: TEST_VIRTUAL_INPUT_ID.to_string(),
+                name: TEST_VIRTUAL_INPUT_NAME.to_string(),
+                channels: Some(microphone_channels),
+                uid: Some(TEST_VIRTUAL_INPUT_UID.to_string()),
+                mix: None,
+                producer: ProducerKind::default(),
+            }],
+        },
+        external: ExternalDevices::default(),
+        pipes: Vec::new(),
+        policy: Policy::default(),
+        ..Profile::default()
     };
-    profile.virtual_devices = VirtualDevices {
-        outputs: vec![VirtualOutputDevice {
-            id: TEST_VIRTUAL_OUTPUT_ID.to_string(),
-            name: TEST_VIRTUAL_OUTPUT_NAME.to_string(),
-            channels: Some(speaker_channels),
-            uid: Some(TEST_VIRTUAL_OUTPUT_UID.to_string()),
-            hidden: false,
-        }],
-        inputs: vec![VirtualInputDevice {
-            id: TEST_VIRTUAL_INPUT_ID.to_string(),
-            name: TEST_VIRTUAL_INPUT_NAME.to_string(),
-            channels: Some(microphone_channels),
-            uid: Some(TEST_VIRTUAL_INPUT_UID.to_string()),
-            mix: None,
-            producer: ProducerKind::default(),
-        }],
-    };
-    profile.external = ExternalDevices::default();
-    profile.pipes = Vec::new();
-    profile.policy = Policy::default();
 
     profile.external.inputs.push(ExternalInput {
         id: TEST_MIC_ID.to_string(),

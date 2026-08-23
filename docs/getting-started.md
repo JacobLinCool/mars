@@ -1,6 +1,9 @@
 # MARS Getting Started
 
 This guide covers a full dev-first setup on macOS 15+, from first install to first profile apply.
+For a released build, download the installer matching your Mac from GitHub
+Releases and double-click the `.pkg`; no Rust toolchain or repository checkout
+is required.
 
 ## Prerequisites
 
