@@ -166,29 +166,33 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.34.5
+          cache: true
+          cache_dependency_path: sdks/typescript/pnpm-lock.yaml
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: npm
-          cache-dependency-path: sdks/typescript/package-lock.json
-      - uses: actions/setup-python@v6
+      - uses: astral-sh/setup-uv@v9
         with:
+          version: "0.12.5"
           python-version: "3.13"
-          cache: pip
-          cache-dependency-path: sdks/python/pyproject.toml
+          enable-cache: true
+          cache-dependency-glob: sdks/python/uv.lock
       - name: Require arm64 runner
         run: test "$(uname -m)" = arm64
       - name: Test TypeScript SDK
         working-directory: sdks/typescript
         run: |
-          npm ci
-          npm run build:native
-          npm test
-          npm run test:native
+          pnpm install --frozen-lockfile
+          pnpm run build:native
+          pnpm test
+          pnpm run test:native
       - name: Test Python SDK
         run: |
-          python -m pip install ./sdks/python
-          python -m unittest discover -s sdks/python/tests -v
+          uv sync --project sdks/python --locked
+          uv run --project sdks/python --locked python -m unittest discover -s sdks/python/tests -v
 
   publish:
     name: Publish GitHub Release

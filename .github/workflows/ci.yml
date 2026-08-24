@@ -49,24 +49,27 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.34.5
+          cache: true
+          cache_dependency_path: sdks/typescript/pnpm-lock.yaml
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: npm
-          cache-dependency-path: sdks/typescript/package-lock.json
       - name: Require arm64 runner
         run: test "$(uname -m)" = arm64
       - name: Install dependencies
         working-directory: sdks/typescript
-        run: npm ci
+        run: pnpm install --frozen-lockfile
       - name: Build native writer
         working-directory: sdks/typescript
-        run: npm run build:native
+        run: pnpm run build:native
       - name: Test SDK
         working-directory: sdks/typescript
         run: |
-          npm test
-          npm run test:native
+          pnpm test
+          pnpm run test:native
 
   python-sdk:
     name: Python SDK (arm64)
@@ -76,14 +79,15 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v6
+      - uses: astral-sh/setup-uv@v9
         with:
+          version: "0.12.5"
           python-version: "3.13"
-          cache: pip
-          cache-dependency-path: sdks/python/pyproject.toml
+          enable-cache: true
+          cache-dependency-glob: sdks/python/uv.lock
       - name: Require arm64 runner
         run: test "$(uname -m)" = arm64
       - name: Build and install SDK
-        run: python -m pip install ./sdks/python
+        run: uv sync --project sdks/python --locked
       - name: Test SDK
-        run: python -m unittest discover -s sdks/python/tests -v
+        run: uv run --project sdks/python --locked python -m unittest discover -s sdks/python/tests -v

@@ -7,10 +7,10 @@ shared-memory writes to the existing Rust SDK.
 ## Build from this repository
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install .
+uv sync --locked
 ```
+
+Run the complete example with `uv run python examples/virtual_mic.py`.
 
 ## Declare and write a virtual microphone
 

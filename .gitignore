@@ -30,3 +30,4 @@ sdks/typescript/node_modules/
 sdks/python/src/mars_sdk/*.so
 sdks/python/src/mars_sdk/__pycache__/
 sdks/python/tests/__pycache__/
+sdks/python/.venv/

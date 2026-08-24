@@ -7,9 +7,9 @@ daemon; JavaScript does not implement the ring protocol.
 ## Build from this repository
 
 ```bash
-npm ci
-npm run build:native
-npm run build
+pnpm install --frozen-lockfile
+pnpm run build:native
+pnpm run build
 ```
 
 ## Declare and write a virtual microphone
