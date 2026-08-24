@@ -1,6 +1,6 @@
 [package]
 name = "mars-sdk"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -45,4 +45,3 @@ required-features = ["default-socket-path"]
 [[example]]
 name = "virtual_mic_reader"
 path = "examples/virtual_mic_reader.rs"
-
