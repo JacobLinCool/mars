@@ -1,6 +1,8 @@
-# MARS SDK (Rust)
+# MARS SDKs
 
-`mars-sdk` is the public Rust integration layer for building apps and tools on top of `marsd`.
+MARS provides Rust, TypeScript, and Python integration layers for building
+apps and tools on top of `marsd`. This page documents Rust. See
+[`language-sdks.md`](language-sdks.md) for TypeScript and Python.
 
 ## Contract scope
 

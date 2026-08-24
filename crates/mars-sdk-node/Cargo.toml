@@ -1,0 +1,25 @@
+[package]
+name = "mars-sdk-node"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Native data-plane binding for the MARS TypeScript SDK"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mars-sdk = { path = "../mars-sdk" }
+mars-types = { path = "../mars-types" }
+napi = { version = "2.16.17", features = ["napi8"] }
+napi-derive = "2.16.13"
+serde_json.workspace = true
+
+[build-dependencies]
+napi-build = "=2.2.4"
+
+[lints]
+workspace = true

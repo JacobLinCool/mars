@@ -4,6 +4,8 @@ members = [
   "crates/mars-profile",
   "crates/mars-graph",
   "crates/mars-sdk",
+  "crates/mars-sdk-node",
+  "crates/mars-sdk-python",
   "crates/mars-shm",
   "crates/mars-engine",
   "crates/mars-coreaudio",

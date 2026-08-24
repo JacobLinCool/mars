@@ -261,7 +261,7 @@ impl MarsClient {
                 virtual_mics: result
                     .ensured_inputs
                     .into_iter()
-                    .map(VirtualMic::new)
+                    .map(VirtualMic::from_info)
                     .collect(),
             }),
             other => Err(unexpected_response(Command::SetVirtualInputs, &other)),

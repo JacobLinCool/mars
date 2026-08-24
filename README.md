@@ -256,10 +256,12 @@ mars clear
 
 ## SDK
 
-For third-party app/tool development, use the Rust SDK:
+For third-party app/tool development, use one of the typed SDKs:
 
-- docs: `docs/sdk.md`
-- example: `cargo run -p mars-sdk --example status`
+- Rust: `docs/sdk.md`, including the realtime `LiveWriter`
+- TypeScript: `sdks/typescript`, with an arm64 native writer addon
+- Python: `sdks/python`, with an arm64 native writer extension
+- shared TypeScript/Python contract: `docs/language-sdks.md`
 
 ## Uninstall
 

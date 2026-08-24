@@ -24,3 +24,9 @@ bundles/mars.driver/Contents/MacOS/mars_hal
 sudo.secret
 notary.secret
 .claude/worktrees/
+sdks/typescript/dist/
+sdks/typescript/native/*.node
+sdks/typescript/node_modules/
+sdks/python/src/mars_sdk/*.so
+sdks/python/src/mars_sdk/__pycache__/
+sdks/python/tests/__pycache__/

@@ -43,7 +43,12 @@ pub struct VirtualMic {
 }
 
 impl VirtualMic {
-    pub(crate) fn new(ensured: EnsuredVirtualInput) -> Self {
+    /// Rehydrate a writer handle returned by the daemon.
+    ///
+    /// This is primarily used by language bindings that transport the typed
+    /// `EnsuredVirtualInput` value across their native boundary.
+    #[must_use]
+    pub fn from_info(ensured: EnsuredVirtualInput) -> Self {
         Self { ensured }
     }
 
@@ -174,7 +179,7 @@ mod tests {
 
     #[test]
     fn live_writer_attach_write_clear_flush_detach() {
-        let mic = VirtualMic::new(test_ensured("writer-cycle"));
+        let mic = VirtualMic::from_info(test_ensured("writer-cycle"));
         let ring_name = mic.info().ring_name.clone();
 
         let mut writer = mic.open_live_writer().expect("open writer");
@@ -210,7 +215,7 @@ mod tests {
         let mut ensured = test_ensured("misaligned");
         ensured.channels = 2;
         ensured.ring_name = "mars.vin.test.misaligned.feedface00000000".to_string();
-        let mic = VirtualMic::new(ensured);
+        let mic = VirtualMic::from_info(ensured);
         let mut writer = mic.open_live_writer().expect("open writer");
 
         let error = writer
