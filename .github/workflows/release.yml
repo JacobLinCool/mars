@@ -248,12 +248,11 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
-          package-manager-cache: false
       - name: Publish package with npm trusted publishing
         run: |
-          PACKAGE="$(find package -maxdepth 1 -name '*.tgz' -print -quit)"
+          PACKAGE="$(find "$GITHUB_WORKSPACE/package" -maxdepth 1 -name '*.tgz' -print -quit)"
           test -n "$PACKAGE"
+          unset NODE_AUTH_TOKEN
           pnpm dlx npm@11.10.0 publish "$PACKAGE" --access public
 
   publish-pypi:

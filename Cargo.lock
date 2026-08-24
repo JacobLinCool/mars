@@ -856,7 +856,7 @@ dependencies = [
 
 [[package]]
 name = "mars-audio-tap"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "cc",
  "serde",
@@ -866,7 +866,7 @@ dependencies = [
 
 [[package]]
 name = "mars-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "dirs",
@@ -884,7 +884,7 @@ dependencies = [
 
 [[package]]
 name = "mars-coreaudio"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "cpal",
  "mars-shm",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "mars-daemon"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -932,7 +932,7 @@ dependencies = [
 
 [[package]]
 name = "mars-engine"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arc-swap",
  "criterion",
@@ -947,7 +947,7 @@ dependencies = [
 
 [[package]]
 name = "mars-graph"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "criterion",
  "mars-types",
@@ -958,7 +958,7 @@ dependencies = [
 
 [[package]]
 name = "mars-hal"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arc-swap",
  "criterion",
@@ -974,7 +974,7 @@ dependencies = [
 
 [[package]]
 name = "mars-hal-client"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "mars-hal",
  "serde_json",
@@ -984,7 +984,7 @@ dependencies = [
 
 [[package]]
 name = "mars-ipc"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "mars-types",
@@ -998,7 +998,7 @@ dependencies = [
 
 [[package]]
 name = "mars-plugin-host"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "mars-types",
  "serde",
@@ -1007,7 +1007,7 @@ dependencies = [
 
 [[package]]
 name = "mars-profile"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "criterion",
  "mars-graph",
@@ -1023,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "mars-sdk"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "cpal",
@@ -1040,7 +1040,7 @@ dependencies = [
 
 [[package]]
 name = "mars-sdk-node"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "mars-sdk",
  "mars-types",
@@ -1052,7 +1052,7 @@ dependencies = [
 
 [[package]]
 name = "mars-sdk-python"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "mars-sdk",
  "mars-types",
@@ -1062,7 +1062,7 @@ dependencies = [
 
 [[package]]
 name = "mars-shm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dirs",
  "mars-hal",
@@ -1074,7 +1074,7 @@ dependencies = [
 
 [[package]]
 name = "mars-types"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "schemars",
