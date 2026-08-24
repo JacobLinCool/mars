@@ -10,6 +10,17 @@ JSON support. The data plane is implemented by small native bindings that
 delegate to the Rust `mars-sdk::LiveWriter`; TypeScript and Python never
 reimplement the shared-memory ring protocol or capability naming.
 
+Install the published packages with the repository-standard package managers:
+
+```bash
+pnpm add @mars-audio/sdk
+uv add mars-audio-sdk
+```
+
+Both packages target Apple Silicon macOS and require the separately installed
+MARS runtime. The Python distribution uses the CPython 3.11 stable ABI, so one
+arm64 wheel supports CPython 3.11 and newer.
+
 The SDKs live in `sdks/typescript` and `sdks/python`. Both are package-ready
 for arm64 macOS and intentionally expose only:
 

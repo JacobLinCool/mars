@@ -4,6 +4,15 @@ Arm64 macOS SDK for applications that own MARS virtual input devices. The
 async control client uses IPC protocol v3 and its native extension delegates
 shared-memory writes to the existing Rust SDK.
 
+## Install
+
+```bash
+uv add mars-audio-sdk
+```
+
+The wheel requires Apple Silicon macOS, CPython 3.11 or newer, and an installed
+MARS runtime.
+
 ## Build from this repository
 
 ```bash

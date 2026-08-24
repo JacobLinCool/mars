@@ -3,6 +3,14 @@
   "version": "0.1.0",
   "packageManager": "pnpm@10.34.5",
   "description": "TypeScript SDK for app-owned MARS virtual inputs",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/JacobLinCool/mars",
+    "directory": "sdks/typescript"
+  },
+  "homepage": "https://github.com/JacobLinCool/mars#sdk",
+  "bugs": "https://github.com/JacobLinCool/mars/issues",
   "type": "module",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
@@ -22,6 +30,10 @@
     "test:native": "node --test test/native.test.mjs"
   },
   "engines": { "node": ">=20" },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "devDependencies": {
     "@types/node": "^24.3.0",
     "typescript": "^5.9.2"

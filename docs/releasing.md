@@ -23,10 +23,64 @@ Configure these repository Actions secrets:
 The release workflow has no unsigned or password-based fallback. A missing or
 invalid secret fails the release before an artifact is published.
 
+Create two GitHub Actions environments in the repository:
+
+- `npm`
+- `pypi`
+
+They do not contain registry tokens. Registry publication uses GitHub OIDC.
+
+### PyPI trusted publisher
+
+Create a pending GitHub publisher for `mars-audio-sdk` with these exact values:
+
+| Field | Value |
+| --- | --- |
+| PyPI project name | `mars-audio-sdk` |
+| GitHub owner | `JacobLinCool` |
+| Repository name | `mars` |
+| Workflow filename | `release.yml` |
+| Environment name | `pypi` |
+
+PyPI creates the project on the first successful trusted publication. Do not
+add a PyPI API token to GitHub.
+
+### npm trusted publisher
+
+The public `mars-audio` npm scope must exist and the first version of
+`@mars-audio/sdk` must be published interactively before npm exposes its
+trusted-publisher settings:
+
+```bash
+cd sdks/typescript
+pnpm install --frozen-lockfile
+pnpm run build:native
+pnpm test
+pnpm run test:native
+pnpm login --registry https://registry.npmjs.org/
+pnpm publish --access public
+```
+
+Then configure the package's GitHub Actions trusted publisher:
+
+| Field | Value |
+| --- | --- |
+| Organization or user | `JacobLinCool` |
+| Repository | `mars` |
+| Workflow filename | `release.yml` |
+| Environment name | `npm` |
+| Allowed action | `npm publish` |
+
+The workflow uses pnpm for dependency management, build, test, and packaging.
+Its final registry upload invokes a pinned npm CLI because npm's OIDC exchange
+is implemented by npm CLI 11.5.1 and newer. After the trusted publisher works,
+disable token-based publishing for the package.
+
 ## Publish a release
 
-1. Update `crates/mars-daemon/Cargo.toml` to the release version and merge the
-   verified change into `main`.
+1. Update the runtime, SDK, native-binding, TypeScript, and Python package
+   manifests to the same release version and merge the verified change into
+   `main`.
 2. Create and push an annotated matching tag:
 
    ```bash
@@ -35,11 +89,14 @@ invalid secret fails the release before an artifact is published.
    ```
 
 The tag must be `vX.Y.Z`, match the daemon crate version exactly, and point to
-a commit contained in `main`. The workflow publishes:
+a commit contained in `main`. The workflow verifies that all shipping package
+versions match before it publishes:
 
 - `mars-X.Y.Z-arm64.pkg`
 - per-package checksums and notarization logs
 - `SHA256SUMS`
+- `@mars-audio/sdk@X.Y.Z` on npm
+- `mars-audio-sdk==X.Y.Z` as a CPython 3.11+ `abi3` arm64 macOS wheel on PyPI
 
 Users can double-click the package or install it from Terminal:
 

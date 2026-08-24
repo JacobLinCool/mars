@@ -33,6 +33,20 @@ jobs:
         run: |
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/mars-daemon/Cargo.toml | head -1)"
           test "$GITHUB_REF_NAME" = "v$VERSION"
+          for manifest in \
+            crates/mars-cli/Cargo.toml \
+            crates/mars-hal/Cargo.toml \
+            crates/mars-sdk/Cargo.toml \
+            crates/mars-sdk-node/Cargo.toml \
+            crates/mars-sdk-python/Cargo.toml
+          do
+            MANIFEST_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$manifest" | head -1)"
+            test "$MANIFEST_VERSION" = "$VERSION"
+          done
+          TYPESCRIPT_VERSION="$(sed -n 's/^[[:space:]]*"version": "\([^"]*\)",/\1/p' sdks/typescript/package.json | head -1)"
+          PYTHON_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' sdks/python/pyproject.toml | head -1)"
+          test "$TYPESCRIPT_VERSION" = "$VERSION"
+          test "$PYTHON_VERSION" = "$VERSION"
           git fetch origin main --no-tags
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
       - name: Check formatting
@@ -158,7 +172,7 @@ jobs:
           if-no-files-found: error
 
   language-sdks:
-    name: Verify language SDKs (arm64)
+    name: Build and verify language SDKs (arm64)
     needs: verify
     runs-on: macos-15
     timeout-minutes: 25
@@ -177,7 +191,7 @@ jobs:
       - uses: astral-sh/setup-uv@v10.0.1
         with:
           version: "0.12.5"
-          python-version: "3.13"
+          python-version: "3.11"
           enable-cache: true
           cache-dependency-glob: sdks/python/uv.lock
       - name: Require arm64 runner
@@ -189,16 +203,89 @@ jobs:
           pnpm run build:native
           pnpm test
           pnpm run test:native
+          mkdir -p "$GITHUB_WORKSPACE/dist/sdk-npm"
+          pnpm pack --pack-destination "$GITHUB_WORKSPACE/dist/sdk-npm"
       - name: Test Python SDK
         run: |
           uv sync --project sdks/python --locked
           uv run --project sdks/python --locked python -m unittest discover -s sdks/python/tests -v
+          uv build --project sdks/python --python 3.11 --wheel --clear --out-dir dist/sdk-pypi
+          WHEEL="$(find dist/sdk-pypi -maxdepth 1 -name 'mars_audio_sdk-*-cp311-abi3-macosx_11_0_arm64.whl' -print -quit)"
+          test -n "$WHEEL"
+          uv run --isolated --python 3.11 --with "$WHEEL" python -c 'import mars_sdk; print(mars_sdk.__name__)'
+      - name: Upload npm package
+        uses: actions/upload-artifact@v7
+        with:
+          name: mars-sdk-npm
+          path: dist/sdk-npm/*.tgz
+          if-no-files-found: error
+      - name: Upload PyPI package
+        uses: actions/upload-artifact@v7
+        with:
+          name: mars-sdk-pypi
+          path: dist/sdk-pypi/*.whl
+          if-no-files-found: error
+
+  publish-npm:
+    name: Publish TypeScript SDK to npm
+    needs:
+      - build
+      - language-sdks
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: mars-sdk-npm
+          path: package
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.34.5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Publish package with npm trusted publishing
+        run: |
+          PACKAGE="$(find package -maxdepth 1 -name '*.tgz' -print -quit)"
+          test -n "$PACKAGE"
+          pnpm dlx npm@11.10.0 publish "$PACKAGE" --access public
+
+  publish-pypi:
+    name: Publish Python SDK to PyPI
+    needs:
+      - build
+      - language-sdks
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: mars-sdk-pypi
+          path: package
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: "0.12.5"
+          enable-cache: false
+      - name: Publish package with PyPI trusted publishing
+        run: uv publish --trusted-publishing always package/*.whl
 
   publish:
     name: Publish GitHub Release
     needs:
       - build
       - language-sdks
+      - publish-npm
+      - publish-pypi
     runs-on: ubuntu-latest
     permissions:
       contents: write

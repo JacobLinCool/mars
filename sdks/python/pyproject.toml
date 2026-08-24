@@ -8,7 +8,21 @@ version = "0.1.0"
 description = "Python SDK for app-owned MARS virtual inputs"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = [
+  "Operating System :: MacOS :: MacOS X",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+]
+
+[project.urls]
+Homepage = "https://github.com/JacobLinCool/mars"
+Repository = "https://github.com/JacobLinCool/mars"
+Issues = "https://github.com/JacobLinCool/mars/issues"
 
 [tool.maturin]
 manifest-path = "../../crates/mars-sdk-python/Cargo.toml"

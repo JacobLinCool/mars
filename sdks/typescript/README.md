@@ -4,6 +4,15 @@ Arm64 macOS SDK for applications that own MARS virtual input devices. It uses
 IPC protocol v3 for declarations and the same Rust shared-memory writer as the
 daemon; JavaScript does not implement the ring protocol.
 
+## Install
+
+```bash
+pnpm add @mars-audio/sdk
+```
+
+The package requires Apple Silicon macOS, Node.js 20 or newer, and an installed
+MARS runtime.
+
 ## Build from this repository
 
 ```bash

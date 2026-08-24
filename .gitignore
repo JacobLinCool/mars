@@ -27,6 +27,7 @@ notary.secret
 sdks/typescript/dist/
 sdks/typescript/native/*.node
 sdks/typescript/node_modules/
+.pnpm-store/
 sdks/python/src/mars_sdk/*.so
 sdks/python/src/mars_sdk/__pycache__/
 sdks/python/tests/__pycache__/
