@@ -14,7 +14,7 @@ Install the published packages with the repository-standard package managers:
 
 ```bash
 pnpm add @mars-audio/sdk
-uv add mars-audio-sdk
+uv add mars-sdk
 ```
 
 Both packages target Apple Silicon macOS and require the separately installed

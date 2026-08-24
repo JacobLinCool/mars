@@ -7,7 +7,7 @@ shared-memory writes to the existing Rust SDK.
 ## Install
 
 ```bash
-uv add mars-audio-sdk
+uv add mars-sdk
 ```
 
 The wheel requires Apple Silicon macOS, CPython 3.11 or newer, and an installed

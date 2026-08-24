@@ -32,11 +32,11 @@ They do not contain registry tokens. Registry publication uses GitHub OIDC.
 
 ### PyPI trusted publisher
 
-Create a pending GitHub publisher for `mars-audio-sdk` with these exact values:
+Create a pending GitHub publisher for `mars-sdk` with these exact values:
 
 | Field | Value |
 | --- | --- |
-| PyPI project name | `mars-audio-sdk` |
+| PyPI project name | `mars-sdk` |
 | GitHub owner | `JacobLinCool` |
 | Repository name | `mars` |
 | Workflow filename | `release.yml` |
@@ -96,7 +96,7 @@ versions match before it publishes:
 - per-package checksums and notarization logs
 - `SHA256SUMS`
 - `@mars-audio/sdk@X.Y.Z` on npm
-- `mars-audio-sdk==X.Y.Z` as a CPython 3.11+ `abi3` arm64 macOS wheel on PyPI
+- `mars-sdk==X.Y.Z` as a CPython 3.11+ `abi3` arm64 macOS wheel on PyPI
 
 Users can double-click the package or install it from Terminal:
 

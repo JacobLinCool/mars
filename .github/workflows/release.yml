@@ -210,7 +210,7 @@ jobs:
           uv sync --project sdks/python --locked
           uv run --project sdks/python --locked python -m unittest discover -s sdks/python/tests -v
           uv build --project sdks/python --python 3.11 --wheel --clear --out-dir dist/sdk-pypi
-          WHEEL="$(find dist/sdk-pypi -maxdepth 1 -name 'mars_audio_sdk-*-cp311-abi3-macosx_11_0_arm64.whl' -print -quit)"
+          WHEEL="$(find dist/sdk-pypi -maxdepth 1 -name 'mars_sdk-*-cp311-abi3-macosx_11_0_arm64.whl' -print -quit)"
           test -n "$WHEEL"
           uv run --isolated --python 3.11 --with "$WHEEL" python -c 'import mars_sdk; print(mars_sdk.__name__)'
       - name: Upload npm package

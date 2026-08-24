@@ -3,7 +3,7 @@ requires = ["maturin>=1.9,<2"]
 build-backend = "maturin"
 
 [project]
-name = "mars-audio-sdk"
+name = "mars-sdk"
 version = "0.1.0"
 description = "Python SDK for app-owned MARS virtual inputs"
 readme = "README.md"
