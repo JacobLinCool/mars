@@ -12,6 +12,8 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod binary_license;
+
 pub const PROPERTY_DESIRED_STATE: &str = "com.mars.profile.desired_state";
 pub const PROPERTY_APPLIED_STATE: &str = "com.mars.profile.applied_state";
 pub const PROPERTY_RUNTIME_STATS: &str = "com.mars.runtime.stats";

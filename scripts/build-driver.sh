@@ -7,7 +7,15 @@ cd "$ROOT_DIR"
 cargo build --release -p mars-hal
 
 BUNDLE_DIR="$ROOT_DIR/bundles/mars.driver/Contents"
-mkdir -p "$BUNDLE_DIR/MacOS"
+DRIVER_EXECUTABLE="$BUNDLE_DIR/MacOS/mars_hal"
+DRIVER_LICENSE="$BUNDLE_DIR/Resources/MARS-OFFICIAL-DRIVER-BINARY-LICENSE.txt"
+
+if [ ! -s "$DRIVER_LICENSE" ]; then
+    echo "error: official driver binary license is missing or empty: $DRIVER_LICENSE" >&2
+    exit 1
+fi
+
+mkdir -p "$BUNDLE_DIR/MacOS" "$BUNDLE_DIR/Resources"
 cp "$ROOT_DIR/target/release/libmars_hal.dylib" "$BUNDLE_DIR/MacOS/mars_hal"
 
 # Rust cdylib produces MH_DYLIB, but CoreAudio's DriverHelper loads plugins via
@@ -70,7 +78,14 @@ if not found:
 
 with open(path, 'wb') as f:
     f.write(data)
-" "$BUNDLE_DIR/MacOS/mars_hal"
+" "$DRIVER_EXECUTABLE"
+
+# The human-readable resource travels with the bundle, while the custom Mach-O
+# section keeps the same text attached to the executable if it is extracted.
+if ! strings "$DRIVER_EXECUTABLE" | grep -F "MARS OFFICIAL DRIVER BINARY LICENSE" >/dev/null; then
+    echo "error: official driver binary license is not embedded in $DRIVER_EXECUTABLE" >&2
+    exit 1
+fi
 
 # Code-sign the bundle with hardened runtime. macOS 14+ loads HAL plugins
 # out-of-process in com.apple.audio.DriverHelper which enforces library
@@ -86,10 +101,9 @@ fi
 
 if [ -n "$DEV_ID" ]; then
     codesign --force --sign "$DEV_ID" --deep --options runtime --timestamp "$ROOT_DIR/bundles/mars.driver"
-    codesign --verify --deep --strict --verbose=2 "$ROOT_DIR/bundles/mars.driver"
 elif [ "$ALLOW_INSECURE_SIGNING" = "1" ]; then
     SIGN_ID="-"
-    FOUND_ID="$(security find-identity -v -p codesigning 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/' || true)"
+    FOUND_ID="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(.*\)"/\1/p' | head -1 || true)"
     if [ -n "$FOUND_ID" ]; then
         SIGN_ID="$FOUND_ID"
     fi
@@ -102,4 +116,5 @@ else
     exit 1
 fi
 
+codesign --verify --deep --strict --verbose=2 "$ROOT_DIR/bundles/mars.driver"
 echo "Built driver bundle at $ROOT_DIR/bundles/mars.driver"
