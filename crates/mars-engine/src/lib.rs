@@ -1638,7 +1638,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use mars_graph::build_routing_graph;
     use mars_types::{
@@ -2038,6 +2038,29 @@ if __name__ == "__main__":
         })
     }
 
+    fn render_until_au_instance_processes(
+        engine: &Engine,
+        expected_id: &str,
+        sources: &HashMap<String, Vec<f32>>,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            engine.render_cycle(256, sources).expect("render");
+            let status = engine.plugin_runtime_status();
+            if status.instances.len() == 1
+                && status.instances[0].id == expected_id
+                && status.instances[0].process_calls > 0
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "AU instance {expected_id} did not process frames before timeout: {status:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn rms(samples: &[f32]) -> f32 {
         if samples.is_empty() {
             return 0.0;
@@ -2418,12 +2441,7 @@ if __name__ == "__main__":
 
         let mut sources = HashMap::new();
         sources.insert("src".to_string(), vec![0.25; 256 * 2]);
-        for _ in 0..16 {
-            engine.render_cycle(256, &sources).expect("render");
-            thread::sleep(Duration::from_millis(2));
-        }
-        let before = engine.plugin_runtime_status();
-        assert_eq!(before.instances.len(), 1);
+        render_until_au_instance_processes(&engine, "au-a", &sources);
 
         let replacement = au_engine("au-b", &script_path);
         engine.swap_snapshot(EngineSnapshot {
@@ -2432,15 +2450,7 @@ if __name__ == "__main__":
             buffer_frames: 256,
         });
 
-        for _ in 0..16 {
-            engine.render_cycle(256, &sources).expect("render");
-            thread::sleep(Duration::from_millis(2));
-        }
-
-        let after = engine.plugin_runtime_status();
-        assert_eq!(after.instances.len(), 1);
-        assert_eq!(after.instances[0].id, "au-b");
-        assert!(after.instances[0].process_calls > 0);
+        render_until_au_instance_processes(&engine, "au-b", &sources);
 
         let _ = fs::remove_file(script_path);
     }
