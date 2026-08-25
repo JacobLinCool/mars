@@ -5,6 +5,12 @@ version tags. Every executable is signed with Developer ID and hardened
 runtime, and every installer is submitted with `notarytool`, stapled, checked
 with Gatekeeper, and uploaded with checksums and notarization logs.
 
+The release build must contain the complete Official Driver Binary License in
+both `mars.driver/Contents/Resources/MARS-OFFICIAL-DRIVER-BINARY-LICENSE.txt`
+and the driver executable's `__TEXT,__mars_license` Mach-O section. The driver
+bundle is signed only after both copies are present, so the signature covers
+the license shipped with the official binary.
+
 ## One-time GitHub configuration
 
 Configure these repository Actions secrets:

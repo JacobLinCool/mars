@@ -1,0 +1,44 @@
+MARS OFFICIAL DRIVER BINARY LICENSE
+
+Copyright (c) 2026 JacobLinCool. All rights reserved.
+
+1. Scope
+
+This license applies only to the precompiled mars.driver bundle distributed
+by the MARS team through the official GitHub Releases page for
+https://github.com/JacobLinCool/mars and signed with the MARS team's
+Developer ID (the "Official Driver Binary").
+
+This license does not apply to the MARS source code or to binaries
+independently compiled from that source code. The MARS source code remains
+available under the MIT License.
+
+2. Non-Commercial Use
+
+Permission is granted to install, use, copy, and redistribute the unmodified
+Official Driver Binary solely for non-commercial purposes, provided that this
+license text remains included and the code signature and notarization ticket
+are not removed or altered.
+
+3. Commercial Use
+
+"Commercial Purpose" means any use, whether direct or indirect, in connection
+with a business, trade, profession, paid product or service, revenue-generating
+activity, or the internal operations of a for-profit organization.
+
+No permission is granted to use the Official Driver Binary for a Commercial
+Purpose. A separate written commercial license from the MARS team is required
+before any such use.
+
+For commercial licensing, contact the MARS team through
+https://github.com/JacobLinCool/mars.
+
+4. No Warranty
+
+THE OFFICIAL DRIVER BINARY IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO
+EVENT SHALL THE COPYRIGHT HOLDER OR MARS CONTRIBUTORS BE LIABLE FOR ANY CLAIM,
+DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR
+OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE OFFICIAL DRIVER
+BINARY OR ITS USE.

@@ -263,6 +263,18 @@ For third-party app/tool development, use one of the typed SDKs:
 - Python: `sdks/python`, with an arm64 native writer extension
 - shared TypeScript/Python contract: `docs/language-sdks.md`
 
+## License
+
+MARS source code is licensed under the MIT License, including the `mars-hal`
+driver source. The official precompiled `mars.driver` bundle distributed by
+the MARS team through GitHub Releases is licensed separately for
+non-commercial use. Any commercial use of that official signed driver binary
+requires a separate written license from the MARS team.
+
+The binary license does not apply to drivers independently compiled from the
+MIT-licensed source code. See [`LICENSE-POLICY.md`](LICENSE-POLICY.md) for the
+exact boundary and terms.
+
 ## Uninstall
 
 ```bash
