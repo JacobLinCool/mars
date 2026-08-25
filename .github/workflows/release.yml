@@ -33,20 +33,18 @@ jobs:
         run: |
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/mars-daemon/Cargo.toml | head -1)"
           test "$GITHUB_REF_NAME" = "v$VERSION"
-          for manifest in \
-            crates/mars-cli/Cargo.toml \
-            crates/mars-hal/Cargo.toml \
-            crates/mars-sdk/Cargo.toml \
-            crates/mars-sdk-node/Cargo.toml \
-            crates/mars-sdk-python/Cargo.toml
-          do
+          for manifest in crates/*/Cargo.toml; do
             MANIFEST_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$manifest" | head -1)"
             test "$MANIFEST_VERSION" = "$VERSION"
           done
           TYPESCRIPT_VERSION="$(sed -n 's/^[[:space:]]*"version": "\([^"]*\)",/\1/p' sdks/typescript/package.json | head -1)"
           PYTHON_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' sdks/python/pyproject.toml | head -1)"
+          DRIVER_SHORT_VERSION="$(plutil -extract CFBundleShortVersionString raw bundles/mars.driver/Contents/Info.plist)"
+          DRIVER_BUNDLE_VERSION="$(plutil -extract CFBundleVersion raw bundles/mars.driver/Contents/Info.plist)"
           test "$TYPESCRIPT_VERSION" = "$VERSION"
           test "$PYTHON_VERSION" = "$VERSION"
+          test "$DRIVER_SHORT_VERSION" = "$VERSION"
+          test "$DRIVER_BUNDLE_VERSION" = "$VERSION"
           git fetch origin main --no-tags
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
       - name: Check formatting
