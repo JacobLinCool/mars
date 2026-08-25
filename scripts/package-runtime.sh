@@ -25,7 +25,19 @@ if [[ -z "$VERSION" || -z "$PROTOCOL_VERSION" ]]; then
   exit 1
 fi
 
+REQUIRE_DRIVER_NOTARIZATION="${MARS_REQUIRE_DRIVER_NOTARIZATION:-0}"
+case "$REQUIRE_DRIVER_NOTARIZATION" in
+  0 | 1) ;;
+  *)
+    echo "error: MARS_REQUIRE_DRIVER_NOTARIZATION must be 0 or 1." >&2
+    exit 1
+    ;;
+esac
+
 "$ROOT_DIR/scripts/build-driver.sh"
+if [ "$REQUIRE_DRIVER_NOTARIZATION" = "1" ]; then
+  "$ROOT_DIR/scripts/notarize-driver.sh"
+fi
 
 cargo build --release -p mars-cli -p mars-daemon
 
@@ -36,7 +48,10 @@ mkdir -p "$STAGE_DIR/bin" "$STAGE_DIR/launchd" "$STAGE_DIR/driver"
 install -m 0755 "$ROOT_DIR/target/release/mars" "$STAGE_DIR/bin/mars"
 install -m 0755 "$ROOT_DIR/target/release/marsd" "$STAGE_DIR/bin/marsd"
 cp "$ROOT_DIR/launchd/com.mars.marsd.plist" "$STAGE_DIR/launchd/com.mars.marsd.plist"
-cp -R "$ROOT_DIR/bundles/mars.driver" "$STAGE_DIR/driver/mars.driver"
+ditto "$ROOT_DIR/bundles/mars.driver" "$STAGE_DIR/driver/mars.driver"
+if [ "$REQUIRE_DRIVER_NOTARIZATION" = "1" ]; then
+  xcrun stapler validate "$STAGE_DIR/driver/mars.driver"
+fi
 
 # Sign the CLI binaries with the same Developer ID policy as the driver bundle
 # (build-driver.sh already signed the bundle). Unsigned packages stay unsigned
@@ -124,5 +139,13 @@ PY
 ARCHIVE="$ROOT_DIR/dist/mars-runtime-$VERSION.tar.gz"
 rm -f "$ARCHIVE"
 tar -czf "$ARCHIVE" -C "$STAGE_DIR" manifest.json bin launchd driver
+if [ "$REQUIRE_DRIVER_NOTARIZATION" = "1" ]; then
+  VERIFY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mars-runtime-verify.XXXXXX")"
+  trap 'rm -rf "$VERIFY_DIR"' EXIT
+  tar -xzf "$ARCHIVE" -C "$VERIFY_DIR" driver
+  xcrun stapler validate "$VERIFY_DIR/driver/mars.driver"
+  rm -rf "$VERIFY_DIR"
+  trap - EXIT
+fi
 
 echo "Built runtime package: $ARCHIVE"

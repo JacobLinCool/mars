@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build a signed, native-architecture macOS installer package from the MARS
-# runtime payload. Release CI notarizes and staples the resulting flat package.
+# Build a signed, native-architecture macOS installer package from a MARS
+# runtime payload whose driver is notarized and stapled. Release CI then
+# notarizes and staples the resulting flat package.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
@@ -26,7 +27,9 @@ if [ -z "$INSTALLER_ID" ]; then
   exit 1
 fi
 
-MARS_REQUIRE_SIGNING=1 "$ROOT_DIR/scripts/package-runtime.sh"
+MARS_REQUIRE_SIGNING=1 \
+MARS_REQUIRE_DRIVER_NOTARIZATION=1 \
+  "$ROOT_DIR/scripts/package-runtime.sh"
 
 RUNTIME_DIR="$ROOT_DIR/dist/mars-runtime-$VERSION"
 WORK_DIR="$ROOT_DIR/dist/installer-$VERSION-$ARCH"
@@ -45,7 +48,8 @@ install -m 0644 "$RUNTIME_DIR/manifest.json" "$PAYLOAD_DIR/usr/local/share/mars/
 install -m 0644 \
   "$RUNTIME_DIR/launchd/com.mars.marsd.plist" \
   "$PAYLOAD_DIR/usr/local/share/mars/com.mars.marsd.plist.in"
-cp -R "$RUNTIME_DIR/driver/mars.driver" "$PAYLOAD_DIR/Library/Audio/Plug-Ins/HAL/mars.driver"
+ditto "$RUNTIME_DIR/driver/mars.driver" "$PAYLOAD_DIR/Library/Audio/Plug-Ins/HAL/mars.driver"
+xcrun stapler validate "$PAYLOAD_DIR/Library/Audio/Plug-Ins/HAL/mars.driver"
 
 rm -f "$PACKAGE_PATH"
 pkgbuild \
@@ -59,4 +63,8 @@ pkgbuild \
   "$PACKAGE_PATH"
 
 pkgutil --check-signature "$PACKAGE_PATH"
+EXPANDED_PACKAGE_DIR="$WORK_DIR/expanded-package"
+pkgutil --expand-full "$PACKAGE_PATH" "$EXPANDED_PACKAGE_DIR"
+xcrun stapler validate \
+  "$EXPANDED_PACKAGE_DIR/Payload/Library/Audio/Plug-Ins/HAL/mars.driver"
 echo "Built signed installer: $PACKAGE_PATH"

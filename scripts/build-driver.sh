@@ -100,7 +100,7 @@ if [ -z "$DEV_ID" ]; then
 fi
 
 if [ -n "$DEV_ID" ]; then
-    codesign --force --sign "$DEV_ID" --deep --options runtime --timestamp "$ROOT_DIR/bundles/mars.driver"
+    codesign --force --sign "$DEV_ID" --options runtime --timestamp "$ROOT_DIR/bundles/mars.driver"
 elif [ "$ALLOW_INSECURE_SIGNING" = "1" ]; then
     SIGN_ID="-"
     FOUND_ID="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(.*\)"/\1/p' | head -1 || true)"
@@ -109,7 +109,7 @@ elif [ "$ALLOW_INSECURE_SIGNING" = "1" ]; then
     fi
     echo "warning: using insecure signing path (MARS_ALLOW_INSECURE_SIGNING=1)." >&2
     echo "warning: this is for local development only (for example SIP-disabled systems)." >&2
-    codesign --force --sign "$SIGN_ID" --deep --options runtime "$ROOT_DIR/bundles/mars.driver"
+    codesign --force --sign "$SIGN_ID" --options runtime "$ROOT_DIR/bundles/mars.driver"
 else
     echo "error: missing Developer ID Application certificate; cannot build a loadable HAL bundle in strict mode." >&2
     echo "error: for local-only development, set MARS_ALLOW_INSECURE_SIGNING=1 to opt in explicitly." >&2

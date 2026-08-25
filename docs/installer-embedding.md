@@ -12,9 +12,16 @@ linking `mars-sdk` directly (recommended for Rust/Tauri) or by shelling out to
 Build a relocatable, versioned package on your release machine:
 
 ```bash
-./scripts/package-runtime.sh
+MARS_REQUIRE_DRIVER_NOTARIZATION=1 ./scripts/package-runtime.sh
 # -> dist/mars-runtime-<version>.tar.gz
 ```
+
+The release machine must provide the Developer ID Application identity and
+the `NOTARY_KEY_PATH`, `NOTARY_KEY_ID`, and `NOTARY_ISSUER_ID` CI
+credentials. The script submits the signed driver in a ZIP archive, staples
+and validates the driver bundle, then verifies that the ticket survives the
+final runtime archive. Omit `MARS_REQUIRE_DRIVER_NOTARIZATION=1` only for
+local development packages that will be installed with `--allow-unsigned`.
 
 Package layout:
 

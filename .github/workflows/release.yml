@@ -66,7 +66,7 @@ jobs:
     name: Build and notarize (arm64)
     needs: verify
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -125,7 +125,10 @@ jobs:
           printf '%s' "$NOTARY_KEY" | base64 -D > "$NOTARY_KEY_PATH"
           chmod 0600 "$NOTARY_KEY_PATH"
           echo "NOTARY_KEY_PATH=$NOTARY_KEY_PATH" >> "$GITHUB_ENV"
-      - name: Build signed installer
+      - name: Build signed installer with notarized driver
+        env:
+          NOTARY_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
         run: scripts/package-installer.sh
       - name: Notarize and staple installer
         env:
@@ -169,6 +172,8 @@ jobs:
             dist/mars-*-arm64.pkg.sha256
             dist/mars-*-arm64.pkg.notary-result.json
             dist/mars-*-arm64.pkg.notary-log.json
+            dist/mars-*-arm64.driver.notary-result.json
+            dist/mars-*-arm64.driver.notary-log.json
           if-no-files-found: error
 
   language-sdks:
@@ -297,6 +302,8 @@ jobs:
       - name: Verify release assets
         run: |
           test "$(find release -maxdepth 1 -name '*.pkg' | wc -l)" -eq 1
+          test "$(find release -maxdepth 1 -name '*.driver.notary-result.json' | wc -l)" -eq 1
+          test "$(find release -maxdepth 1 -name '*.driver.notary-log.json' | wc -l)" -eq 1
           cd release
           sha256sum --check ./*.pkg.sha256
           sha256sum ./*.pkg > SHA256SUMS
@@ -304,7 +311,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ASSETS=(release/*.pkg release/*.pkg.sha256 release/*.pkg.notary-result.json release/*.pkg.notary-log.json release/SHA256SUMS)
+          ASSETS=(release/*.pkg release/*.pkg.sha256 release/*.pkg.notary-result.json release/*.pkg.notary-log.json release/*.driver.notary-result.json release/*.driver.notary-log.json release/SHA256SUMS)
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" "${ASSETS[@]}" --clobber --repo "$GITHUB_REPOSITORY"
           else
