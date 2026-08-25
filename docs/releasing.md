@@ -2,14 +2,18 @@
 
 MARS publishes a native Apple Silicon (`arm64`) macOS installer package from
 version tags. Every executable is signed with Developer ID and hardened
-runtime, and every installer is submitted with `notarytool`, stapled, checked
-with Gatekeeper, and uploaded with checksums and notarization logs.
+runtime. The signed driver bundle is submitted in a ZIP archive, stapled, and
+validated before it is added to the runtime payload. The resulting installer
+is then separately submitted with `notarytool`, stapled, checked with
+Gatekeeper, and uploaded with checksums and both notarization logs.
 
 The release build must contain the complete Official Driver Binary License in
 both `mars.driver/Contents/Resources/MARS-OFFICIAL-DRIVER-BINARY-LICENSE.txt`
 and the driver executable's `__TEXT,__mars_license` Mach-O section. The driver
 bundle is signed only after both copies are present, so the signature covers
-the license shipped with the official binary.
+the license shipped with the official binary. The driver is notarized and its
+ticket is stapled only after that final signature; packaging uses the stapled
+bundle without rebuilding or re-signing it.
 
 ## One-time GitHub configuration
 
@@ -99,7 +103,8 @@ a commit contained in `main`. The workflow verifies that all shipping package
 versions match before it publishes:
 
 - `mars-X.Y.Z-arm64.pkg`
-- per-package checksums and notarization logs
+- per-package checksums and installer notarization result/log
+- driver notarization result/log
 - `SHA256SUMS`
 - `@mars-audio/sdk@X.Y.Z` on npm
 - `mars-sdk==X.Y.Z` as a CPython 3.11+ `abi3` arm64 macOS wheel on PyPI
